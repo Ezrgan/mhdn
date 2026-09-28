@@ -164,6 +164,7 @@ name = "mhdn-probe"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "mhdn-game",
  "mhdn-rpc",
  "thiserror",
 ]

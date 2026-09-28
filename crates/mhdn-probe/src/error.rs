@@ -9,6 +9,9 @@ pub enum ProbeError {
     Rpc(#[from] RpcError),
 
     #[error(transparent)]
+    Profile(#[from] mhdn_game::ProfileError),
+
+    #[error(transparent)]
     Io(#[from] io::Error),
 
     #[error("{0}")]

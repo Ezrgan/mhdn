@@ -12,5 +12,6 @@ path = "src/main.rs"
 
 [dependencies]
 clap.workspace = true
+mhdn-game = { path = "../mhdn-game" }
 mhdn-rpc = { path = "../mhdn-rpc" }
 thiserror.workspace = true

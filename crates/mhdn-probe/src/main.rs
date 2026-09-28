@@ -5,6 +5,7 @@ mod findmat;
 mod format;
 mod parse;
 mod ptrscan;
+mod record;
 mod scan;
 mod watch;
 
@@ -65,6 +66,22 @@ enum Commands {
     Scan {
         #[command(subcommand)]
         action: ScanCmd,
+    },
+    /// Print frame count and size of an `.mhrec` file.
+    RecInfo { file: PathBuf },
+    /// Record profile fields at a fixed rate into a versioned `.mhrec` file.
+    Record {
+        #[command(flatten)]
+        conn: ConnArgs,
+        #[arg(long)]
+        profile: PathBuf,
+        #[arg(long)]
+        out: PathBuf,
+        #[arg(long, default_value_t = 60)]
+        hz: u32,
+        /// How long to record. The phase-2 check is 120 seconds of combat under 10 MB.
+        #[arg(long, default_value_t = 30)]
+        seconds: u64,
     },
     /// Find view and projection matrix candidates in a dump.
     Findmat {
@@ -215,6 +232,14 @@ fn run() -> Result<()> {
             file,
         } => cmd_dump(conn, start, end, file),
         Commands::Scan { action } => cmd_scan(action),
+        Commands::RecInfo { file } => cmd_rec_info(file),
+        Commands::Record {
+            conn,
+            profile,
+            out,
+            hz,
+            seconds,
+        } => cmd_record(conn, profile, out, hz, seconds),
         Commands::Findmat {
             dump,
             base,
@@ -374,6 +399,54 @@ fn cmd_scan(action: ScanCmd) -> Result<()> {
             }
         }
     }
+    Ok(())
+}
+
+fn cmd_rec_info(file: PathBuf) -> Result<()> {
+    let bytes = std::fs::read(&file)?;
+    let recording = record::decode(&bytes)?;
+    let monsters: usize = recording
+        .frames
+        .iter()
+        .map(|frame| frame.monsters.len())
+        .sum();
+    println!(
+        "{}: {} frames at {} Hz, {monsters} monster samples, {} bytes",
+        recording.profile_id,
+        recording.frames.len(),
+        recording.hz,
+        bytes.len()
+    );
+    Ok(())
+}
+
+fn cmd_record(
+    conn: ConnArgs,
+    profile_path: PathBuf,
+    out: PathBuf,
+    hz: u32,
+    seconds: u64,
+) -> Result<()> {
+    let profile = mhdn_game::Profile::load(&profile_path)?;
+    let mut attached = attach::attach(conn.addr, conn.title_id, conn.timeout())?;
+    println!(
+        "recording {} at {hz} Hz for {seconds}s → {}",
+        profile.id(),
+        out.display()
+    );
+    let pending = profile.unresolved_fields();
+    if !pending.is_empty() {
+        println!("unresolved fields stay empty: {}", pending.join(", "));
+    }
+    let recording = record::record_for(&mut attached.client, &profile, hz, seconds)?;
+    let bytes = record::encode(&recording)?;
+    std::fs::write(&out, &bytes)?;
+    println!(
+        "wrote {} frames, {} bytes ({:.2} MB)",
+        recording.frames.len(),
+        bytes.len(),
+        bytes.len() as f64 / (1024.0 * 1024.0)
+    );
     Ok(())
 }
 
