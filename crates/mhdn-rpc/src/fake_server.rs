@@ -8,8 +8,6 @@ use std::time::Duration;
 
 use crate::packet::{PacketHeader, PacketType, MAX_PACKET_SIZE};
 
-const PROCESS_ENTRY_SIZE: usize = 0x14;
-
 #[derive(Debug, Clone)]
 pub struct FakeProcess {
     pub pid: u32,
@@ -23,15 +21,16 @@ pub struct FakeRpcServer {
     handle: Option<thread::JoinHandle<()>>,
 }
 
+/// Mutable fake server configuration (returned from [`FakeRpcServer::bind`] for tests).
 #[derive(Default)]
-struct ServerState {
-    memory: HashMap<u32, Vec<u8>>,
-    processes: Vec<FakeProcess>,
-    selected_pid: u32,
-    latency: Duration,
-    drop_replies: bool,
-    empty_replies: bool,
-    reorder_replies: bool,
+pub struct ServerState {
+    pub memory: HashMap<u32, Vec<u8>>,
+    pub processes: Vec<FakeProcess>,
+    pub selected_pid: u32,
+    pub latency: Duration,
+    pub drop_replies: bool,
+    pub empty_replies: bool,
+    pub reorder_replies: bool,
     pending_replies: Vec<Vec<u8>>,
 }
 
@@ -72,11 +71,7 @@ impl Drop for FakeRpcServer {
     }
 }
 
-fn run_server(
-    socket: UdpSocket,
-    state: Arc<Mutex<ServerState>>,
-    stop: Arc<Mutex<bool>>,
-) {
+fn run_server(socket: UdpSocket, state: Arc<Mutex<ServerState>>, stop: Arc<Mutex<bool>>) {
     socket
         .set_read_timeout(Some(Duration::from_millis(100)))
         .ok();
@@ -145,22 +140,32 @@ fn build_reply(st: &mut ServerState, header: PacketHeader, payload: &[u8]) -> Ve
             if payload.len() >= 8 {
                 let op = u32::from_le_bytes(payload[0..4].try_into().expect("slice"));
                 if op == 1 {
-                    st.selected_pid =
-                        u32::from_le_bytes(payload[4..8].try_into().expect("slice"));
+                    st.selected_pid = u32::from_le_bytes(payload[4..8].try_into().expect("slice"));
                 }
             }
             out_payload.extend_from_slice(&st.selected_pid.to_le_bytes());
         }
         PacketType::ReadMemory => {
             if payload.len() >= 8 {
-                let addr =
-                    u32::from_le_bytes(payload[0..4].try_into().expect("slice"));
-                let size =
-                    u32::from_le_bytes(payload[4..8].try_into().expect("slice")) as usize;
+                let addr = u32::from_le_bytes(payload[0..4].try_into().expect("slice"));
+                let size = u32::from_le_bytes(payload[4..8].try_into().expect("slice")) as usize;
                 out_payload.resize(size, 0);
                 if let Some(bytes) = st.memory.get(&addr) {
                     let copy_len = size.min(bytes.len());
                     out_payload[..copy_len].copy_from_slice(&bytes[..copy_len]);
+                } else {
+                    for (base, bytes) in &st.memory {
+                        let base = *base;
+                        if addr >= base {
+                            let off = (addr - base) as usize;
+                            if off < bytes.len() {
+                                let copy_len = size.min(bytes.len() - off);
+                                out_payload[..copy_len]
+                                    .copy_from_slice(&bytes[off..off + copy_len]);
+                                break;
+                            }
+                        }
+                    }
                 }
             }
         }

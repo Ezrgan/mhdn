@@ -2,7 +2,7 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
-use crate::error::{RpcError, Result};
+use crate::error::{Result, RpcError};
 
 /// Abstract memory reader used by game logic and offline tests.
 pub trait MemorySource {
@@ -61,9 +61,9 @@ impl FileMemorySource {
 
 impl MemorySource for FileMemorySource {
     fn read(&mut self, addr: u32, buf: &mut [u8]) -> Result<()> {
-        let start = addr.checked_sub(self.base_addr).ok_or(RpcError::ReadFailed {
-            addr,
-        })? as usize;
+        let start = addr
+            .checked_sub(self.base_addr)
+            .ok_or(RpcError::ReadFailed { addr })? as usize;
         let end = start
             .checked_add(buf.len())
             .ok_or(RpcError::ReadFailed { addr })?;
@@ -105,7 +105,8 @@ pub fn read_dump_range(
         .ok_or(RpcError::ReadFailed { addr })? as u64;
     let mut file = File::open(path.as_ref())?;
     file.seek(SeekFrom::Start(offset))?;
-    file.read_exact(buf).map_err(|_| RpcError::ReadFailed { addr })?;
+    file.read_exact(buf)
+        .map_err(|_| RpcError::ReadFailed { addr })?;
     Ok(())
 }
 
@@ -115,7 +116,7 @@ mod tests {
 
     #[test]
     fn file_memory_source_maps_base() {
-        let mem = FileMemorySource::from_bytes(vec![1, 2, 3, 4, 5, 6], 0x1000);
+        let mut mem = FileMemorySource::from_bytes(vec![1, 2, 3, 4, 5, 6], 0x1000);
         let mut buf = [0u8; 2];
         mem.read(0x1002, &mut buf).unwrap();
         assert_eq!(buf, [3, 4]);
