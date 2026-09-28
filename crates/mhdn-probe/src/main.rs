@@ -3,6 +3,7 @@ mod dump;
 mod error;
 mod format;
 mod parse;
+mod ptrscan;
 mod scan;
 mod watch;
 
@@ -63,6 +64,35 @@ enum Commands {
     Scan {
         #[command(subcommand)]
         action: ScanCmd,
+    },
+    /// Find pointer chains from a static range to a target address, using a dump.
+    Ptrscan {
+        #[arg(value_parser = parse_hex_u32, value_name = "TARGET")]
+        target: u32,
+        /// Flat dump produced by `dump` or GDB `dump memory`.
+        #[arg(long)]
+        dump: PathBuf,
+        /// Guest address of byte 0 in the dump.
+        #[arg(long, value_parser = parse_hex_u32)]
+        base: u32,
+        #[arg(long, default_value_t = 4)]
+        depth: u32,
+        #[arg(long, default_value = "0x2000", value_parser = parse_hex_u32)]
+        max_offset: u32,
+        /// Where the chain root must live, e.g. `0x00100000-0x00E00000`.
+        #[arg(long, value_parser = parse_range)]
+        static_range: Range<u32>,
+        #[arg(long, default_value_t = 64)]
+        limit: usize,
+    },
+    /// Resolve `BASE+OFF+OFF` against the live process.
+    Ptrverify {
+        #[command(flatten)]
+        conn: ConnArgs,
+        #[arg(value_parser = ptrscan::parse_path, value_name = "PATH")]
+        path: ptrscan::PointerPath,
+        #[arg(long, value_parser = parse_hex_u32)]
+        expect: Option<u32>,
     },
     /// Print bytes and floats that change between samples.
     Watch {
@@ -173,6 +203,16 @@ fn run() -> Result<()> {
             file,
         } => cmd_dump(conn, start, end, file),
         Commands::Scan { action } => cmd_scan(action),
+        Commands::Ptrscan {
+            target,
+            dump,
+            base,
+            depth,
+            max_offset,
+            static_range,
+            limit,
+        } => cmd_ptrscan(target, dump, base, depth, max_offset, static_range, limit),
+        Commands::Ptrverify { conn, path, expect } => cmd_ptrverify(conn, path, expect),
         Commands::Watch {
             conn,
             guest,
@@ -315,6 +355,71 @@ fn cmd_scan(action: ScanCmd) -> Result<()> {
                 );
             }
         }
+    }
+    Ok(())
+}
+
+fn cmd_ptrscan(
+    target: u32,
+    dump_path: PathBuf,
+    base: u32,
+    depth: u32,
+    max_offset: u32,
+    static_range: Range<u32>,
+    limit: usize,
+) -> Result<()> {
+    if depth == 0 || depth > 6 {
+        return Err(error::ProbeError::msg(
+            "ptrscan --depth must be between 1 and 6",
+        ));
+    }
+    let image = std::fs::read(&dump_path)?;
+    if image.len() > 256 * 1024 * 1024 {
+        return Err(error::ProbeError::msg("dump is above 256 MiB"));
+    }
+    let image_end = base.saturating_add(image.len() as u32);
+    if static_range.start >= image_end || static_range.end <= base {
+        eprintln!(
+            "warning: static range 0x{:08X}..0x{:08X} does not overlap the dump 0x{base:08X}..0x{image_end:08X}",
+            static_range.start, static_range.end
+        );
+    }
+    let found = ptrscan::scan_pointers(
+        base,
+        &image,
+        target,
+        &ptrscan::PtrScanConfig {
+            depth,
+            max_offset,
+            static_range,
+            max_paths: limit,
+        },
+    );
+    println!("{} path(s) to 0x{target:08X}", found.len());
+    for path in &found {
+        let resolved = ptrscan::resolve_in_image(base, &image, path);
+        println!(
+            "{}  => {}",
+            ptrscan::format_path(path),
+            resolved
+                .map(|addr| format!("0x{addr:08X}"))
+                .unwrap_or_else(|| "unresolved".to_string())
+        );
+    }
+    Ok(())
+}
+
+fn cmd_ptrverify(conn: ConnArgs, path: ptrscan::PointerPath, expect: Option<u32>) -> Result<()> {
+    let mut attached = attach::attach(conn.addr, conn.title_id, conn.timeout())?;
+    let resolved = ptrscan::resolve_memory(&mut attached.client, &path)?;
+    println!("{} => 0x{resolved:08X}", ptrscan::format_path(&path));
+    if let Some(expected) = expect {
+        if resolved != expected {
+            return Err(error::ProbeError::msg(format!(
+                "path resolved to 0x{resolved:08X}, expected 0x{expected:08X}"
+            )));
+        }
+        println!("matches expected 0x{expected:08X}");
     }
     Ok(())
 }
