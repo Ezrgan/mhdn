@@ -1,13 +1,22 @@
+mod attach;
+mod error;
+mod format;
+mod parse;
+
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
 use clap::{Parser, Subcommand};
 use mhdn_rpc::{ReadReq, RpcClient};
 
+use crate::error::Result;
+use crate::format::PeekType;
+use crate::parse::{parse_hex_u32, parse_hex_u64};
+
 #[derive(Parser)]
 #[command(
     name = "mhdn-probe",
-    about = "MHXX reverse-engineering CLI (see PLAN.md)"
+    about = "MHXX reverse-engineering CLI (see PLAN.md phase 2)"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -16,32 +25,77 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// List Azahar processes and select MHXX.
+    Attach {
+        #[command(flatten)]
+        conn: ConnArgs,
+    },
+    /// Hex dump of guest memory.
+    Hexdump {
+        #[command(flatten)]
+        conn: ConnArgs,
+        /// Guest address (`0x00100000`).
+        #[arg(value_parser = parse_hex_u32, value_name = "ADDR")]
+        guest: u32,
+        /// Number of bytes to read.
+        len: usize,
+    },
+    /// Read one typed value.
+    Peek {
+        #[command(flatten)]
+        conn: ConnArgs,
+        /// `u8`, `u16`, `u32`, `f32`, or `vec3`.
+        #[arg(value_parser = PeekType::parse)]
+        ty: PeekType,
+        #[arg(value_parser = parse_hex_u32, value_name = "ADDR")]
+        guest: u32,
+    },
     /// Measure Azahar RPC latency and throughput on localhost.
     BenchRpc {
         /// RPC server address (Azahar default: 127.0.0.1:45987).
         #[arg(long, default_value = "127.0.0.1:45987")]
         addr: SocketAddr,
-
         /// Guest address used for small reads (must be readable when a game is loaded).
-        #[arg(long, default_value = "0x00100000")]
+        #[arg(long, default_value = "0x00100000", value_parser = parse_hex_u32)]
         read_addr: u32,
-
         /// Duration of the sustained throughput phase.
         #[arg(long, default_value_t = 10)]
         seconds: u64,
     },
 }
 
+#[derive(clap::Args)]
+struct ConnArgs {
+    /// Azahar RPC address.
+    #[arg(long, default_value = "127.0.0.1:45987")]
+    addr: SocketAddr,
+    /// Guest title id to attach, in hex. Default is MHXX JP.
+    #[arg(long, default_value = "0x0004000000197100", value_parser = parse_hex_u64)]
+    title_id: u64,
+    /// Per-request RPC timeout in milliseconds.
+    #[arg(long, default_value_t = 200)]
+    timeout_ms: u64,
+}
+
+impl ConnArgs {
+    fn timeout(&self) -> Duration {
+        Duration::from_millis(self.timeout_ms)
+    }
+}
+
 fn main() {
-    if let Err(e) = run() {
-        eprintln!("error: {e}");
+    if let Err(err) = run() {
+        eprintln!("error: {err}");
         std::process::exit(1);
     }
 }
 
-fn run() -> mhdn_rpc::Result<()> {
+fn run() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
+        Commands::Attach { conn } => cmd_attach(conn),
+        Commands::Hexdump { conn, guest, len } => cmd_hexdump(conn, guest, len),
+        Commands::Peek { conn, ty, guest } => cmd_peek(conn, ty, guest),
         Commands::BenchRpc {
             addr,
             read_addr,
@@ -50,7 +104,46 @@ fn run() -> mhdn_rpc::Result<()> {
     }
 }
 
-fn bench_rpc(addr: SocketAddr, read_addr: u32, seconds: u64) -> mhdn_rpc::Result<()> {
+fn cmd_attach(conn: ConnArgs) -> Result<()> {
+    let mut attached = attach::attach(conn.addr, conn.title_id, conn.timeout())?;
+    println!("MHXX JP title_id=0x{:016X}", attach::MHXX_JP_TITLE_ID);
+    print!("{}", attach::format_process_list(&attached.processes));
+    println!(
+        "selected pid={} title_id=0x{:016X} name={}",
+        attached.selected.pid,
+        attached.selected.title_id,
+        attached.selected.name_str()
+    );
+    let confirmed = attached.client.selected_process()?;
+    println!("RPC selected pid={confirmed}");
+    Ok(())
+}
+
+fn cmd_hexdump(conn: ConnArgs, addr: u32, len: usize) -> Result<()> {
+    if len == 0 {
+        return Err(error::ProbeError::msg("length must be greater than 0"));
+    }
+    if len > 1024 * 1024 {
+        return Err(error::ProbeError::msg(
+            "hexdump refuses lengths above 1 MiB; use `dump` for larger regions",
+        ));
+    }
+    let mut attached = attach::attach(conn.addr, conn.title_id, conn.timeout())?;
+    let mut buf = vec![0u8; len];
+    attached.client.read(addr, &mut buf)?;
+    println!("{}", format::hexdump(addr, &buf));
+    Ok(())
+}
+
+fn cmd_peek(conn: ConnArgs, ty: PeekType, addr: u32) -> Result<()> {
+    let mut attached = attach::attach(conn.addr, conn.title_id, conn.timeout())?;
+    let mut buf = vec![0u8; ty.size()];
+    attached.client.read(addr, &mut buf)?;
+    println!("{}", format::format_peek(ty, addr, &buf));
+    Ok(())
+}
+
+fn bench_rpc(addr: SocketAddr, read_addr: u32, seconds: u64) -> Result<()> {
     let mut client = RpcClient::connect(addr, Duration::from_millis(20))?;
     let _ = client.list_processes()?;
 
@@ -82,8 +175,8 @@ fn bench_rpc(addr: SocketAddr, read_addr: u32, seconds: u64) -> mhdn_rpc::Result
         let mut reqs: Vec<ReadReq<'_>> = bufs
             .iter_mut()
             .zip(addrs.iter())
-            .map(|(buf, &addr)| ReadReq {
-                addr,
+            .map(|(buf, &guest)| ReadReq {
+                addr: guest,
                 buf: buf.as_mut(),
             })
             .collect();

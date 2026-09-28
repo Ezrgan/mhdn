@@ -13,3 +13,4 @@ path = "src/main.rs"
 [dependencies]
 clap.workspace = true
 mhdn-rpc = { path = "../mhdn-rpc" }
+thiserror.workspace = true
