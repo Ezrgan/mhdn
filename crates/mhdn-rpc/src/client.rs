@@ -145,7 +145,7 @@ impl RpcClient {
             let req_payload = read_processes
                 .to_le_bytes()
                 .into_iter()
-                .chain(0x7FFF_FFFFu32.to_le_bytes().into_iter());
+                .chain(0x7FFF_FFFFu32.to_le_bytes());
             let payload: Vec<u8> = req_payload.collect();
             let reply = self.exchange(PacketType::ProcessList, &payload, 1)?;
             if reply.len() < 4 {
