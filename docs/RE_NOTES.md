@@ -117,3 +117,41 @@ three quests, and after a game restart.
 cargo run -p mhdn-probe -- peek u32 0x00D2CAA0
 cargo run -p mhdn-probe -- ptrverify 0x00D2CAA0+0x14+0x10A8+0x360
 ```
+
+---
+
+## Game version fingerprint
+
+Checked on 2026-09-27 against the Azahar install on this machine.
+
+| Source | Value |
+|---|---|
+| Base title | MHXX JP `0004000000197100` |
+| Update title | `0004000E00197100` |
+| TMD | `~/Library/Application Support/Azahar/sdmc/.../title/0004000e/00197100/content/00000001.tmd` |
+| Title version at TMD `0x1DC` (u16 big-endian) | **4224** (`0x1080`) |
+
+4224 is the v1.4 update (4160) plus 64, which matches the Spanish patch raising the version so it replaces the official update. There is no official untranslated v1.4 dump on this machine, so `.text` hashes cannot be compared against that build. `mhdn-probe game-info` hashes eight 4 KiB windows at `0x00100000 + k*0x40000` with xxh3. Those hashes are still `0` in the profile until a session with the RPC server fills them in. Until then, profile selection is provisional on the title id.
+
+```bash
+cargo run -p mhdn-probe -- game-info --profile profiles/mhxx-jp-v1.4-es.toml
+```
+
+---
+
+## Live sessions still required
+
+The probe can run these checks. The offsets are not in the profile yet, because they have to be found in a running game and confirmed more than once. Filling them in without that evidence would make the overlay read the wrong memory.
+
+| Plan | What to do once Azahar is in a quest with the RPC server on |
+|---|---|
+| 2.10 frame counter | `scan new u32 unknown`, then `scan next inc` until a value climbs by 1 at 30 Hz and freezes in a menu |
+| 2.11 scene flags | Scan values that change only on village → loading → quest → village, plus the reference visibility byte |
+| 2.12 hunter position | In the village, `scan new f32 unknown`, walk, then `inc` / `dec` / `unchanged`, and keep the contiguous `vec3` |
+| 2.13 monster position | `watch` ±0x2000 around the monster struct; the `vec3` moves when the monster walks and matches distance to the hunter |
+| 2.14 camera | Rotate the camera and look for an eye on a sphere around the hunter, or `findmat` on two dumps |
+| 2.15 stability | `ptrverify` on 5 cold boots × 3 quests × 2 zones, with and without a save state |
+| 2.16 traces | `record --profile profiles/mhxx-jp-v1.4-es.toml --out tests/traces/<name>.mhrec --seconds 120` for the six sessions in the plan |
+| 2.17 multiplayer | Record the same quest on the host and on a LAN client and compare HP timing |
+
+Definition of done for those rows: each offset has an entry here with the method, the date, the game version, and at least three separate confirmations.

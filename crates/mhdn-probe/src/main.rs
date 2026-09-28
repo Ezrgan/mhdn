@@ -2,6 +2,7 @@ mod attach;
 mod dump;
 mod error;
 mod findmat;
+mod fingerprint;
 mod format;
 mod parse;
 mod ptrscan;
@@ -34,6 +35,20 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Show title id, update TMD version, and `.text` xxh3 fingerprints.
+    GameInfo {
+        #[command(flatten)]
+        conn: ConnArgs,
+        /// Update TMD (`0004000e/00197100/content/*.tmd`). Defaults to the Azahar path on macOS.
+        #[arg(long)]
+        tmd: Option<PathBuf>,
+        /// Profile to compare fingerprints against.
+        #[arg(long)]
+        profile: Option<PathBuf>,
+        /// How many 4 KiB `.text` windows to hash when the profile has none.
+        #[arg(long, default_value_t = 8)]
+        windows: u32,
+    },
     /// List Azahar processes and select MHXX.
     Attach {
         #[command(flatten)]
@@ -223,6 +238,12 @@ fn main() {
 fn run() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
+        Commands::GameInfo {
+            conn,
+            tmd,
+            profile,
+            windows,
+        } => cmd_game_info(conn, tmd, profile, windows),
         Commands::Attach { conn } => cmd_attach(conn),
         Commands::Hexdump { conn, guest, len } => cmd_hexdump(conn, guest, len),
         Commands::Dump {
@@ -270,6 +291,70 @@ fn run() -> Result<()> {
             seconds,
         } => bench_rpc(addr, read_addr, seconds),
     }
+}
+
+fn cmd_game_info(
+    conn: ConnArgs,
+    tmd: Option<PathBuf>,
+    profile_path: Option<PathBuf>,
+    windows: u32,
+) -> Result<()> {
+    let tmd_path = tmd.or_else(fingerprint::default_azahar_update_tmd);
+    match tmd_path {
+        Some(path) => match fingerprint::read_tmd_title_version(&path) {
+            Ok(version) => println!(
+                "update title version {version} (0x{version:04X}) from {}",
+                path.display()
+            ),
+            Err(err) => println!("tmd: {err}"),
+        },
+        None => println!("tmd: not found (pass --tmd)"),
+    }
+
+    let profile = match profile_path {
+        Some(path) => Some(mhdn_game::Profile::load(path)?),
+        None => None,
+    };
+
+    match attach::attach(conn.addr, conn.title_id, conn.timeout()) {
+        Ok(mut attached) => {
+            println!(
+                "process pid={} title_id=0x{:016X} name={}",
+                attached.selected.pid,
+                attached.selected.title_id,
+                attached.selected.name_str()
+            );
+            let windows = match &profile {
+                Some(profile) if !profile.meta.fingerprint.is_empty() => profile
+                    .meta
+                    .fingerprint
+                    .iter()
+                    .map(|window| (window.addr, window.len))
+                    .collect::<Vec<_>>(),
+                _ => fingerprint::text_windows(windows),
+            };
+            let hashes = fingerprint::hash_windows(&mut attached.client, &windows)?;
+            for ((addr, len), (_, hash)) in windows.iter().zip(&hashes) {
+                println!("xxh3 0x{addr:08X} len={len} 0x{hash:016X}");
+            }
+            if let Some(profile) = &profile {
+                let observed: Vec<_> = hashes
+                    .iter()
+                    .map(|&(addr, xxh3)| mhdn_game::ObservedWindow { addr, xxh3 })
+                    .collect();
+                match mhdn_game::select(
+                    std::slice::from_ref(profile),
+                    attached.selected.title_id,
+                    &observed,
+                ) {
+                    Some(selection) => println!("profile {} ({:?})", profile.id(), selection.kind),
+                    None => println!("profile {} does not match this process", profile.id()),
+                }
+            }
+        }
+        Err(err) => println!("rpc: {err}"),
+    }
+    Ok(())
 }
 
 fn cmd_attach(conn: ConnArgs) -> Result<()> {
