@@ -9,3 +9,7 @@ publish = false
 [[bin]]
 name = "mhdn-probe"
 path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+mhdn-rpc = { path = "../mhdn-rpc" }
