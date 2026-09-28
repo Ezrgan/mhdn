@@ -7,3 +7,8 @@ license.workspace = true
 publish = false
 
 [lib]
+
+[dependencies]
+thiserror.workspace = true
+
+[dev-dependencies]
