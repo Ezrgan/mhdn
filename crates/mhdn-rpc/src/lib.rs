@@ -5,6 +5,7 @@
 mod client;
 mod error;
 mod packet;
+mod pipeline;
 
 #[doc(hidden)]
 pub mod fake_server;
