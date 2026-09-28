@@ -1,6 +1,7 @@
 mod attach;
 mod dump;
 mod error;
+mod findmat;
 mod format;
 mod parse;
 mod ptrscan;
@@ -64,6 +65,17 @@ enum Commands {
     Scan {
         #[command(subcommand)]
         action: ScanCmd,
+    },
+    /// Find view and projection matrix candidates in a dump.
+    Findmat {
+        dump: PathBuf,
+        #[arg(long, value_parser = parse_hex_u32)]
+        base: u32,
+        /// Second dump (camera moved). Hits that did not change are dropped.
+        #[arg(long)]
+        diff: Option<PathBuf>,
+        #[arg(long, default_value_t = 32)]
+        limit: usize,
     },
     /// Find pointer chains from a static range to a target address, using a dump.
     Ptrscan {
@@ -203,6 +215,12 @@ fn run() -> Result<()> {
             file,
         } => cmd_dump(conn, start, end, file),
         Commands::Scan { action } => cmd_scan(action),
+        Commands::Findmat {
+            dump,
+            base,
+            diff,
+            limit,
+        } => cmd_findmat(dump, base, diff, limit),
         Commands::Ptrscan {
             target,
             dump,
@@ -355,6 +373,31 @@ fn cmd_scan(action: ScanCmd) -> Result<()> {
                 );
             }
         }
+    }
+    Ok(())
+}
+
+fn cmd_findmat(dump_path: PathBuf, base: u32, diff: Option<PathBuf>, limit: usize) -> Result<()> {
+    let image = std::fs::read(&dump_path)?;
+    let other = match diff {
+        Some(path) => {
+            let bytes = std::fs::read(&path)?;
+            if bytes.len() != image.len() {
+                return Err(error::ProbeError::msg(
+                    "diff dump must be the same size as the first dump",
+                ));
+            }
+            Some(bytes)
+        }
+        None => None,
+    };
+    let hits = findmat::find_matrices(base, &image, other.as_deref());
+    println!("{} matrix candidate(s)", hits.len());
+    for hit in hits.iter().take(limit) {
+        println!("0x{:08X}  {:?}", hit.addr, hit.kind);
+    }
+    if hits.len() > limit {
+        println!("… {} more (raise --limit)", hits.len() - limit);
     }
     Ok(())
 }
