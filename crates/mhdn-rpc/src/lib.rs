@@ -6,6 +6,9 @@ mod client;
 mod error;
 mod packet;
 
+#[doc(hidden)]
+pub mod fake_server;
+
 pub use client::{ProcessInfo, ReadReq, RpcClient, DEFAULT_PIPELINE_WINDOW, DEFAULT_REQUEST_TIMEOUT};
 pub use error::{Result, RpcError};
 pub use packet::{
