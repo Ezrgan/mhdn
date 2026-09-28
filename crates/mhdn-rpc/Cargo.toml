@@ -1,0 +1,9 @@
+[package]
+name = "mhdn-rpc"
+description = "UDP client for the Azahar/Citra RPC memory server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]

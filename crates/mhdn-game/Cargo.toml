@@ -1,0 +1,9 @@
+[package]
+name = "mhdn-game"
+description = "Game profiles, memory layouts, snapshots, and passive damage derivation"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]

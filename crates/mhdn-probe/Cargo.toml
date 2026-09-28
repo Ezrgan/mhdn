@@ -1,0 +1,11 @@
+[package]
+name = "mhdn-probe"
+description = "CLI for reverse engineering: scan, watch, dump, record"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "mhdn-probe"
+path = "src/main.rs"

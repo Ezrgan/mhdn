@@ -1,0 +1,22 @@
+/target/
+**/*.rs.bk
+*.pdb
+
+# Reverse-engineering artifacts (never commit game code)
+*.bin
+dumps/
+*.ips
+*.3gx
+
+# Recorded sessions (large traces use Git LFS or stay local)
+tests/traces/*.mhrec
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# Build outputs
+*.app
+dist/

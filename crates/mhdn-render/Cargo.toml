@@ -1,0 +1,9 @@
+[package]
+name = "mhdn-render"
+description = "wgpu renderer, MSDF glyph atlas, instanced quads"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]

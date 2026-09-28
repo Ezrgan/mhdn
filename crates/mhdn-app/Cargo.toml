@@ -1,0 +1,11 @@
+[package]
+name = "mhdn-app"
+description = "MHXX damage numbers overlay application"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "mhdn"
+path = "src/main.rs"

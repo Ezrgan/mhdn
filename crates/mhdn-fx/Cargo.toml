@@ -1,0 +1,9 @@
+[package]
+name = "mhdn-fx"
+description = "Floating damage number animation (no graphics dependencies)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]

@@ -1,0 +1,9 @@
+[package]
+name = "mhdn-proj"
+description = "Camera projection and Azahar framebuffer layout resolution"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
