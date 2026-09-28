@@ -1,9 +1,11 @@
 mod attach;
+mod dump;
 mod error;
 mod format;
 mod parse;
 
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use clap::{Parser, Subcommand};
@@ -39,6 +41,19 @@ enum Commands {
         guest: u32,
         /// Number of bytes to read.
         len: usize,
+    },
+    /// Dump a guest address range to a raw file (pair it with `--base` later).
+    Dump {
+        #[command(flatten)]
+        conn: ConnArgs,
+        /// First guest address to include.
+        #[arg(value_parser = parse_hex_u32, value_name = "START")]
+        start: u32,
+        /// Exclusive end address.
+        #[arg(value_parser = parse_hex_u32, value_name = "END")]
+        end: u32,
+        /// Output path. Raw bytes, no header. `*.bin` is gitignored.
+        file: PathBuf,
     },
     /// Read one typed value.
     Peek {
@@ -95,6 +110,12 @@ fn run() -> Result<()> {
     match cli.command {
         Commands::Attach { conn } => cmd_attach(conn),
         Commands::Hexdump { conn, guest, len } => cmd_hexdump(conn, guest, len),
+        Commands::Dump {
+            conn,
+            start,
+            end,
+            file,
+        } => cmd_dump(conn, start, end, file),
         Commands::Peek { conn, ty, guest } => cmd_peek(conn, ty, guest),
         Commands::BenchRpc {
             addr,
@@ -132,6 +153,20 @@ fn cmd_hexdump(conn: ConnArgs, addr: u32, len: usize) -> Result<()> {
     let mut buf = vec![0u8; len];
     attached.client.read(addr, &mut buf)?;
     println!("{}", format::hexdump(addr, &buf));
+    Ok(())
+}
+
+fn cmd_dump(conn: ConnArgs, start: u32, end: u32, file: PathBuf) -> Result<()> {
+    let mut attached = attach::attach(conn.addr, conn.title_id, conn.timeout())?;
+    let stats = dump::dump_to_file(&mut attached.client, start, end, &file)?;
+    println!(
+        "wrote {} bytes to {} in {:.3?} (guest 0x{start:08X}..0x{end:08X})",
+        stats.bytes,
+        file.display(),
+        stats.elapsed
+    );
+    println!("reload with FileMemorySource base 0x{start:08X}");
+    println!("faster path: Azahar GDB stub, see docs/RE_NOTES.md#memory-dumps");
     Ok(())
 }
 

@@ -32,3 +32,36 @@ cargo run -p mhdn-probe -- bench-rpc --read-addr 0x00100000 --seconds 10
 | Fecha | SO / CPU | p50 4 B | p99 4 B | p99 1 KiB | p99 batch 32×4 B | req/s 10 s | FPS Azahar antes | FPS durante |
 |---|---|---|---|---|---|---|---|---|
 | _pendiente_ | macOS | — | — | — | — | — | — | — |
+
+---
+
+## Memory dumps
+
+`mhdn-probe dump` reads a guest range through the RPC and writes raw bytes (no header).
+Pass the start address back in as the base when loading the file.
+
+```bash
+cargo run -p mhdn-probe -- dump 0x08000000 0x09000000 dumps/heap.bin
+```
+
+Typical guest regions:
+
+| Region | Start |
+|---|---|
+| code (`.text`) | `0x00100000` |
+| heap | `0x08000000` |
+| linear heap | `0x14000000` or `0x30000000` |
+
+RPC dumps are reliable and slow. For a large region, the GDB stub is faster
+(enable it only while doing RE; default port **24689**):
+
+```bash
+arm-none-eabi-gdb -batch \
+  -ex "target remote :24689" \
+  -ex "dump memory dumps/heap.bin 0x08000000 0x09000000" \
+  -ex "detach" \
+  -ex "quit"
+```
+
+The file is the same flat image: guest address = base + file offset.
+Do not commit `*.bin` or `dumps/`.
