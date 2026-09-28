@@ -10,6 +10,7 @@ dumps/
 
 # Recorded sessions (large traces use Git LFS or stay local)
 tests/traces/*.mhrec
+*.mhscan
 
 # IDE / OS
 .idea/

@@ -3,8 +3,10 @@ mod dump;
 mod error;
 mod format;
 mod parse;
+mod scan;
 
 use std::net::SocketAddr;
+use std::ops::Range;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -13,7 +15,8 @@ use mhdn_rpc::{ReadReq, RpcClient};
 
 use crate::error::Result;
 use crate::format::PeekType;
-use crate::parse::{parse_hex_u32, parse_hex_u64};
+use crate::parse::{parse_hex_u32, parse_hex_u64, parse_range};
+use crate::scan::ValueType;
 
 #[derive(Parser)]
 #[command(
@@ -55,6 +58,11 @@ enum Commands {
         /// Output path. Raw bytes, no header. `*.bin` is gitignored.
         file: PathBuf,
     },
+    /// Cheat-engine style value scan. Candidates are stored in a session file.
+    Scan {
+        #[command(subcommand)]
+        action: ScanCmd,
+    },
     /// Read one typed value.
     Peek {
         #[command(flatten)]
@@ -76,6 +84,40 @@ enum Commands {
         /// Duration of the sustained throughput phase.
         #[arg(long, default_value_t = 10)]
         seconds: u64,
+    },
+}
+
+#[derive(Subcommand)]
+enum ScanCmd {
+    /// First pass: `unknown` or an exact value.
+    New {
+        #[command(flatten)]
+        conn: ConnArgs,
+        #[arg(value_parser = ValueType::parse)]
+        ty: ValueType,
+        /// `unknown` or the exact value to keep (`100`, `0x64`, `1.5`).
+        query: String,
+        /// Guest range `START-END` (end exclusive), e.g. `0x08000000-0x09000000`.
+        #[arg(long, value_parser = parse_range)]
+        range: Range<u32>,
+        #[arg(long, default_value = scan::DEFAULT_SESSION)]
+        session: PathBuf,
+    },
+    /// Narrow the session with eq, ne, gt, lt, inc, dec, changed, or unchanged.
+    Next {
+        #[command(flatten)]
+        conn: ConnArgs,
+        filter: String,
+        value: Option<String>,
+        #[arg(long, default_value = scan::DEFAULT_SESSION)]
+        session: PathBuf,
+    },
+    /// Print candidates from the session (last scanned value, no RPC read).
+    List {
+        #[arg(long, default_value = scan::DEFAULT_SESSION)]
+        session: PathBuf,
+        #[arg(long, default_value_t = 32)]
+        limit: usize,
     },
 }
 
@@ -116,6 +158,7 @@ fn run() -> Result<()> {
             end,
             file,
         } => cmd_dump(conn, start, end, file),
+        Commands::Scan { action } => cmd_scan(action),
         Commands::Peek { conn, ty, guest } => cmd_peek(conn, ty, guest),
         Commands::BenchRpc {
             addr,
@@ -167,6 +210,91 @@ fn cmd_dump(conn: ConnArgs, start: u32, end: u32, file: PathBuf) -> Result<()> {
     );
     println!("reload with FileMemorySource base 0x{start:08X}");
     println!("faster path: Azahar GDB stub, see docs/RE_NOTES.md#memory-dumps");
+    Ok(())
+}
+
+fn cmd_scan(action: ScanCmd) -> Result<()> {
+    match action {
+        ScanCmd::New {
+            conn,
+            ty,
+            query,
+            range,
+            session,
+        } => {
+            let query = if query.eq_ignore_ascii_case("unknown") {
+                scan::InitialQuery::Unknown
+            } else {
+                scan::InitialQuery::Equal(
+                    scan::parse_scan_value(ty, &query).map_err(error::ProbeError::msg)?,
+                )
+            };
+            let len = (range.end - range.start) as usize;
+            if len > 128 * 1024 * 1024 {
+                return Err(error::ProbeError::msg(
+                    "scan range is above 128 MiB; narrow --range",
+                ));
+            }
+            let mut attached = attach::attach(conn.addr, conn.title_id, conn.timeout())?;
+            let data = dump::read_range(&mut attached.client, range.start, range.end)?;
+            let snapshot = scan::scan_new(range, &data, ty, query)?;
+            scan::save_snapshot(&session, &snapshot)?;
+            println!(
+                "{} candidates in 0x{:08X}..0x{:08X} → {}",
+                snapshot.candidates.len(),
+                snapshot.range.start,
+                snapshot.range.end,
+                session.display()
+            );
+        }
+        ScanCmd::Next {
+            conn,
+            filter,
+            value,
+            session,
+        } => {
+            let previous = scan::load_snapshot(&session)?;
+            let filter = scan::Filter::parse(&filter, previous.ty, value.as_deref())
+                .map_err(error::ProbeError::msg)?;
+            let mut attached = attach::attach(conn.addr, conn.title_id, conn.timeout())?;
+            let data = dump::read_range(
+                &mut attached.client,
+                previous.range.start,
+                previous.range.end,
+            )?;
+            let snapshot = scan::scan_next(&previous, &data, filter)?;
+            scan::save_snapshot(&session, &snapshot)?;
+            println!(
+                "{} candidates (was {}) → {}",
+                snapshot.candidates.len(),
+                previous.candidates.len(),
+                session.display()
+            );
+        }
+        ScanCmd::List { session, limit } => {
+            let snapshot = scan::load_snapshot(&session)?;
+            println!(
+                "{} candidates, type {:?}, range 0x{:08X}..0x{:08X}",
+                snapshot.candidates.len(),
+                snapshot.ty,
+                snapshot.range.start,
+                snapshot.range.end
+            );
+            for candidate in snapshot.candidates.iter().take(limit) {
+                println!(
+                    "0x{:08X} = {}",
+                    candidate.addr,
+                    scan::format_value(snapshot.ty, candidate.prev)
+                );
+            }
+            if snapshot.candidates.len() > limit {
+                println!(
+                    "… {} more (raise --limit)",
+                    snapshot.candidates.len() - limit
+                );
+            }
+        }
+    }
     Ok(())
 }
 

@@ -65,3 +65,25 @@ arm-none-eabi-gdb -batch \
 
 The file is the same flat image: guest address = base + file offset.
 Do not commit `*.bin` or `dumps/`.
+
+---
+
+## Value scanner
+
+`mhdn-probe scan` is a Cheat Engine style search over a guest range. The candidate
+list lives in `scan.mhscan` (gitignored). Float compares use an absolute epsilon of `1e-4`.
+
+```bash
+# HP drops on hit. Repeat `next lt` or `next dec` after each hit.
+cargo run -p mhdn-probe -- scan new u32 unknown --range 0x08000000-0x0A000000
+cargo run -p mhdn-probe -- scan next dec
+cargo run -p mhdn-probe -- scan list
+
+# Position: walk forward, then stand still.
+cargo run -p mhdn-probe -- scan new f32 unknown --range 0x08000000-0x0A000000
+cargo run -p mhdn-probe -- scan next inc
+cargo run -p mhdn-probe -- scan next unchanged
+```
+
+A first `unknown` pass stores every aligned value in the range. Narrow `--range`
+before doing that on a full heap.
