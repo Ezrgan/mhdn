@@ -5,7 +5,10 @@ use clap::{Parser, Subcommand};
 use mhdn_rpc::{ReadReq, RpcClient};
 
 #[derive(Parser)]
-#[command(name = "mhdn-probe", about = "MHXX reverse-engineering CLI (see PLAN.md)")]
+#[command(
+    name = "mhdn-probe",
+    about = "MHXX reverse-engineering CLI (see PLAN.md)"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -79,7 +82,10 @@ fn bench_rpc(addr: SocketAddr, read_addr: u32, seconds: u64) -> mhdn_rpc::Result
         let mut reqs: Vec<ReadReq<'_>> = bufs
             .iter_mut()
             .zip(addrs.iter())
-            .map(|(buf, &addr)| ReadReq { addr, buf: buf.as_mut() })
+            .map(|(buf, &addr)| ReadReq {
+                addr,
+                buf: buf.as_mut(),
+            })
             .collect();
         let t0 = Instant::now();
         client.read_many(&mut reqs)?;
@@ -94,9 +100,7 @@ fn bench_rpc(addr: SocketAddr, read_addr: u32, seconds: u64) -> mhdn_rpc::Result
         total_reads += 1;
     }
     let req_per_s = total_reads as f64 / seconds as f64;
-    println!(
-        "sustained {seconds}s: {total_reads} single reads ({req_per_s:.0} req/s)"
-    );
+    println!("sustained {seconds}s: {total_reads} single reads ({req_per_s:.0} req/s)");
     println!("Note: compare Azahar FPS/title bar before and during this test.");
     println!("Document results in docs/RE_NOTES.md#rpc-bench");
 

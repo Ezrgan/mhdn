@@ -1,6 +1,6 @@
 //! Azahar/Citra RPC packet header and payload layout (see `dist/scripting/citra.py`).
 
-use crate::error::{RpcError, Result};
+use crate::error::{Result, RpcError};
 
 /// Protocol version shared by request and response headers.
 pub const PROTOCOL_VERSION: u32 = 1;
@@ -97,11 +97,7 @@ pub fn split_datagram(raw: &[u8]) -> Result<(PacketHeader, &[u8])> {
 }
 
 /// Validate response header against the outstanding request.
-pub fn validate_response(
-    raw: &[u8],
-    expected_id: u32,
-    expected_type: PacketType,
-) -> Result<&[u8]> {
+pub fn validate_response(raw: &[u8], expected_id: u32, expected_type: PacketType) -> Result<&[u8]> {
     let (header, payload) = split_datagram(raw)?;
     if header.version != PROTOCOL_VERSION {
         return Err(RpcError::VersionMismatch {
@@ -172,8 +168,7 @@ mod tests {
         let mut raw = Vec::new();
         raw.extend_from_slice(&PacketHeader::new(5, PacketType::SetGetProcess, 4).encode());
         raw.extend_from_slice(&123u32.to_le_bytes());
-        let payload =
-            validate_response(&raw, 5, PacketType::SetGetProcess).unwrap();
+        let payload = validate_response(&raw, 5, PacketType::SetGetProcess).unwrap();
         assert_eq!(payload, 123u32.to_le_bytes());
     }
 

@@ -15,9 +15,7 @@ pub use client::{
     ProcessInfo, ReadReq, RpcClient, DEFAULT_PIPELINE_WINDOW, DEFAULT_REQUEST_TIMEOUT,
 };
 pub use error::{Result, RpcError};
-pub use memory_source::{
-    read_dump_range, FileMemorySource, MemorySource, ReplaySource,
-};
+pub use memory_source::{read_dump_range, FileMemorySource, MemorySource, ReplaySource};
 pub use packet::{
     PacketHeader, PacketType, MAX_PACKET_DATA_SIZE, MAX_PACKET_SIZE, PROTOCOL_VERSION,
 };

@@ -1,5 +1,5 @@
 use crate::client::RpcClient;
-use crate::error::{RpcError, Result};
+use crate::error::{Result, RpcError};
 use crate::packet::{self, PacketType, MAX_PACKET_DATA_SIZE, MAX_PACKET_SIZE};
 use crate::ReadReq;
 
@@ -37,8 +37,7 @@ impl RpcClient {
                 }
                 let id = self.next_request_id();
                 let addr = reqs[next_req].addr;
-                let req_payload =
-                    [addr.to_le_bytes(), (len as u32).to_le_bytes()].concat();
+                let req_payload = [addr.to_le_bytes(), (len as u32).to_le_bytes()].concat();
                 self.send_request(id, PacketType::ReadMemory, &req_payload)?;
                 pending.push(Pending {
                     id,

@@ -1,7 +1,7 @@
 use std::net::{SocketAddr, UdpSocket};
 use std::time::Duration;
 
-use crate::error::{RpcError, Result};
+use crate::error::{Result, RpcError};
 use crate::packet::{self, PacketHeader, PacketType, MAX_PACKET_DATA_SIZE, MAX_PACKET_SIZE};
 
 /// One process entry returned by [`RpcClient::list_processes`].
@@ -98,11 +98,7 @@ impl RpcClient {
         Ok(())
     }
 
-    fn recv_response(
-        &mut self,
-        expected_id: u32,
-        expected_type: PacketType,
-    ) -> Result<Vec<u8>> {
+    fn recv_response(&mut self, expected_id: u32, expected_type: PacketType) -> Result<Vec<u8>> {
         let mut buf = [0u8; MAX_PACKET_SIZE];
         let len = match self.socket.recv(&mut buf) {
             Ok(n) => n,
@@ -146,11 +142,10 @@ impl RpcClient {
         let mut processes = Vec::new();
         let mut read_processes = 0u32;
         loop {
-            let req_payload = read_processes.to_le_bytes().into_iter().chain(
-                0x7FFF_FFFFu32
-                    .to_le_bytes()
-                    .into_iter(),
-            );
+            let req_payload = read_processes
+                .to_le_bytes()
+                .into_iter()
+                .chain(0x7FFF_FFFFu32.to_le_bytes().into_iter());
             let payload: Vec<u8> = req_payload.collect();
             let reply = self.exchange(PacketType::ProcessList, &payload, 1)?;
             if reply.len() < 4 {
