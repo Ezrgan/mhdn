@@ -4,6 +4,7 @@ mod error;
 mod format;
 mod parse;
 mod scan;
+mod watch;
 
 use std::net::SocketAddr;
 use std::ops::Range;
@@ -62,6 +63,19 @@ enum Commands {
     Scan {
         #[command(subcommand)]
         action: ScanCmd,
+    },
+    /// Print bytes and floats that change between samples.
+    Watch {
+        #[command(flatten)]
+        conn: ConnArgs,
+        #[arg(value_parser = parse_hex_u32, value_name = "ADDR")]
+        guest: u32,
+        len: usize,
+        #[arg(long, default_value_t = 30)]
+        hz: u32,
+        /// Stop after this many seconds. `0` watches until Ctrl-C.
+        #[arg(long, default_value_t = 0)]
+        seconds: u64,
     },
     /// Read one typed value.
     Peek {
@@ -159,6 +173,13 @@ fn run() -> Result<()> {
             file,
         } => cmd_dump(conn, start, end, file),
         Commands::Scan { action } => cmd_scan(action),
+        Commands::Watch {
+            conn,
+            guest,
+            len,
+            hz,
+            seconds,
+        } => cmd_watch(conn, guest, len, hz, seconds),
         Commands::Peek { conn, ty, guest } => cmd_peek(conn, ty, guest),
         Commands::BenchRpc {
             addr,
@@ -294,6 +315,45 @@ fn cmd_scan(action: ScanCmd) -> Result<()> {
                 );
             }
         }
+    }
+    Ok(())
+}
+
+fn cmd_watch(conn: ConnArgs, guest: u32, len: usize, hz: u32, seconds: u64) -> Result<()> {
+    if len == 0 || len > 4096 {
+        return Err(error::ProbeError::msg(
+            "watch length must be between 1 and 4096 bytes",
+        ));
+    }
+    if hz == 0 || hz > 120 {
+        return Err(error::ProbeError::msg(
+            "watch --hz must be between 1 and 120",
+        ));
+    }
+    let mut attached = attach::attach(conn.addr, conn.title_id, conn.timeout())?;
+    let mut prev = vec![0u8; len];
+    attached.client.read(guest, &mut prev)?;
+    println!(
+        "watching 0x{guest:08X} + {len} bytes at {hz} Hz{}",
+        if seconds == 0 {
+            " (Ctrl-C to stop)".to_string()
+        } else {
+            format!(" for {seconds}s")
+        }
+    );
+    let period = Duration::from_secs_f64(1.0 / f64::from(hz));
+    let deadline = (seconds > 0).then(|| Instant::now() + Duration::from_secs(seconds));
+    let mut next = vec![0u8; len];
+    loop {
+        if deadline.is_some_and(|end| Instant::now() >= end) {
+            break;
+        }
+        std::thread::sleep(period);
+        attached.client.read(guest, &mut next)?;
+        let bytes = watch::changed_bytes(guest, &prev, &next)?;
+        let floats = watch::changed_f32(guest, &prev, &next)?;
+        print!("{}", watch::format_diff(&bytes, &floats, 48));
+        prev.copy_from_slice(&next);
     }
     Ok(())
 }
