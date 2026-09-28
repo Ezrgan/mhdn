@@ -1,0 +1,60 @@
+# MHXX JP v1.4 + Spanish patch (title version 4224).
+# Addresses are quoted because TOML has no hexadecimal integer syntax.
+# Monster-list numbers come from the GPLv3 reference overlay and still need a
+# live session before they are treated as confirmed. See docs/RE_NOTES.md.
+
+[meta]
+game = "MHXX"
+region = "JP"
+version = "1.4-es"
+title_id = "0x0004000000197100"
+update_title_version = 4224
+fingerprint = [
+  { addr = "0x00100000", len = 4096, xxh3 = "0x0" },
+  { addr = "0x00140000", len = 4096, xxh3 = "0x0" },
+  { addr = "0x00180000", len = 4096, xxh3 = "0x0" },
+  { addr = "0x001C0000", len = 4096, xxh3 = "0x0" },
+  { addr = "0x00200000", len = 4096, xxh3 = "0x0" },
+  { addr = "0x00240000", len = 4096, xxh3 = "0x0" },
+  { addr = "0x00280000", len = 4096, xxh3 = "0x0" },
+  { addr = "0x002C0000", len = 4096, xxh3 = "0x0" },
+]
+
+[monster_list]
+base_candidates = [
+  { addr = "0x00D2CAA0", expect = ["0x082B7720", "0x082B9660"] },
+  { addr = "0x00D30AA0", expect = ["0x082B98B0"] },
+  { addr = "0x00D3A8E0", expect = ["0x082D0760"] },
+]
+slots = 16
+slot_stride = 4
+slot_offset = "0x14"
+chain = ["0x10A8", "0x360"]
+
+[monster]
+hp = { off = 0, ty = "u32" }
+max_hp = { off = 4, ty = "u32" }
+species = { off = "0x5A18", ty = "u16" }
+size = { off = -432, ty = "f32" }
+pos = "TBD"
+poison = { off = "0x54E4", ty = "u16" }
+visible_flag = { off = -5128, ty = "u8", hidden_value = "0x7" }
+
+[frame_counter]
+chain = "TBD"
+
+[scene]
+chain = "TBD"
+
+[hunter]
+pos = "TBD"
+
+[camera]
+mode = "params"
+fov_unit = "rad"
+eye = "TBD"
+target = "TBD"
+fov_y = "TBD"
+
+[species]
+default_anchor_height = 150.0

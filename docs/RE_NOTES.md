@@ -87,3 +87,33 @@ cargo run -p mhdn-probe -- scan next unchanged
 
 A first `unknown` pass stores every aligned value in the range. Narrow `--range`
 before doing that on a full heap.
+
+---
+
+## Monster list offsets (mhxx-jp-v1.4-es)
+
+Profile: `profiles/mhxx-jp-v1.4-es.toml`.
+
+The static candidates and the in-struct offsets below are **ported from the GPLv3
+reference** *MH-HP-Overlay-For-3DS-Emulator* (`modules/mhxx.py`), not yet confirmed
+on this machine's build (MHXX JP + Spanish patch, title version 4224). A translation
+patch can move static data even when struct layouts stay put. Do not treat them as
+validated until `ptrverify` succeeds on three large monsters, three small monsters,
+three quests, and after a game restart.
+
+| Field | Candidate |
+|---|---|
+| static bases | `0x00D2CAA0`, `0x00D30AA0`, `0x00D3A8E0` (first whose value is in `expect` wins) |
+| slot | `+0x14`, stride 4, 16 slots |
+| chain | `+0x10A8` then `+0x360` |
+| HP / max HP | `+0x0` / `+0x4` u32 |
+| species | `+0x5A18` u16 |
+| size | `-0x1B0` f32 |
+| poison | `+0x54E4` u16 |
+| hidden flag | `-0x1408` u8, hidden when `0x7` |
+| position, frame counter, scene, hunter, camera | unresolved (`TBD`) |
+
+```bash
+cargo run -p mhdn-probe -- peek u32 0x00D2CAA0
+cargo run -p mhdn-probe -- ptrverify 0x00D2CAA0+0x14+0x10A8+0x360
+```
