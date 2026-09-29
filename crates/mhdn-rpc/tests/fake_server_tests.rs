@@ -69,6 +69,60 @@ fn timeout_on_dropped_replies() {
 }
 
 #[test]
+fn write_inside_process_image_is_readable_back() {
+    let (server, _state) = FakeRpcServer::bind();
+    let mut client = RpcClient::connect(server.addr(), Duration::from_millis(500)).unwrap();
+    client
+        .write(0x00D3_2000, &[0x11, 0x22, 0x33, 0x44])
+        .unwrap();
+    let mut buf = [0u8; 4];
+    client.read(0x00D3_2000, &mut buf).unwrap();
+    assert_eq!(buf, [0x11, 0x22, 0x33, 0x44]);
+    server.shutdown();
+}
+
+#[test]
+fn write_outside_azahar_whitelist_is_rejected() {
+    let (server, state) = FakeRpcServer::bind();
+    {
+        let mut st = state.lock().unwrap();
+        st.memory.insert(0x3000_0000, vec![1, 2, 3, 4]);
+    }
+    let mut client = RpcClient::connect(server.addr(), Duration::from_millis(500)).unwrap();
+    let err = client.write(0x3000_0000, &[9, 9, 9, 9]).unwrap_err();
+    assert!(matches!(err, RpcError::WriteRejected { addr: 0x3000_0000 }));
+    let mut buf = [0u8; 4];
+    client.read(0x3000_0000, &mut buf).unwrap();
+    assert_eq!(buf, [1, 2, 3, 4]);
+    server.shutdown();
+}
+
+#[test]
+fn write_chunks_across_the_packet_limit() {
+    let (server, _state) = FakeRpcServer::bind();
+    let mut client = RpcClient::connect(server.addr(), Duration::from_millis(500)).unwrap();
+    let data: Vec<u8> = (0..2000).map(|i| (i % 251) as u8).collect();
+    client.write(0x00BF_2D00, &data).unwrap();
+    let mut got = vec![0u8; data.len()];
+    client.read(0x00BF_2D00, &mut got).unwrap();
+    assert_eq!(got, data);
+    server.shutdown();
+}
+
+#[test]
+#[ignore = "writes 4 bytes of free .bss in a running Azahar and restores them"]
+fn live_bss_write_roundtrip() {
+    let addr = "127.0.0.1:45987".parse().unwrap();
+    let mut client = RpcClient::connect(addr, Duration::from_millis(500)).unwrap();
+    let mut original = [0u8; 4];
+    client.read(0x00D3_2000, &mut original).unwrap();
+    client
+        .write(0x00D3_2000, &[0xA5, 0x5A, 0xA5, 0x5A])
+        .unwrap();
+    client.write(0x00D3_2000, &original).unwrap();
+}
+
+#[test]
 fn pipelined_read_many_with_reorder() {
     let (server, state) = FakeRpcServer::bind();
     {

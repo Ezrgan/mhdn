@@ -222,6 +222,40 @@ impl RpcClient {
         self.socket.recv(buf)
     }
 
+    /// Write `data` at `addr`. Azahar replies with an empty payload both when the
+    /// write lands and when it rejects the address, so this reads the bytes back
+    /// and returns [`RpcError::WriteRejected`] if they do not match.
+    ///
+    /// Each datagram carries at most [`MAX_PACKET_DATA_SIZE`] minus the 8-byte
+    /// address and size header.
+    pub fn write(&mut self, addr: u32, data: &[u8]) -> Result<()> {
+        if data.is_empty() {
+            return Ok(());
+        }
+        let chunk_max = MAX_PACKET_DATA_SIZE - 8;
+        let mut offset = 0usize;
+        let mut cur_addr = addr;
+        while offset < data.len() {
+            let chunk = (data.len() - offset).min(chunk_max);
+            let mut payload = Vec::with_capacity(8 + chunk);
+            payload.extend_from_slice(&cur_addr.to_le_bytes());
+            payload.extend_from_slice(&(chunk as u32).to_le_bytes());
+            payload.extend_from_slice(&data[offset..offset + chunk]);
+            let reply = self.exchange(PacketType::WriteMemory, &payload, 1)?;
+            if !reply.is_empty() {
+                return Err(RpcError::InvalidResponse);
+            }
+            offset += chunk;
+            cur_addr = cur_addr.wrapping_add(chunk as u32);
+        }
+        let mut got = vec![0u8; data.len()];
+        self.read(addr, &mut got)?;
+        if got != data {
+            return Err(RpcError::WriteRejected { addr });
+        }
+        Ok(())
+    }
+
     pub fn read_u32(&mut self, addr: u32) -> Result<u32> {
         let mut buf = [0u8; 4];
         self.read(addr, &mut buf)?;

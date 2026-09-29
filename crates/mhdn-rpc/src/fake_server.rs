@@ -118,6 +118,39 @@ fn run_server(socket: UdpSocket, state: Arc<Mutex<ServerState>>, stop: Arc<Mutex
     }
 }
 
+/// Same start-address check as `RPCServer::HandleWriteMemory` in Azahar
+/// (`src/core/rpc/rpc_server.cpp`). The New 3DS linear alias at `0x30000000`
+/// is not in that list.
+pub fn write_allowed(addr: u32) -> bool {
+    const REGIONS: [(u32, u32); 4] = [
+        (0x0010_0000, 0x0400_0000),
+        (0x0800_0000, 0x1000_0000),
+        (0x1400_0000, 0x1C00_0000),
+        (0x1E80_0000, 0x1EC0_0000),
+    ];
+    REGIONS
+        .iter()
+        .any(|&(start, end)| addr >= start && addr <= end)
+}
+
+fn apply_write(memory: &mut HashMap<u32, Vec<u8>>, addr: u32, data: &[u8]) {
+    let existing = memory.iter_mut().find(|(base, buf)| {
+        let base = **base;
+        (addr >= base && (addr as usize) < (base as usize).saturating_add(buf.len()))
+            || addr == base.wrapping_add(buf.len() as u32)
+    });
+    if let Some((base, buf)) = existing {
+        let off = (addr - *base) as usize;
+        let end = off + data.len();
+        if end > buf.len() {
+            buf.resize(end, 0);
+        }
+        buf[off..end].copy_from_slice(data);
+        return;
+    }
+    memory.insert(addr, data.to_vec());
+}
+
 fn build_reply(st: &mut ServerState, header: PacketHeader, payload: &[u8]) -> Vec<u8> {
     let mut out_payload = Vec::new();
     match header.packet_type {
@@ -169,7 +202,17 @@ fn build_reply(st: &mut ServerState, header: PacketHeader, payload: &[u8]) -> Ve
                 }
             }
         }
-        PacketType::WriteMemory => {}
+        PacketType::WriteMemory => {
+            if payload.len() >= 8 {
+                let addr = u32::from_le_bytes(payload[0..4].try_into().expect("slice"));
+                let size = u32::from_le_bytes(payload[4..8].try_into().expect("slice")) as usize;
+                let data = &payload[8..];
+                if data.len() >= size && write_allowed(addr) {
+                    apply_write(&mut st.memory, addr, &data[..size]);
+                }
+            }
+            // Azahar sends an empty payload for both a landed write and a rejected one.
+        }
     }
     let hdr = PacketHeader::new(header.id, header.packet_type, out_payload.len() as u32);
     let mut datagram = Vec::with_capacity(16 + out_payload.len());

@@ -37,6 +37,9 @@ pub enum RpcError {
     #[error("memory read failed at address 0x{addr:08X}")]
     ReadFailed { addr: u32 },
 
+    #[error("memory write was rejected or did not stick at address 0x{addr:08X}")]
+    WriteRejected { addr: u32 },
+
     #[error("no process selected")]
     NoProcessSelected,
 
