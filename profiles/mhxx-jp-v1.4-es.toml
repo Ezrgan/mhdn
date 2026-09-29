@@ -47,7 +47,12 @@ addr = "0x082C4BB8"
 chain = "TBD"
 
 [scene]
+# in_quest is 7 inside a quest and 0 in the village and on the load screen.
+# loading is a u8: 1 only while the load screen is showing. The bytes above it move for other reasons.
+# The quest-clear / fail screen was not sampled.
 chain = "TBD"
+in_quest = { addr = "0x08142FE0", ty = "u32", value = 7 }
+loading = { addr = "0x00DC5814", ty = "u8", value = 1 }
 
 [hunter]
 # deref(base) + pos.off = feet. Confirmed on 3 boots (docs/RE_NOTES.md).

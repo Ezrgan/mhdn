@@ -104,6 +104,22 @@ pub struct ChainRegion {
     pub chain: ChainSpec,
     #[serde(default, deserialize_with = "de_opt_u32")]
     pub addr: Option<u32>,
+    /// `value` while a quest is running. Village and the load screen hold a different value.
+    #[serde(default)]
+    pub in_quest: Option<SceneFlag>,
+    /// Low byte. `value` only while the load screen is up.
+    #[serde(default)]
+    pub loading: Option<SceneFlag>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SceneFlag {
+    #[serde(deserialize_with = "de_u32")]
+    pub addr: u32,
+    pub ty: FieldType,
+    #[serde(deserialize_with = "de_u32")]
+    pub value: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -353,7 +369,12 @@ impl Profile {
         if self.frame_counter.addr.is_none() {
             push_chain(&mut names, "frame_counter", &self.frame_counter.chain);
         }
-        push_chain(&mut names, "scene", &self.scene.chain);
+        if self.scene.in_quest.is_none()
+            && self.scene.loading.is_none()
+            && self.scene.addr.is_none()
+        {
+            push_chain(&mut names, "scene", &self.scene.chain);
+        }
         push_field(&mut names, "hunter.pos", &self.hunter.pos);
         match self.camera.mode {
             CameraMode::Params => {
@@ -750,8 +771,16 @@ mod tests {
         assert!(third.expect.contains(&0x082C_E730));
         let pending = profile.unresolved_fields();
         assert!(!pending.contains(&"monster.pos"));
-        assert!(pending.contains(&"scene"));
+        assert!(!pending.contains(&"scene"));
         assert!(!pending.contains(&"frame_counter"));
+        let in_quest = profile.scene.in_quest.as_ref().expect("in quest");
+        assert_eq!(in_quest.addr, 0x0814_2FE0);
+        assert_eq!(in_quest.value, 7);
+        assert_eq!(in_quest.ty, FieldType::U32);
+        let loading = profile.scene.loading.as_ref().expect("loading");
+        assert_eq!(loading.addr, 0x00DC_5814);
+        assert_eq!(loading.value, 1);
+        assert_eq!(loading.ty, FieldType::U8);
         assert_eq!(profile.frame_counter.addr, Some(0x082C_4BB8));
         assert_eq!(profile.hunter.base, Some(0x0814_E620));
         match &profile.hunter.pos {
