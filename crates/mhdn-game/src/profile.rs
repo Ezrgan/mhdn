@@ -32,6 +32,9 @@ pub struct Profile {
     pub hunter: HunterProfile,
     pub camera: CameraProfile,
     pub species: SpeciesProfile,
+    /// Absent on profiles that have not confirmed the damage hook.
+    #[serde(default)]
+    pub damage_tap: Option<DamageTap>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -142,6 +145,53 @@ pub enum CameraMode {
 pub enum FovUnit {
     Rad,
     Deg,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DamageTap {
+    #[serde(deserialize_with = "de_u32")]
+    pub hook_addr: u32,
+    #[serde(deserialize_with = "de_u32")]
+    pub return_addr: u32,
+    pub expected_words: Vec<ExpectedWord>,
+    pub cave: MemorySpan,
+    pub ring: TapRing,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExpectedWord {
+    #[serde(deserialize_with = "de_u32")]
+    pub addr: u32,
+    #[serde(deserialize_with = "de_u32")]
+    pub word: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MemorySpan {
+    #[serde(deserialize_with = "de_u32")]
+    pub addr: u32,
+    #[serde(deserialize_with = "de_u32")]
+    pub len: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TapRing {
+    #[serde(deserialize_with = "de_u32")]
+    pub addr: u32,
+    pub capacity: u32,
+    pub entry_size: u32,
+}
+
+impl TapRing {
+    /// Ring slots plus the three words the stub publishes after them
+    /// (`write_seq`, local seq, scratch).
+    pub fn reserved_len(&self) -> Option<u32> {
+        self.capacity.checked_mul(self.entry_size)?.checked_add(12)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -277,6 +327,9 @@ impl Profile {
                 ));
             }
         }
+        if let Some(tap) = &self.damage_tap {
+            validate_damage_tap(tap, &self.meta.fingerprint, &mut errors);
+        }
         if errors.is_empty() {
             Ok(())
         } else {
@@ -375,6 +428,57 @@ pub fn select<'a>(
         }
     }
     provisional
+}
+
+fn validate_damage_tap(tap: &DamageTap, windows: &[FingerprintWindow], errors: &mut Vec<String>) {
+    if tap.expected_words.is_empty() {
+        errors.push("damage_tap.expected_words is empty".to_string());
+    }
+    if tap.cave.len == 0 {
+        errors.push("damage_tap.cave length is 0".to_string());
+    }
+    if tap.ring.capacity == 0 || tap.ring.entry_size == 0 {
+        errors.push("damage_tap.ring capacity and entry_size must be positive".to_string());
+    }
+    let Some(ring_len) = tap.ring.reserved_len() else {
+        errors.push("damage_tap.ring size overflows".to_string());
+        return;
+    };
+    let guarded = [
+        ("hook", tap.hook_addr, 4u32),
+        ("return", tap.return_addr, 4),
+        ("cave", tap.cave.addr, tap.cave.len),
+        ("ring", tap.ring.addr, ring_len),
+    ];
+    for word in &tap.expected_words {
+        if ranges_overlap(word.addr, 4, tap.cave.addr, tap.cave.len)
+            || ranges_overlap(word.addr, 4, tap.ring.addr, ring_len)
+        {
+            errors.push(format!(
+                "damage_tap expected word 0x{:08X} overlaps the cave or the ring",
+                word.addr
+            ));
+        }
+    }
+    for window in windows {
+        for (name, addr, len) in guarded {
+            if ranges_overlap(window.addr, window.len, addr, len) {
+                errors.push(format!(
+                    "fingerprint 0x{:08X} overlaps damage_tap {name} at 0x{addr:08X}",
+                    window.addr
+                ));
+            }
+        }
+    }
+}
+
+fn ranges_overlap(a: u32, a_len: u32, b: u32, b_len: u32) -> bool {
+    if a_len == 0 || b_len == 0 {
+        return false;
+    }
+    let a_end = a.saturating_add(a_len);
+    let b_end = b.saturating_add(b_len);
+    a < b_end && b < a_end
 }
 
 fn is_positive(value: f32) -> bool {
@@ -677,6 +781,26 @@ mod tests {
         assert!(!pending.contains(&"hunter.pos"));
         assert!(!pending.contains(&"camera.eye"));
         assert!(!pending.contains(&"monster.hp"));
+        let tap = profile.damage_tap.as_ref().expect("damage tap");
+        assert_eq!(tap.hook_addr, crate::HOOK_ADDR);
+        assert_eq!(tap.return_addr, crate::RETURN_ADDR);
+        assert_eq!(tap.cave.addr, crate::CAVE_ADDR);
+        assert_eq!(tap.cave.len, 0x300);
+        assert_eq!(tap.ring.addr, crate::RING_ADDR);
+        assert_eq!(tap.ring.capacity, 64);
+        assert_eq!(tap.ring.entry_size, crate::ENTRY_SIZE);
+        assert_eq!(tap.expected_words[0].word, crate::EXPECTED_HOOK);
+        assert_eq!(tap.expected_words[1].word, crate::EXPECTED_NEXT);
+        assert_eq!(tap.expected_words[2].word, crate::EXPECTED_HP_STORE);
+    }
+
+    #[test]
+    fn rejects_a_fingerprint_that_overlaps_the_tap_hook() {
+        let mut profile = Profile::from_toml_str(sample()).unwrap();
+        profile.meta.fingerprint[0].addr = 0x008D_03E0;
+        profile.meta.fingerprint[0].len = 0x20;
+        let err = profile.validate().unwrap_err();
+        assert!(err.to_string().contains("overlaps damage_tap hook"));
     }
 
     #[test]

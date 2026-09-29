@@ -198,6 +198,17 @@ enum TapCmd {
         #[command(flatten)]
         conn: ConnArgs,
     },
+    /// Stay attached and append new hits. One process, one socket.
+    Follow {
+        #[command(flatten)]
+        conn: ConnArgs,
+        /// Boss HP address for this boot, if already resolved.
+        #[arg(long, value_parser = parse_hex_u32)]
+        hp: Option<u32>,
+        /// Append-only log. Defaults to `dumps/tap-live.log`.
+        #[arg(long)]
+        log: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -316,6 +327,13 @@ fn run() -> Result<()> {
                 tap_cmd::uninstall(conn.addr, conn.title_id, conn.timeout())
             }
             TapCmd::Events { conn } => tap_cmd::events(conn.addr, conn.title_id, conn.timeout()),
+            TapCmd::Follow { conn, hp, log } => tap_cmd::follow(
+                conn.addr,
+                conn.title_id,
+                conn.timeout(),
+                hp,
+                log.unwrap_or_else(|| PathBuf::from("dumps/tap-live.log")),
+            ),
         },
         Commands::BenchRpc {
             addr,

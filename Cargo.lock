@@ -150,6 +150,7 @@ version = "0.1.0"
 name = "mhdn-game"
 version = "0.1.0"
 dependencies = [
+ "mhdn-rpc",
  "serde",
  "thiserror",
  "toml",

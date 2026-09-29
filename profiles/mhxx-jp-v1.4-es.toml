@@ -63,3 +63,15 @@ fov_y = { off = 60, ty = "f32" }
 
 [species]
 default_anchor_height = 150.0
+
+# Live GO 2026-09-28: one boss, 774 → 0, 111 hits summed 775 (1 overkill on the killing blow).
+[damage_tap]
+hook_addr = "0x008D03E8"
+return_addr = "0x008D03EC"
+expected_words = [
+  { addr = "0x008D03E8", word = "0xE593C0A8" },
+  { addr = "0x008D03EC", word = "0xE59C0360" },
+  { addr = "0x008D03FC", word = "0xE58C0360" },
+]
+cave = { addr = "0x00BF2D00", len = "0x300" }
+ring = { addr = "0x00D32000", capacity = 64, entry_size = 40 }
