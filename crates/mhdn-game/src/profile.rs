@@ -106,6 +106,9 @@ pub struct ChainRegion {
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HunterProfile {
+    /// Static address of a pointer. One deref, then `pos.off`, is the feet vec3.
+    #[serde(default, deserialize_with = "de_opt_u32")]
+    pub base: Option<u32>,
     pub pos: FieldRef,
 }
 
@@ -114,6 +117,9 @@ pub struct HunterProfile {
 pub struct CameraProfile {
     pub mode: CameraMode,
     pub fov_unit: FovUnit,
+    /// Static address of a pointer. One deref, then each field offset, is eye / target / fov.
+    #[serde(default, deserialize_with = "de_opt_u32")]
+    pub base: Option<u32>,
     #[serde(default)]
     pub eye: Option<FieldRef>,
     #[serde(default)]
@@ -627,12 +633,49 @@ mod tests {
             FieldRef::Relative(spec) => assert_eq!(spec.hidden_value, Some(0x7)),
             FieldRef::Unresolved => panic!("visible flag should be resolved"),
         }
+        match &profile.monster.pos {
+            FieldRef::Relative(spec) => {
+                assert_eq!(spec.off, -800);
+                assert_eq!(spec.ty, FieldType::Vec3);
+            }
+            FieldRef::Unresolved => panic!("pos should be resolved"),
+        }
+        let third = &profile.monster_list.base_candidates[2];
+        assert!(third.expect.contains(&0x082C_E730));
         let pending = profile.unresolved_fields();
-        assert!(pending.contains(&"monster.pos"));
+        assert!(!pending.contains(&"monster.pos"));
         assert!(pending.contains(&"frame_counter"));
         assert!(pending.contains(&"scene"));
-        assert!(pending.contains(&"hunter.pos"));
-        assert!(pending.contains(&"camera.eye"));
+        assert_eq!(profile.hunter.base, Some(0x0814_E620));
+        match &profile.hunter.pos {
+            FieldRef::Relative(spec) => {
+                assert_eq!(spec.off, 64);
+                assert_eq!(spec.ty, FieldType::Vec3);
+            }
+            FieldRef::Unresolved => panic!("hunter.pos should be resolved"),
+        }
+        assert_eq!(profile.camera.base, Some(0x0814_CACC));
+        assert_eq!(profile.camera.fov_unit, FovUnit::Deg);
+        match profile.camera.eye.as_ref() {
+            Some(FieldRef::Relative(spec)) => {
+                assert_eq!(spec.off, 64);
+                assert_eq!(spec.ty, FieldType::Vec3);
+            }
+            other => panic!("camera.eye should be resolved, got {other:?}"),
+        }
+        match profile.camera.target.as_ref() {
+            Some(FieldRef::Relative(spec)) => assert_eq!(spec.off, 96),
+            other => panic!("camera.target should be resolved, got {other:?}"),
+        }
+        match profile.camera.fov_y.as_ref() {
+            Some(FieldRef::Relative(spec)) => {
+                assert_eq!(spec.off, 60);
+                assert_eq!(spec.ty, FieldType::F32);
+            }
+            other => panic!("camera.fov_y should be resolved, got {other:?}"),
+        }
+        assert!(!pending.contains(&"hunter.pos"));
+        assert!(!pending.contains(&"camera.eye"));
         assert!(!pending.contains(&"monster.hp"));
     }
 

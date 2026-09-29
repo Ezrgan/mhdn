@@ -24,7 +24,7 @@ fingerprint = [
 base_candidates = [
   { addr = "0x00D2CAA0", expect = ["0x082B7720", "0x082B9660"] },
   { addr = "0x00D30AA0", expect = ["0x082B98B0"] },
-  { addr = "0x00D3A8E0", expect = ["0x082D0760"] },
+  { addr = "0x00D3A8E0", expect = ["0x082CE730", "0x082D0760"] },
 ]
 slots = 16
 slot_stride = 4
@@ -36,7 +36,7 @@ hp = { off = 0, ty = "u32" }
 max_hp = { off = 4, ty = "u32" }
 species = { off = "0x5A18", ty = "u16" }
 size = { off = -432, ty = "f32" }
-pos = "TBD"
+pos = { off = -800, ty = "vec3" }
 poison = { off = "0x54E4", ty = "u16" }
 visible_flag = { off = -5128, ty = "u8", hidden_value = "0x7" }
 
@@ -47,14 +47,19 @@ chain = "TBD"
 chain = "TBD"
 
 [hunter]
-pos = "TBD"
+# deref(base) + pos.off = feet. Confirmed on 3 boots (docs/RE_NOTES.md).
+base = "0x0814E620"
+pos = { off = 64, ty = "vec3" }
 
 [camera]
 mode = "params"
-fov_unit = "rad"
-eye = "TBD"
-target = "TBD"
-fov_y = "TBD"
+# The live value at fov_y is degrees (50), proven by the projection scale 1/tan(25°).
+fov_unit = "deg"
+# deref(base) + off. Eye +0x40, target +0x60, fov_y +0x3C. Same 3 boots.
+base = "0x0814CACC"
+eye = { off = 64, ty = "vec3" }
+target = { off = 96, ty = "vec3" }
+fov_y = { off = 60, ty = "f32" }
 
 [species]
 default_anchor_height = 150.0

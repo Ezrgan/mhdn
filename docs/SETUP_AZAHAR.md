@@ -85,7 +85,7 @@ Si cambias layout con atajos **sin** guardar config, el overlay puede desalinear
 ### GDB stub (Fase 2 / 7)
 
 - Activar **GDB stub** (`use_gdbstub=true`), puerto por defecto **24689**.
-- Para watchpoints **exactos** en escrituras de HP, **desactiva el JIT de CPU** mientras depuras (más lento, breakpoints precisos).
+- Para usar watchpoints **desactiva el JIT de CPU** mientras depuras. Es obligatorio: con el JIT activado los watchpoints pueden no dispararse nunca (issue #2199 de Azahar). Los breakpoints de ejecución sí funcionan con JIT. Vuelve a activarlo al terminar, porque sin JIT el juego va mucho más lento.
 
 Ejemplo:
 
@@ -113,6 +113,13 @@ sdmc/luma/plugins/0004000000197100/mhdn.3gx
 (Crea carpetas si no existen; el Title ID es MHXX JP.)
 
 Reinicia el juego tras copiar el `.3gx`. El plugin **no** modifica partidas guardadas; solo parchea en RAM.
+
+Si el juego crashea al arrancar con el loader activado (issue #1381), desactívalo: el Modo Tap no lo necesita.
+
+### Cheats de Azahar (solo para la validación 2.19)
+
+- *Emulation → Cheats*: añadir el cheat "Hit Monster Display Last Damage v1.4" para confirmar la semántica del sitio de daño.
+- **Desactívalo antes de usar el Modo Tap**: ambos usan la misma *code cave* y el mismo punto de enganche (`0x8D03E8`).
 
 ## Instalación del juego y parches
 

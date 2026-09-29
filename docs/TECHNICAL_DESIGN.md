@@ -60,18 +60,41 @@ Azahar es el fork activo de Citra (Citra se discontinuó en 2024). Lo que nos im
 | **C. Fork de Azahar** | Modificar el emulador: overlay ImGui dentro de su render, acceso directo a memoria y uniforms del PICA | Sincronía perfecta; matrices exactas de la GPU; sin tracking de ventanas | Mantener un fork C++ enorme (GPL, rebase continuo); el usuario debe usar tu build; contradice el requisito "no invasivo" del PRD | ❌ Descartada |
 | **D. Proxy DLL / inyección en el proceso del emulador** | Inyectar en Azahar y hookear su presentación (Metal/Vulkan/OpenGL) | Dibuja dentro del swapchain del emulador | Hay que buscar a mano dónde está la RAM emulada dentro del proceso del host (cambia en cada build); frágil ante actualizaciones; en macOS es inviable por SIP/hardened runtime; distinto por backend gráfico | ❌ Descartada |
 | **E. Cheats Gateway/Action Replay** | Códigos de trucos soportados por Azahar | Sencillo | No pueden emitir eventos ni exponer datos estructurados | ❌ Descartada |
-| **F. Parche `code.ips` con trampolín ARM a mano** | Igual que B pero sin framework | No depende del plugin loader | Hay que escribir ensamblador a mano; sin C++ ni utilidades de hook | ⚠️ **Contingencia de B** |
+| **F. Parche ARM a mano (stub + salto)** | Un stub de ~20 instrucciones en una *code cave*, instalado **por el propio overlay vía escritura RPC** (o como `code.ips`) | No depende del plugin loader ni de cheats; instalable/desinstalable en caliente; el sitio exacto ya se conoce gracias a un cheat público (§3.3) | Ensamblador a mano; solo captura lo que haya en registros/stack en ese punto | ✅ **Modo Tap (nivel intermedio)** |
 
-### 3.2 Decisión: híbrido A + B en dos niveles
+### 3.2 Decisión: híbrido en tres niveles (A → F → B)
 
 1. **Modo Pasivo (A)** llega primero porque da valor sin el RE más difícil (el de la función de daño) y
-   porque su parte de HP ya está documentada por proyectos previos. Es el *fallback* permanente.
-2. **Modo Activo (B)** llega después y reutiliza **todo** el pipeline del overlay: solo cambia la fuente de
-   `DamageEvent`s. El overlay detecta el plugin automáticamente.
-3. **El render siempre es externo**, a resolución nativa del host, con texto vectorial (MSDF): es la única
+   porque su parte de HP ya está documentada por proyectos previos. Es el *fallback* permanente. Es un
+   **detector de cambios de HP**, no de golpes: varios golpes en el mismo frame salen como un solo número.
+2. **Modo Tap (F)** da golpes exactos (valor y monstruo) enganchando el sitio de aplicación del daño que ya
+   se conoce (§3.3). Si su spike da GO, entra en el MVP.
+3. **Modo Activo (B)** añade la semántica completa (autor, crítico, elemento, punto de impacto) si el plugin
+   loader es fiable en tu build; si no, esa semántica se busca ampliando el Tap.
+4. Los tres producen el mismo `DamageEvent` (con un campo `confidence`: `Exact`, `HpDelta` o `AggregatedHpDelta`),
+   así que el resto del overlay no cambia. Prioridad automática: Plugin > Tap > Pasivo.
+5. **El render siempre es externo**, a resolución nativa del host, con texto vectorial (MSDF): es la única
    forma de obtener un aspecto "moderno" sobre un juego de 400×240.
 
-Esta separación hace que el proyecto **nunca quede bloqueado**: si el plugin resulta inviable, el MVP ya está entregado.
+Esta separación hace que el proyecto **nunca quede bloqueado**: si el Tap o el plugin resultan inviables, el MVP ya está entregado.
+
+### 3.3 El atajo: el cheat "Last Damage" de MHXX v1.4
+
+Un cheat público ("Hit Monster Display Last Damage v1.4") muestra el daño del último golpe. Al decodificar su
+ARM se ve que engancha una función del juego en `0x008D03E8`–`0x008D03FC`:
+
+```
+0x8D03E8  ldr r12, [r3, #0xA8]    ; r12 = objeto del monstruo      (aquí r1 = −daño)
+0x8D03EC  ldr r0,  [r12, #0x360]  ; r0  = HP actual
+   ...                              ; HP nuevo = HP + r1 (con límites)
+0x8D03FC  str r0,  [r12, #0x360]  ; escribe el HP nuevo
+```
+
+`objeto+0x360` es exactamente el HP que ya leemos por la cadena de punteros conocida, lo que valida ambas fuentes.
+Eso da, sin buscar a ciegas, el punto donde cada golpe se aplica con su valor y su objetivo. El Tap copia `r1`,
+`r12`, `r3`, `lr` y unas palabras del stack a un ring buffer, y desde `lr`/stack se sube a los *callers*, donde
+deberían estar el atacante y los datos del golpe. Las direcciones son de la v1.4 oficial y se verifican en el
+build con parche en español antes de parchear nada.
 
 ---
 
@@ -94,7 +117,20 @@ cada ~16 ms (60 Hz) en misión:
 
 Presupuesto típico: ~15–25 peticiones UDP por muestra → ~1000–1500 req/s. Una petición local tarda decenas de µs.
 
-### 4.2 Modo Activo
+### 4.2 Modo Tap
+
+```
+instalación (una vez por arranque del título):
+  verificar palabras originales en 0x8D03E8/EC/FC y que cave (0xBF2Dxx) y ring (0xD320xx) están vacíos
+  escribir stub en la cave → escribir salto en 0x8D03E8 (4 bytes alineados) → Azahar invalida el JIT
+juego emulado:  golpe → 0x8D03E8 → stub: instrucción original, ring[seq % 64] = {seq, r1, r12, r3, lr, sp[0..4]}
+                → barrera → write_seq = seq → vuelve a 0x8D03EC
+overlay:        lee write_seq y solo las entradas nuevas → DamageEvent { confidence: Exact }
+                ΔHP − Σ Tap > 0 ⇒ daño por otra ruta ⇒ evento HpDelta con el residuo
+cierre:         restaurar la palabra original en 0x8D03E8
+```
+
+### 4.3 Modo Activo (plugin)
 
 ```
 juego emulado:  hit → función de daño → [hook] → escribe MhdnEvent en ring[seq % 256] → dmb → write_seq = seq
@@ -104,7 +140,7 @@ overlay:        lee write_seq → lee solo eventos nuevos → DamageEvent exacto
                 (el ΔHP se sigue leyendo como verificación cruzada)
 ```
 
-### 4.3 De evento a píxel
+### 4.4 De evento a píxel
 
 ```
 DamageEvent.anchor (mundo) ─▶ cámara interpolada (t_render = now − 1 frame del juego)
@@ -175,7 +211,20 @@ fov_unit = "rad"
 [species]                  # altura del ancla por especie (offset vertical en unidades del juego)
 default_anchor_height = 150.0
 # 1 = { anchor_height = 220.0 }  # ejemplo, se completa por especie
+
+[damage_tap]               # opcional (PLAN 3.1); valores de la v1.4 oficial, a verificar en 2.18
+hook_addr = "0x008D03E8"
+return_addr = "0x008D03EC"
+expected_words = [
+  { addr = "0x008D03E8", word = "0xE593C0A8" },   # ldr r12,[r3,#0xA8]
+  { addr = "0x008D03EC", word = "0xE59C0360" },   # ldr r0,[r12,#0x360]
+  { addr = "0x008D03FC", word = "0xE58C0360" },   # str r0,[r12,#0x360]
+]
+cave = { addr = "TBD", len = "TBD" }             # dentro de 0x00BF2D00–0x00BF3000 si 2.18 confirma que está libre
+ring = { addr = "TBD", capacity = 64, entry_size = 40 }   # .bss libre verificada (zona 0x00D32000+)
 ```
+
+Las ventanas de `fingerprint` nunca pueden solaparse con `hook_addr`, `cave` ni `ring`: la validación del perfil lo rechaza.
 
 Los valores de `[monster]`, `[monster_list]` y `poison` salen del proyecto GPLv3 *MH-HP-Overlay-For-3DS-Emulator*
 (`modules/mhxx.py`) y **deben revalidarse** en la Fase 2 antes de darlos por buenos.
@@ -192,7 +241,7 @@ Los valores de `[monster]`, `[monster_list]` y `poison` salen del proyecto GPLv3
 | Posición del monstruo | Exploración ±0x2000 alrededor del struct del monstruo + distancia al cazador | En MT Framework los datos de transformación viven dentro del objeto; la distancia al cazador valida el candidato sin ver la pantalla. |
 | Cámara (parámetros) | `eye` se mueve en una esfera alrededor del cazador; `fov` cambia al apuntar | Firma geométrica muy distintiva. |
 | Cámara (matriz) | Buscador de bases ortonormales (filas unitarias y ortogonales) | Una matriz de vista siempre contiene una rotación pura; es raro que datos aleatorios cumplan eso. |
-| Función de daño | Watchpoint de escritura en el HP (GDB stub) → Ghidra hacia arriba en la pila de llamadas | La instrucción que escribe el HP está al final de la cadena de daño; subiendo se llega a la función que tiene todos los datos del golpe. |
+| Función de daño | Partir del sitio del cheat "Last Damage" (§3.3) + `lr`/stack capturados por el Tap → Ghidra hacia arriba por los `BL`. Confirmación con watchpoint GDB en el HP (**CPU JIT desactivado, obligatorio**) y búsqueda estática de `str #0x360` para rutas alternativas | La instrucción que escribe el HP está al final de la cadena de daño; subiendo se llega a la función que tiene todos los datos del golpe. El cheat ahorra la búsqueda del punto de partida. |
 | Estabilidad | Escáner de cadenas de punteros desde la región estática + matriz de validación | Solo las cadenas que parten de `.data/.bss` sobreviven a reinicios. |
 
 ---
@@ -216,6 +265,7 @@ Los valores de `[monster]`, `[monster_list]` y `poison` salen del proyecto GPLv3
 - **ADR-0003 — Dos niveles Pasivo/Activo con la misma interfaz `DamageEvent`.** Motivo: entregar pronto y no bloquearse por el RE de la función de daño.
 - **ADR-0004 — Proyección reconstruida desde parámetros de cámara.** Motivo: evita la ambigüedad de la rotación de la matriz de GPU y de su *layout* en memoria; la matriz queda como contingencia.
 - **ADR-0005 (se escribe en F5.1)** — NSWindow de winit vs. NSPanel propio en macOS, según el resultado del spike.
+- **ADR-0006 (se escribe en 2.18, se completa en 2.20/2.21)** — Modo Tap mediante parche de código por RPC; amplía la ADR-0003 a tres niveles y registra el GO/NO-GO del Tap y del plugin 3GX.
 
 ---
 
