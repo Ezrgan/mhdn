@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted for the patch mechanism (2026-09-28). Live GO/NO-GO of the installed stub, and the 3GX loader spike, are not done.
+Accepted (2026-09-28). Live GO for the tap on one full boss kill. The 3GX loader spike was not run.
 
 Extends [ADR-0003](0003-two-tier-passive-active.md).
 
@@ -24,10 +24,16 @@ Ship a third source, **Modo Tap**, between passive HP deltas and the plugin:
 4. Uninstall restores the original word at `0x008D03E8`.
 5. Passive HP deltas stay as the fallback and as the cross-check. Priority remains Plugin > Tap > Passive.
 
-The 3GX loader is **not** a GO and **not** a NO-GO. It was not executed. Phase 3 can consume passive deltas and, once a live session says the stub is stable, the tap ring. It must not depend on the plugin loader.
+The 3GX loader is **not** a GO and **not** a NO-GO. It was not executed. Phase 3 consumes the tap ring. It must not depend on the plugin loader.
+
+## Live result
+
+2026-09-28, Spanish MHXX v1.4, one boss, `mhdn-probe tap install` then `tap follow` in a single process. The hook was the original `ldr` before install. Starting HP **774/774** at `0x300658B8` (monster object `0x30065558`). The fight ended at HP **0**. The tap recorded **126** events and lost none. **111** of them belong to that boss and sum to **775**. The extra point is the killing blow: HP was 5, the hit was 6, and the game clamped the bar at 0. Two other monsters summed 63 and 61. Callers: `0x008BA260` (124 hits) and `0x008BA870` (2 hits). The game stayed up through the kill. `tap uninstall` restored `0x008D03E8`. The log is `crates/mhdn-game/tests/fixtures/tap-boss-2026-09-28.txt`.
+
+Who dealt each hit (hunter, Felyne, barrel, status) is still unnamed. Frame counter, scene flags, the six traces, and LAN are still open, so the phase 2 definition of done is not met. The tap itself is a GO.
 
 ## Consequences
 
-- **Positive:** Exact per-hit values do not require the plugin loader. The stub is data in the repo, and its branches are checked by a unit test.
-- **Negative:** The live bar in plan 2.20 (10 minutes of Dual Blades, `Σ events == HP lost`, no crash) is still open. A bad stub can crash the guest until the title reboots. `fov`, hunter, and camera pointers are known; frame counter, scene flags, traces, and LAN are not, so the phase 2 definition of done is not met.
-- **Follow-ups:** Run `mhdn-probe tap install`, fight, `tap events`, `tap uninstall`. Run the 2.21 loader spike before any plugin work. Do not install the tap while the Last Damage cheat is in memory; reboot the title after that cheat.
+- **Positive:** Exact per-hit values do not require the plugin loader. One full kill matched the HP bar, with the killing blow allowed to overshoot zero by the amount the game clamps away.
+- **Negative:** Attacker, element, poison, bomb, and Felyne are not labeled. Frame counter, scene flags, traces, and LAN are still unknown, so phase 2 is not done as a whole. A bad stub can still crash the guest until the title reboots.
+- **Follow-ups:** Phase 3 can turn the ring into `DamageEvent`s. Run the 2.21 loader spike before any plugin work. Do not install the tap while the Last Damage cheat is in memory; reboot the title after that cheat.

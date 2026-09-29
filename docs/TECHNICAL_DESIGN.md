@@ -212,7 +212,7 @@ fov_unit = "rad"
 default_anchor_height = 150.0
 # 1 = { anchor_height = 220.0 }  # ejemplo, se completa por especie
 
-[damage_tap]               # opcional (PLAN 3.1); valores de la v1.4 oficial, a verificar en 2.18
+[damage_tap]               # confirmado en vivo el 2026-09-28 (ADR-0006)
 hook_addr = "0x008D03E8"
 return_addr = "0x008D03EC"
 expected_words = [
@@ -220,8 +220,8 @@ expected_words = [
   { addr = "0x008D03EC", word = "0xE59C0360" },   # ldr r0,[r12,#0x360]
   { addr = "0x008D03FC", word = "0xE58C0360" },   # str r0,[r12,#0x360]
 ]
-cave = { addr = "TBD", len = "TBD" }             # dentro de 0x00BF2D00–0x00BF3000 si 2.18 confirma que está libre
-ring = { addr = "TBD", capacity = 64, entry_size = 40 }   # .bss libre verificada (zona 0x00D32000+)
+cave = { addr = "0x00BF2D00", len = "0x300" }
+ring = { addr = "0x00D32000", capacity = 64, entry_size = 40 }
 ```
 
 Las ventanas de `fingerprint` nunca pueden solaparse con `hook_addr`, `cave` ni `ring`: la validación del perfil lo rechaza.

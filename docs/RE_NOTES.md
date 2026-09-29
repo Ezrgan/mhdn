@@ -350,3 +350,11 @@ Unchecking the cheat does **not** restore the hook. After the box was cleared, `
 | 2.17 multiplayer | Record the same quest on the host and on a LAN client and compare HP timing |
 
 Definition of done for those rows: each offset has an entry here with the method, the date, the game version, and at least three separate confirmations.
+
+### Live session — 2026-09-28, damage tap GO (plan 2.20)
+
+Title reboot, cheat absent. Before any hit: `0x008D03E8` = `E593C0A8`, `0x008D03EC` = `E59C0360`, `0x008D03FC` = `E58C0360`, cave `0x00BF2D00` = 0. Monster HP chain `0x00D3A8E0+0x14+0x10A8+0x360` → `0x300658B8` = **774/774**. Object at HP−0x360 = `0x30065558`.
+
+`mhdn-probe tap install`, then `tap follow` (one process, one socket). The fight ran to the kill. HP ended at **0**. The ring produced **126** events, none lost. The boss accounts for **111** hits summing **775**. The extra 1 is the killing blow: the bar was at 5 and the hit was 6, and the store at `0x008D0408` clamps HP at 0. Other objects `0x3008BD08` and `0x300974A8` summed 63 and 61. `lr` was `0x008BA260` on 124 hits and `0x008BA870` on the two hits of 100. `tap uninstall` restored the original load. Fixture: `crates/mhdn-game/tests/fixtures/tap-boss-2026-09-28.txt`.
+
+An earlier poll that spawned a new process every sample ran while the machine switched desktops and the Mac locked up; that log has no hits. The successful read is the single-process follow. The tap does not name the attacker. Frame counter, scene, traces, and LAN remain open.
