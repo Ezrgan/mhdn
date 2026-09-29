@@ -350,7 +350,9 @@ impl Profile {
             "monster.visible_flag",
             &self.monster.visible_flag,
         );
-        push_chain(&mut names, "frame_counter", &self.frame_counter.chain);
+        if self.frame_counter.addr.is_none() {
+            push_chain(&mut names, "frame_counter", &self.frame_counter.chain);
+        }
         push_chain(&mut names, "scene", &self.scene.chain);
         push_field(&mut names, "hunter.pos", &self.hunter.pos);
         match self.camera.mode {
@@ -748,8 +750,9 @@ mod tests {
         assert!(third.expect.contains(&0x082C_E730));
         let pending = profile.unresolved_fields();
         assert!(!pending.contains(&"monster.pos"));
-        assert!(pending.contains(&"frame_counter"));
         assert!(pending.contains(&"scene"));
+        assert!(!pending.contains(&"frame_counter"));
+        assert_eq!(profile.frame_counter.addr, Some(0x082C_4BB8));
         assert_eq!(profile.hunter.base, Some(0x0814_E620));
         match &profile.hunter.pos {
             FieldRef::Relative(spec) => {

@@ -41,6 +41,9 @@ poison = { off = "0x54E4", ty = "u16" }
 visible_flag = { off = -5128, ty = "u8", hidden_value = "0x7" }
 
 [frame_counter]
+# Direct u32. With the 60fps cheat: about +60/s in a quest, frozen on the in-game pause.
+# Same address after a title reboot. See docs/RE_NOTES.md.
+addr = "0x082C4BB8"
 chain = "TBD"
 
 [scene]
