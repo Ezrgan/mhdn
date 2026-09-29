@@ -8,6 +8,7 @@ mod parse;
 mod ptrscan;
 mod record;
 mod scan;
+mod tap_cmd;
 mod watch;
 
 use std::net::SocketAddr;
@@ -161,6 +162,11 @@ enum Commands {
         #[arg(value_parser = parse_hex_u32, value_name = "ADDR")]
         guest: u32,
     },
+    /// Install, remove, or read the damage-tap hook (plan 2.20).
+    Tap {
+        #[command(subcommand)]
+        action: TapCmd,
+    },
     /// Measure Azahar RPC latency and throughput on localhost.
     BenchRpc {
         /// RPC server address (Azahar default: 127.0.0.1:45987).
@@ -172,6 +178,25 @@ enum Commands {
         /// Duration of the sustained throughput phase.
         #[arg(long, default_value_t = 10)]
         seconds: u64,
+    },
+}
+
+#[derive(Subcommand)]
+enum TapCmd {
+    /// Verify the original words, write the stub, then the hook branch.
+    Install {
+        #[command(flatten)]
+        conn: ConnArgs,
+    },
+    /// Restore the original instruction at the hook.
+    Uninstall {
+        #[command(flatten)]
+        conn: ConnArgs,
+    },
+    /// Print ring entries published by the stub.
+    Events {
+        #[command(flatten)]
+        conn: ConnArgs,
     },
 }
 
@@ -285,6 +310,13 @@ fn run() -> Result<()> {
             seconds,
         } => cmd_watch(conn, guest, len, hz, seconds),
         Commands::Peek { conn, ty, guest } => cmd_peek(conn, ty, guest),
+        Commands::Tap { action } => match action {
+            TapCmd::Install { conn } => tap_cmd::install(conn.addr, conn.title_id, conn.timeout()),
+            TapCmd::Uninstall { conn } => {
+                tap_cmd::uninstall(conn.addr, conn.title_id, conn.timeout())
+            }
+            TapCmd::Events { conn } => tap_cmd::events(conn.addr, conn.title_id, conn.timeout()),
+        },
         Commands::BenchRpc {
             addr,
             read_addr,
