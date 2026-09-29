@@ -47,9 +47,9 @@ addr = "0x082C4BB8"
 chain = "TBD"
 
 [scene]
-# in_quest is 7 inside a quest and 0 in the village and on the load screen.
-# loading is a u8: 1 only while the load screen is showing. The bytes above it move for other reasons.
-# The quest-clear / fail screen was not sampled.
+# in_quest is 7 while hunting and 0 in the village, on the load screen, and on the reward screen.
+# loading is a u8: 1 on the load screen and on the reward screen, 0 in the village and while hunting.
+# Those two screens are not separated yet. Read the loading flag as a byte.
 chain = "TBD"
 in_quest = { addr = "0x08142FE0", ty = "u32", value = 7 }
 loading = { addr = "0x00DC5814", ty = "u8", value = 1 }

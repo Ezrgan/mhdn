@@ -113,7 +113,7 @@ three quests, and after a game restart.
 | hidden flag | `-0x1408` u8, hidden when `0x7` |
 | position | **HP − 0x320** vec3 f32 (confirmed sessions 1–3; profile `off = -800`) |
 | frame counter | **`0x082C4BB8` u32** (60fps cheat: ~60/s, frozen on in-game pause; same address after title reboot) |
-| scene | **`0x08142FE0` = 7** inside a quest, **0** in the village and on the load screen. **`0x00DC5814` u8 = 1** only on the load screen. Quest-clear / fail not sampled |
+| scene | **`0x08142FE0` = 7** while hunting, **0** in the village, on the load screen, and on the reward screen. **`0x00DC5814` u8 = 1** on the load screen and the reward screen, **0** in the village and while hunting. Reward and load are not separated |
 
 ```bash
 cargo run -p mhdn-probe -- peek u32 0x00D2CAA0
@@ -374,9 +374,9 @@ The 60fps cheat was on, so game logic and vblank both advance about 60 times a s
 
 Snapshots of `0x00800000–0x01000000` and `0x08100000–0x08400000` while standing and while walking, in a quest and in the village, so bytes that move with the hunter drop out. The load screen was read with Azahar's emulation paused on that screen, twice, the second time into a different quest.
 
-| Address | Quest | Village | Load screen |
-|---|---|---|---|
-| `0x08142FE0` u32 | **7** (two different quests) | **0** | **0** |
-| `0x00DC5814` u8 | **0** | **0** | **1** |
+| Address | Quest | Village | Load screen | Reward screen |
+|---|---|---|---|---|
+| `0x08142FE0` u32 | **7** while hunting (two different quests) | **0** | **0** | **0** |
+| `0x00DC5814` u8 | **0** | **0** | **1** | **1** |
 
-`0x08142FE8` and `0x08142FF0` matched `0x08142FE0` on the first quest and then read 0 inside the second quest. They are not the flag. `0x00D37A24` was 1, then 2, then 0, then 1 across these scenes; it does not name the scene. The quest-clear and quest-fail screens were not sampled. `0x00DC5814` must be read as a byte: in the second quest the u32 was `0x02000000`, so the bytes above the flag are unrelated.
+`0x08142FE8` and `0x08142FF0` matched `0x08142FE0` on the first quest and then read 0 inside the second quest. They are not the flag. `0x00D37A24` was 1, then 2, then 0, then 1 across these scenes; it does not name the scene. The reward screen matches the load screen on both flags, so they do not separate those two. A scan for a reward-only small value produced 281 hits, mixed with per-quest noise; none is confirmed. `0x00DC5814` must be read as a byte: while hunting, the u32 was `0x02000000`, so the bytes above the flag are unrelated. For the meter, load and reward are both "do not count hits."
