@@ -950,6 +950,15 @@ dependencies = [
 [[package]]
 name = "mhdn-app"
 version = "0.1.0"
+dependencies = [
+ "glam",
+ "mhdn-game",
+ "mhdn-platform",
+ "mhdn-proj",
+ "mhdn-render",
+ "mhdn-rpc",
+ "winit",
+]
 
 [[package]]
 name = "mhdn-fx"

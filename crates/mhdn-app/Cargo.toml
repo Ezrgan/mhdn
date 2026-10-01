@@ -6,6 +6,18 @@ edition.workspace = true
 license.workspace = true
 publish = false
 
+[lib]
+path = "src/lib.rs"
+
 [[bin]]
 name = "mhdn"
 path = "src/main.rs"
+
+[dependencies]
+glam = "0.29"
+mhdn-game = { path = "../mhdn-game" }
+mhdn-platform = { path = "../mhdn-platform" }
+mhdn-proj = { path = "../mhdn-proj" }
+mhdn-render = { path = "../mhdn-render" }
+mhdn-rpc = { path = "../mhdn-rpc" }
+winit = "0.30.13"
