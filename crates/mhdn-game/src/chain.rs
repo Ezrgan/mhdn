@@ -93,7 +93,7 @@ fn add_offset(addr: u32, offset: i32) -> Result<u32, ChainError> {
 
 /// Static slots in the process image, plus any heap address, can be read.
 fn require_readable(addr: u32) -> Result<(), ChainError> {
-    if addr % 4 != 0 {
+    if !addr.is_multiple_of(4) {
         return Err(ChainError::Misaligned { addr });
     }
     let in_image = (0x0010_0000..0x0400_0000).contains(&addr);
@@ -105,7 +105,7 @@ fn require_readable(addr: u32) -> Result<(), ChainError> {
 }
 
 fn require_heap(addr: u32) -> Result<(), ChainError> {
-    if addr % 4 != 0 {
+    if !addr.is_multiple_of(4) {
         return Err(ChainError::Misaligned { addr });
     }
     if heap_contains(addr) {

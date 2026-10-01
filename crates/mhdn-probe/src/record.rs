@@ -214,7 +214,9 @@ fn read_hunter(mem: &mut dyn MemorySource, profile: &Profile) -> Result<[f32; 3]
         return Ok([f32::NAN; 3]);
     };
     match &profile.hunter.pos {
-        FieldRef::Relative(spec) if spec.ty == FieldType::Vec3 => read_vec3_field(mem, object, spec),
+        FieldRef::Relative(spec) if spec.ty == FieldType::Vec3 => {
+            read_vec3_field(mem, object, spec)
+        }
         _ => Ok([f32::NAN; 3]),
     }
 }
