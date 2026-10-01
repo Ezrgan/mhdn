@@ -7,3 +7,8 @@ license.workspace = true
 publish = false
 
 [lib]
+
+[dependencies]
+glam = "0.29"
+notify = "6.1"
+thiserror.workspace = true
