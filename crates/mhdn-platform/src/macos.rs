@@ -13,12 +13,19 @@ use crate::error::PlatformError;
 
 /// Click-through, clear, topmost, and allowed next to a native fullscreen space.
 ///
-/// `click_through` is false while calibration needs the mouse.
+/// `click_through` is false while calibration needs the mouse and the keyboard.
+/// A regular activation policy is required for that, so the overlay can become
+/// key. Click-through returns the process to an accessory app.
 pub fn apply_click_through(window: &Window, click_through: bool) -> Result<(), PlatformError> {
     let marker = MainThreadMarker::new().ok_or(PlatformError::NotMainThread)?;
     let ns_window = ns_window(window)?;
     let app = NSApplication::sharedApplication(marker);
-    let _ = app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
+    let policy = if click_through {
+        NSApplicationActivationPolicy::Accessory
+    } else {
+        NSApplicationActivationPolicy::Regular
+    };
+    let _ = app.setActivationPolicy(policy);
 
     ns_window.setIgnoresMouseEvents(click_through);
     ns_window.setOpaque(false);
