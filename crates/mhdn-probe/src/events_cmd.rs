@@ -38,7 +38,11 @@ pub fn follow(
         }
         let _ = pipeline.maintain_tap(&mut session, &profile);
         let period = mhdn_game::sample_period(pipeline.scene(), pipeline.failures());
-        std::thread::sleep(period.min(Duration::from_millis(250)));
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            break;
+        }
+        std::thread::sleep(period.min(left));
     }
     pipeline.shutdown_tap(&mut session);
     if pipeline.lost_tap() > 0 {

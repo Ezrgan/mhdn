@@ -36,6 +36,7 @@ pub struct Pipeline {
     fingerprints_ok: Option<bool>,
     tap_installed: bool,
     tap_blocked: bool,
+    plugin_present: Option<bool>,
 }
 
 impl Default for Pipeline {
@@ -56,6 +57,7 @@ impl Pipeline {
             fingerprints_ok: None,
             tap_installed: false,
             tap_blocked: false,
+            plugin_present: None,
         }
     }
 
@@ -202,7 +204,7 @@ impl Pipeline {
     ) -> Vec<crate::DamageEvent> {
         let hook = mem.read_u32(HOOK_ADDR).unwrap_or(0);
         let tap_active = hook == hook_branch();
-        let plugin = read_plugin(mem);
+        let plugin = self.plugin_hits(mem);
         let taps = if tap_active {
             self.read_new_taps(mem)
         } else {
@@ -258,6 +260,19 @@ impl Pipeline {
         }
         self.last_tap_seq = write_seq;
         events
+    }
+
+    fn plugin_hits(&mut self, mem: &mut dyn MemorySource) -> Option<Vec<PluginHit>> {
+        if self.plugin_present == Some(false) {
+            return None;
+        }
+        let hits = read_plugin(mem);
+        if hits.is_none() {
+            self.plugin_present = Some(false);
+        } else {
+            self.plugin_present = Some(true);
+        }
+        hits
     }
 }
 
