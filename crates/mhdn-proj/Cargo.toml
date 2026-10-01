@@ -7,3 +7,6 @@ license.workspace = true
 publish = false
 
 [lib]
+
+[dependencies]
+glam = "0.29"
