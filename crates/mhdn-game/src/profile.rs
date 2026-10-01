@@ -845,7 +845,13 @@ mod tests {
 
     #[test]
     fn selects_provisionally_until_fingerprints_are_filled() {
-        let profile = Profile::from_toml_str(sample()).unwrap();
+        let mut profile = Profile::from_toml_str(sample()).unwrap();
+        // Clear all hashes so every window is a placeholder (xxh3 == 0).
+        // The real profile has live-collected hashes; we strip them here to
+        // test the provisional path in isolation.
+        for w in &mut profile.meta.fingerprint {
+            w.xxh3 = 0;
+        }
         let profiles = [profile];
         let chosen = select(&profiles, MHXX_JP_TITLE_ID, &[]).unwrap();
         assert_eq!(chosen.kind, MatchKind::Provisional);
@@ -855,6 +861,12 @@ mod tests {
     #[test]
     fn exact_match_requires_every_recorded_window() {
         let mut profile = Profile::from_toml_str(sample()).unwrap();
+        // Zero out all entries first so they are placeholders, then set only
+        // two as real fingerprint windows. This keeps the test independent of
+        // however many windows the live profile has collected.
+        for w in &mut profile.meta.fingerprint {
+            w.xxh3 = 0;
+        }
         profile.meta.fingerprint[0].xxh3 = 0x1111;
         profile.meta.fingerprint[1].xxh3 = 0x2222;
         let observed = [
