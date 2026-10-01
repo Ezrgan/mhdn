@@ -7,3 +7,13 @@ license.workspace = true
 publish = false
 
 [lib]
+
+[dependencies]
+bytemuck = { version = "1.25.2", features = ["derive"] }
+pollster = "1.0.1"
+thiserror.workspace = true
+wgpu = "30.0.1"
+winit = "0.30.13"
+
+[dev-dependencies]
+naga = { version = "30.0.1", features = ["wgsl-in"] }
