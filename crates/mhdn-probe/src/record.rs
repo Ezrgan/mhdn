@@ -1,6 +1,6 @@
 use std::time::{Duration, Instant};
 
-use mhdn_game::{ChainSpec, FieldRef, FieldSpec, FieldType, Profile};
+use mhdn_game::{ChainSpec, FieldRef, FieldSpec, FieldType, Profile, SceneFlag};
 use mhdn_rpc::MemorySource;
 
 use crate::error::{ProbeError, Result};
@@ -147,14 +147,108 @@ pub fn capture_frame(
 ) -> Result<RecordedFrame> {
     Ok(RecordedFrame {
         host_us,
-        guest_frame: 0,
-        scene: u32::MAX,
-        hunter: [f32::NAN; 3],
-        eye: [f32::NAN; 3],
-        target: [f32::NAN; 3],
-        fov: f32::NAN,
+        guest_frame: read_guest_frame(mem, profile)?,
+        scene: read_scene(mem, profile)?,
+        hunter: read_hunter(mem, profile)?,
+        eye: read_camera_vec3(mem, profile, |camera| camera.eye.as_ref())?,
+        target: read_camera_vec3(mem, profile, |camera| camera.target.as_ref())?,
+        fov: read_camera_fov(mem, profile)?,
         monsters: read_monsters(mem, profile)?,
     })
+}
+
+fn read_guest_frame(mem: &mut dyn MemorySource, profile: &Profile) -> Result<u32> {
+    let Some(addr) = profile.frame_counter.addr else {
+        return Ok(0);
+    };
+    Ok(mem.read_u32(addr)?)
+}
+
+fn read_scene(mem: &mut dyn MemorySource, profile: &Profile) -> Result<u32> {
+    if let Some(flag) = &profile.scene.loading {
+        if read_flag(mem, flag)? == flag.value {
+            return Ok(2);
+        }
+    }
+    if let Some(flag) = &profile.scene.in_quest {
+        if read_flag(mem, flag)? == flag.value {
+            return Ok(1);
+        }
+    }
+    if profile.scene.in_quest.is_some() || profile.scene.loading.is_some() {
+        return Ok(0);
+    }
+    Ok(u32::MAX)
+}
+
+fn read_flag(mem: &mut dyn MemorySource, flag: &SceneFlag) -> Result<u32> {
+    match flag.ty {
+        FieldType::U8 => {
+            let mut buf = [0u8; 1];
+            mem.read(flag.addr, &mut buf)?;
+            Ok(u32::from(buf[0]))
+        }
+        FieldType::U16 => {
+            let mut buf = [0u8; 2];
+            mem.read(flag.addr, &mut buf)?;
+            Ok(u32::from(u16::from_le_bytes(buf)))
+        }
+        FieldType::U32 => Ok(mem.read_u32(flag.addr)?),
+        FieldType::F32 | FieldType::Vec3 => Err(ProbeError::msg("scene flag must be an integer")),
+    }
+}
+
+fn deref_base(mem: &mut dyn MemorySource, base: Option<u32>) -> Result<Option<u32>> {
+    let Some(addr) = base else {
+        return Ok(None);
+    };
+    let ptr = mem.read_u32(addr)?;
+    if ptr == 0 {
+        return Ok(None);
+    }
+    Ok(Some(ptr))
+}
+
+fn read_hunter(mem: &mut dyn MemorySource, profile: &Profile) -> Result<[f32; 3]> {
+    let Some(object) = deref_base(mem, profile.hunter.base)? else {
+        return Ok([f32::NAN; 3]);
+    };
+    match &profile.hunter.pos {
+        FieldRef::Relative(spec) if spec.ty == FieldType::Vec3 => read_vec3_field(mem, object, spec),
+        _ => Ok([f32::NAN; 3]),
+    }
+}
+
+fn read_camera_vec3(
+    mem: &mut dyn MemorySource,
+    profile: &Profile,
+    pick: fn(&mhdn_game::CameraProfile) -> Option<&FieldRef>,
+) -> Result<[f32; 3]> {
+    let Some(object) = deref_base(mem, profile.camera.base)? else {
+        return Ok([f32::NAN; 3]);
+    };
+    match pick(&profile.camera) {
+        Some(FieldRef::Relative(spec)) if spec.ty == FieldType::Vec3 => {
+            read_vec3_field(mem, object, spec)
+        }
+        _ => Ok([f32::NAN; 3]),
+    }
+}
+
+fn read_camera_fov(mem: &mut dyn MemorySource, profile: &Profile) -> Result<f32> {
+    let Some(object) = deref_base(mem, profile.camera.base)? else {
+        return Ok(f32::NAN);
+    };
+    match &profile.camera.fov_y {
+        Some(FieldRef::Relative(spec)) if spec.ty == FieldType::F32 => {
+            let addr = add_offset(object, spec.off)
+                .ok_or_else(|| ProbeError::msg("field offset overflow"))?;
+            let mut buf = [0u8; 4];
+            mem.read(addr, &mut buf)?;
+            Ok(f32::from_le_bytes(buf))
+        }
+        _ => Ok(f32::NAN),
+    }
 }
 
 pub fn record_for(
@@ -416,7 +510,60 @@ mod tests {
         assert_eq!(frame.monsters[0].max_hp, 3000);
         assert_eq!(frame.monsters[0].species, 42);
         assert!(frame.monsters[0].pos[0].is_nan());
+        assert_eq!(frame.guest_frame, 0);
+        assert_eq!(frame.scene, u32::MAX);
         assert!(frame.hunter[0].is_nan());
+    }
+
+    #[test]
+    fn capture_reads_the_frame_counter_and_in_quest_flag() {
+        let profile = Profile::from_toml_str(
+            r#"
+            [meta]
+            game = "MHXX"
+            region = "JP"
+            version = "test"
+            title_id = "0x1000"
+            update_title_version = 1
+            [monster_list]
+            base_candidates = [{ addr = "0x1000", expect = ["0x2000"] }]
+            slots = 1
+            slot_stride = 4
+            slot_offset = "0x14"
+            chain = ["0x10"]
+            [monster]
+            hp = { off = 0, ty = "u32" }
+            max_hp = { off = 4, ty = "u32" }
+            species = "TBD"
+            size = { off = -4, ty = "f32" }
+            pos = "TBD"
+            poison = { off = 12, ty = "u16" }
+            visible_flag = { off = 14, ty = "u8" }
+            [frame_counter]
+            addr = "0x1200"
+            chain = "TBD"
+            [scene]
+            chain = "TBD"
+            in_quest = { addr = "0x1300", ty = "u32", value = 7 }
+            loading = { addr = "0x1304", ty = "u8", value = 1 }
+            [hunter]
+            pos = "TBD"
+            [camera]
+            mode = "params"
+            fov_unit = "rad"
+            [species]
+            default_anchor_height = 150.0
+            "#,
+        )
+        .unwrap();
+        let mut image = vec![0u8; 0x400];
+        put_u32(&mut image, 0x1000, 0x1200, 42);
+        put_u32(&mut image, 0x1000, 0x1300, 7);
+        image[0x1304 - 0x1000] = 0;
+        let mut mem = FileMemorySource::from_bytes(image, 0x1000);
+        let frame = capture_frame(&mut mem, &profile, 1).unwrap();
+        assert_eq!(frame.guest_frame, 42);
+        assert_eq!(frame.scene, 1);
     }
 
     #[test]

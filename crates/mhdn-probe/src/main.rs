@@ -27,7 +27,7 @@ use crate::scan::ValueType;
 #[derive(Parser)]
 #[command(
     name = "mhdn-probe",
-    about = "MHXX reverse-engineering CLI (see PLAN.md phase 2)"
+    about = "CLI for live memory analysis and diagnostics against a running Azahar instance"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -546,11 +546,21 @@ fn cmd_rec_info(file: PathBuf) -> Result<()> {
         .map(|frame| frame.monsters.len())
         .sum();
     println!(
-        "{}: {} frames at {} Hz, {monsters} monster samples, {} bytes",
+        "{}: {} frames at {} Hz, {monsters} monster samples, {} bytes, last guest_frame={} scene={}",
         recording.profile_id,
         recording.frames.len(),
         recording.hz,
-        bytes.len()
+        bytes.len(),
+        recording
+            .frames
+            .last()
+            .map(|frame| frame.guest_frame)
+            .unwrap_or(0),
+        recording
+            .frames
+            .last()
+            .map(|frame| frame.scene)
+            .unwrap_or(u32::MAX)
     );
     Ok(())
 }

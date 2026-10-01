@@ -1,158 +1,125 @@
-# Configuración de Azahar para desarrollo (mhdn)
+# Azahar Configuration Guide for Development (`mhdn`)
 
-Guía para dejar Azahar listo para reverse engineering y pruebas del overlay: RPC, logs, layout, GDB y
-plugin loader. Ajusta según tu SO.
+This guide explains how to prepare Azahar for memory inspection, reverse engineering, and overlay usage: RPC server setup, logging, window layouts, and GDB debugging.
 
-## Requisitos
+---
 
-- [Azahar](https://github.com/azahar-emu/azahar) **≥ 2121.2** (el servidor RPC viene desactivado por defecto desde esa versión).
-- Copia legal de **MHXX Japón** (`Title ID` `0004000000197100`) con actualización **v1.4** instalada.
-  En builds con parche de traducción al español, la versión de título del update suele ser **4224** (`0x1080`) en lugar de 4160.
-- **3D estereoscópico apagado** (`render_3d = Off`, `factor_3d = 0`).
+## Prerequisites
 
-## Rutas del archivo de configuración
+- [Azahar](https://github.com/azahar-emu/azahar) **$\ge$ 2121.2** (the RPC server is disabled by default starting from this build).
+- Legal copy of **Monster Hunter XX Japan** (`Title ID` `0004000000197100`) with **v1.4 update** installed.
+  - In builds with the community Spanish/English translation patch, the title version in the TMD is typically **4224** (`0x1080`) instead of the base 4160.
+- **Stereoscopic 3D disabled** (`render_3d = Off`, `factor_3d = 0`).
 
-| SO | Ruta |
-|----|------|
+---
+
+## Configuration File Paths
+
+| OS | Default Path |
+|---|---|
 | macOS | `~/Library/Application Support/Azahar/config/qt-config.ini` |
 | Windows | `%APPDATA%\Azahar\config\qt-config.ini` |
-| Linux (portable) | `<carpeta Azahar>/user/config/qt-config.ini` |
+| Linux (portable) | `<Azahar directory>/user/config/qt-config.ini` |
 
-Cierra Azahar antes de editar el INI, o reinicia el emulador tras guardar.
+*Close Azahar before editing the INI file, or restart the emulator after saving changes.*
 
-## Opciones obligatorias para mhdn
+---
 
-En **Emulation → Configure → System** (o equivalente en el INI):
+## Required Settings for `mhdn`
 
-### 1. Servidor RPC (Modo Pasivo y lectura del plugin)
+You can set these in **Emulation → Configure → System** (or directly in `qt-config.ini`):
 
-- Activar **Enable RPC server** (`enable_rpc_server=true`).
-- Escucha en **`127.0.0.1:45987`** (UDP). No expongas este puerto fuera de localhost.
+### 1. RPC Memory Server
 
-Comprueba que responde (con el juego en marcha):
+- Enable **Enable RPC server** (`enable_rpc_server=true`).
+- Azahar listens on **`127.0.0.1:45987`** via UDP. Never expose this port outside of localhost.
+
+Verify responsiveness while the game is running:
 
 ```bash
-# Tras implementar mhdn-probe (Fase 2):
-mhdn-probe attach
+cargo run -p mhdn-probe -- attach
 ```
 
-Mientras tanto, puedes usar el script oficial `citra.py` del repo de Azahar (`dist/scripting/citra.py`).
+### 2. RPC Logging Filter (Critical for Performance)
 
-### 2. Filtro de log del RPC (importante)
+Azahar logs a `LOG_INFO` message for **every single RPC datagram**. At ~2000 requests/sec during combat, unfiltered logging will choke the host CPU and cause emulator stutter.
 
-El servidor RPC registra **un `LOG_INFO` por paquete**. A ~2000 req/s el log crece y penaliza CPU.
-
-En el INI, ajusta el filtro global:
+Add or update the logging filter in `qt-config.ini`:
 
 ```ini
 [Core]
 log_filter=*:Info RPC_Server:Warning
 ```
 
-(Sintaxis exacta puede variar; busca la clave `log_filter` en tu `qt-config.ini`.)
+### 3. Screen Layout
 
-### 3. Layout de pantalla
+**Recommended for overlay alignment:** **Separate Windows** — the top 3DS screen occupies its own dedicated host window, significantly simplifying screen-space projection.
 
-**Recomendado para alinear el overlay:** **Separate Windows** — la pantalla superior ocupa su propia ventana,
-lo que simplifica el rect de proyección.
+**Alternative (common single-window setup):** **Large Screen** with large screen proportion and the bottom touch screen placed in a corner. The overlay's projection module (`mhdn-proj`) replicates Azahar's internal layout calculations.
 
-Alternativa válida (desarrollo actual): **Large Screen** con proporción grande y pantalla táctil en una esquina.
-El overlay reimplementará la matemática de layout de Azahar (`mhdn-proj`).
-
-Claves típicas en `qt-config.ini`:
+Typical keys in `qt-config.ini`:
 
 ```ini
 [Layout]
-layout_option=2          # 2 = LargeScreen (ver enum en Azahar)
+layout_option=2          # 2 = LargeScreen
 large_screen_proportion=4
 small_screen_position=2  # BottomRight
 swap_screen=false
 upright_screen=false
 screen_top_stretch=false
 singleWindowMode=true
-showStatusBar=true       # resta altura al área de juego; el overlay debe tener inset inferior
+showStatusBar=true       # Status bar takes vertical space; overlay accounts for this inset
 fullscreen=false
 ```
 
-Si cambias layout con atajos **sin** guardar config, el overlay puede desalinear hasta recalibrar (Fase 5).
+### 4. Internal Resolution
 
-### 4. Resolución interna
+Setting `resolution_factor=4` (or any scaling factor) scales Azahar's rasterization but **does not alter** the logical 400×240 projection coordinates.
 
-`resolution_factor=4` (u otro) **no cambia** la proyección lógica 400×240; solo escala el render del emulador.
+---
 
-## Opciones solo para reverse engineering
+## Reverse Engineering & Debugging Settings
 
-### GDB stub (Fase 2 / 7)
+### GDB Stub
 
-- Activar **GDB stub** (`use_gdbstub=true`), puerto por defecto **24689**.
-- Para usar watchpoints **desactiva el JIT de CPU** mientras depuras. Es obligatorio: con el JIT activado los watchpoints pueden no dispararse nunca (issue #2199 de Azahar). Los breakpoints de ejecución sí funcionan con JIT. Vuelve a activarlo al terminar, porque sin JIT el juego va mucho más lento.
+- Enable **GDB stub** (`use_gdbstub=true`), listening on port **24689**.
+- **Important:** Disable CPU JIT while using watchpoints. Watchpoints may not trigger reliably when JIT is active (Azahar issue #2199). Re-enable JIT when done, as the interpreter is substantially slower.
 
-Ejemplo:
+Example:
 
 ```bash
 arm-none-eabi-gdb
 (gdb) target remote :24689
-(gdb) watch *(int*)0x........   # dirección guest del HP tras encontrarla con mhdn-probe
+(gdb) watch *(int*)0x082C4BB8
 ```
 
-Volcado rápido de regiones (alternativa al dump por RPC):
+Fast memory dump (alternative to RPC dumping):
 
-```text
-(gdb) dump memory heap.bin 0x08000000 0x09000000
+```bash
+arm-none-eabi-gdb -batch \
+  -ex "target remote :24689" \
+  -ex "dump memory dumps/heap.bin 0x08000000 0x09000000" \
+  -ex "detach" -ex "quit"
 ```
 
-### Plugin loader 3GX (Fase 7 — Modo Activo)
+---
 
-- Activar **Enable 3GX plugin loader** (`plugin_loader=true`).
-- Instalar el plugin en la SD virtual:
+## Pre-Session Checklist
 
-```text
-sdmc/luma/plugins/0004000000197100/mhdn.3gx
-```
+- [ ] RPC server enabled (`enable_rpc_server=true`)
+- [ ] Log filter configured (`RPC_Server:Warning`)
+- [ ] 3D stereoscopy disabled
+- [ ] Title ID `0004000000197100` visible in `mhdn-probe attach`
+- [ ] Quest loaded with target monster active
 
-(Crea carpetas si no existen; el Title ID es MHXX JP.)
+---
 
-Reinicia el juego tras copiar el `.3gx`. El plugin **no** modifica partidas guardadas; solo parchea en RAM.
+## Troubleshooting
 
-Si el juego crashea al arrancar con el loader activado (issue #1381), desactívalo: el Modo Tap no lo necesita.
+| Issue | Resolution |
+|---|---|
+| RPC connection refused / times out | Verify `enable_rpc_server=true` and that Azahar is running version $\ge$ 2121.2. |
+| High CPU usage / FPS drop in Azahar | Verify `log_filter=*:Info RPC_Server:Warning` in `qt-config.ini`. |
+| Wrong process read | Azahar requires explicit PID selection via `SetGetProcess`. `mhdn-rpc` selects the MHXX title ID automatically. |
+| Overlay offset in fullscreen | Check whether `showStatusBar=true` is enabled and account for the 22–26 pt bottom status bar inset. |
 
-### Cheats de Azahar (solo para la validación 2.19)
-
-- *Emulation → Cheats*: añadir el cheat "Hit Monster Display Last Damage v1.4" para confirmar la semántica del sitio de daño.
-- **Desactívalo antes de usar el Modo Tap**: ambos usan la misma *code cave* y el mismo punto de enganche (`0x8D03E8`).
-
-## Instalación del juego y parches
-
-1. Instala la base MHXX JP en Azahar (CIA/3DS según tu flujo habitual).
-2. Instala la **actualización oficial v1.4** (`0004000E00197100`).
-3. Si usas **parche de traducción** (ES/EN), instálalo como update compatible; verifica versión de título en el TMD
-   (`content/00000001.tmd`, offset `0x1DC`, u16 big-endian). Documenta el valor en `docs/RE_NOTES.md` (Fase 2).
-
-**No subas ROMs, CIAs ni `code.bin` a este repositorio.**
-
-## Checklist antes de una sesión de RE
-
-- [ ] RPC activo; log con `RPC_Server:Warning`
-- [ ] 3D off; juego en misión con monstruo visible
-- [ ] Title ID `0004000000197100` visible en lista de procesos RPC
-- [ ] (Opcional) GDB stub / plugin loader según la tarea del PLAN
-
-## Multijugador local
-
-Cada jugador usa **su propio** Azahar y **su propio** overlay. Valida host vs. cliente en F2.17: el HP en clientes
-puede llegar agrupado o con retraso; el Modo Activo (plugin) es la vía para filtrar golpes propios.
-
-## Problemas frecuentes
-
-| Síntoma | Qué revisar |
-|---------|-------------|
-| RPC no responde | `enable_rpc_server`, firewall local, Azahar ≥ 2121.2 |
-| Azahar muy lento con overlay | `log_filter` del RPC; reducir req/s en reposo (fases posteriores) |
-| Proceso incorrecto leído | Desde PR #956 hay que **seleccionar PID** (`SetGetProcess`); `mhdn-rpc` lo hará en Fase 1 |
-| Plugin no carga | Ruta `sdmc/luma/plugins/<TitleID>/`, loader activado, juego reiniciado |
-
-## Referencias
-
-- [`PLAN.md`](../PLAN.md) — fases y commits
-- [`TECHNICAL_DESIGN.md`](TECHNICAL_DESIGN.md) — RPC, memoria guest, arquitectura
-- Azahar: `src/core/rpc/`, `dist/scripting/citra.py`, `src/common/settings.h`

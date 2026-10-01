@@ -22,3 +22,8 @@ tests/traces/*.mhrec
 # Build outputs
 *.app
 dist/
+
+# Development notes / scratch
+conversation.txt
+PLAN.md
+scratch/

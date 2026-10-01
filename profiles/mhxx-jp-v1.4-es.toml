@@ -10,14 +10,14 @@ version = "1.4-es"
 title_id = "0x0004000000197100"
 update_title_version = 4224
 fingerprint = [
-  { addr = "0x00100000", len = 4096, xxh3 = "0x0" },
-  { addr = "0x00140000", len = 4096, xxh3 = "0x0" },
-  { addr = "0x00180000", len = 4096, xxh3 = "0x0" },
-  { addr = "0x001C0000", len = 4096, xxh3 = "0x0" },
-  { addr = "0x00200000", len = 4096, xxh3 = "0x0" },
-  { addr = "0x00240000", len = 4096, xxh3 = "0x0" },
-  { addr = "0x00280000", len = 4096, xxh3 = "0x0" },
-  { addr = "0x002C0000", len = 4096, xxh3 = "0x0" },
+  { addr = "0x00100000", len = 4096, xxh3 = "0xE73BCD825AFB63D8" },
+  { addr = "0x00140000", len = 4096, xxh3 = "0x5820A35EB5299E7C" },
+  { addr = "0x00180000", len = 4096, xxh3 = "0x510BD1D2A3ECCEBF" },
+  { addr = "0x001C0000", len = 4096, xxh3 = "0x61C94D95756CC1A7" },
+  { addr = "0x00200000", len = 4096, xxh3 = "0x0D41046E5B909DBD" },
+  { addr = "0x00240000", len = 4096, xxh3 = "0x0744A2EE2BC46BA5" },
+  { addr = "0x00280000", len = 4096, xxh3 = "0x103CB2775F0DA264" },
+  { addr = "0x002C0000", len = 4096, xxh3 = "0x5FCFBCC3902D91FF" },
 ]
 
 [monster_list]

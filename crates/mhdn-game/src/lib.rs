@@ -14,7 +14,7 @@ pub use damage::{
 pub use profile::{
     load_dir, select, CameraMode, CameraProfile, ChainSpec, DamageTap, ExpectedWord, FieldRef,
     FieldSpec, FieldType, FingerprintWindow, FovUnit, MatchKind, MemorySpan, MonsterLayout,
-    MonsterList, ObservedWindow, Profile, ProfileError, Selection, SpeciesProfile, TapRing,
+    MonsterList, ObservedWindow, Profile, ProfileError, SceneFlag, Selection, SpeciesProfile, TapRing,
     MHXX_JP_TITLE_ID,
 };
 pub use tap::{

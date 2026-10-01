@@ -50,12 +50,17 @@ pub fn events(addr: SocketAddr, title_id: u64, timeout: Duration) -> Result<()> 
     }
     for event in events {
         println!(
-            "seq={} damage={} r1={} monster=0x{:08X} lr=0x{:08X}",
+            "seq={} damage={} r1={} monster=0x{:08X} lr=0x{:08X} sp=[0x{:08X}, 0x{:08X}, 0x{:08X}, 0x{:08X}, 0x{:08X}]",
             event.seq,
             event.damage(),
             event.r1,
             event.monster,
-            event.lr
+            event.lr,
+            event.stack[0],
+            event.stack[1],
+            event.stack[2],
+            event.stack[3],
+            event.stack[4],
         );
     }
     Ok(())
@@ -113,12 +118,17 @@ pub fn follow(
                     hits += 1;
                     sum += i64::from(event.damage());
                     let line = format!(
-                        "seq={} damage={} r1={} monster=0x{:08X} lr=0x{:08X}",
+                        "seq={} damage={} r1={} monster=0x{:08X} lr=0x{:08X} sp=[0x{:08X}, 0x{:08X}, 0x{:08X}, 0x{:08X}, 0x{:08X}]",
                         event.seq,
                         event.damage(),
                         event.r1,
                         event.monster,
-                        event.lr
+                        event.lr,
+                        event.stack[0],
+                        event.stack[1],
+                        event.stack[2],
+                        event.stack[3],
+                        event.stack[4],
                     );
                     println!("{line}");
                     writeln!(log, "{line}").ok();
