@@ -55,7 +55,12 @@ pub fn camera_from(state: &CameraState) -> Option<Camera> {
     params.is_usable().then(|| Camera::from(params))
 }
 
-pub fn build_hud(snapshot: Option<&Snapshot>, top: ScreenRect, stats: &HudStats) -> Vec<Quad> {
+pub fn build_hud(
+    snapshot: Option<&Snapshot>,
+    top: ScreenRect,
+    stats: &HudStats,
+    text_scale: f32,
+) -> Vec<Quad> {
     let frame_color = premul([0.25, 0.95, 0.45], 0.85);
     let monster_color = premul([1.0, 0.45, 0.12], 0.95);
     let hunter_color = premul([0.25, 0.85, 1.0], 0.95);
@@ -99,7 +104,13 @@ pub fn build_hud(snapshot: Option<&Snapshot>, top: ScreenRect, stats: &HudStats)
         "{}  F {}  {:.0} REQ/S  {:.1} MS  RPC {}",
         stats.scene, stats.guest_frame, stats.requests_per_sec, stats.rpc_latency_ms, rpc
     );
-    quads.extend(text_quads(&line, top.x + 8.0, top.y + 8.0, 2.0, text_color));
+    quads.extend(text_quads(
+        &line,
+        top.x + 8.0,
+        top.y + 8.0,
+        text_scale.max(1.0),
+        text_color,
+    ));
     quads
 }
 
@@ -162,7 +173,7 @@ mod tests {
             rpc_up: true,
             ..HudStats::default()
         };
-        let quads = build_hud(Some(&snapshot), top, &stats);
+        let quads = build_hud(Some(&snapshot), top, &stats, 2.0);
         let monster = premul([1.0, 0.45, 0.12], 0.95);
         let hunter = premul([0.25, 0.85, 1.0], 0.95);
         assert!(quads
@@ -177,7 +188,7 @@ mod tests {
     #[test]
     fn a_missing_snapshot_still_draws_the_screen_rect_and_status() {
         let top = ScreenRect::new(10.0, 12.0, 200.0, 120.0);
-        let quads = build_hud(None, top, &HudStats::default());
+        let quads = build_hud(None, top, &HudStats::default(), 2.0);
         assert!(quads.iter().any(|quad| quad.x == 10.0 && quad.y == 12.0));
         assert!(quads.len() > 4);
     }

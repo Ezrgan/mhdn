@@ -2,6 +2,8 @@
 
 #![forbid(unsafe_code)]
 
+mod calibrate;
+mod config;
 mod hud;
 mod run;
 mod session;

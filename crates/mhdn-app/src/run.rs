@@ -8,25 +8,29 @@ use std::time::{Duration, Instant};
 
 use mhdn_game::{Latest, Profile, Snapshot};
 use mhdn_platform::{
-    apply_click_through, system_tracker, Insets, OverlayHost, SurfaceUpdate, TrackedWindow,
-    WindowTracker,
+    apply_click_through, system_tracker, OverlayHost, SurfaceUpdate, TrackedWindow, WindowTracker,
 };
-use mhdn_proj::{parse_layout_settings, resolve, LayoutOption, LayoutSettings, ScreenRect};
+use mhdn_proj::{
+    parse_layout_settings, resolve, LayoutOption, LayoutSettings, LayoutWatcher, ScreenRect,
+};
 use mhdn_render::{FrameClock, Quad, RenderError, Renderer};
 use winit::application::ApplicationHandler;
-use winit::dpi::{LogicalPosition, LogicalSize};
-use winit::event::WindowEvent;
+use winit::dpi::{LogicalPosition, LogicalSize, PhysicalSize};
+use winit::event::{ElementState, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::window::{Window, WindowAttributes, WindowId};
 
+use crate::calibrate::{command_from_key, handles, CalibCommand, Calibrator};
+use crate::config::{config_path, layout_name, OverlayConfig, SnapshotDelay};
 use crate::hud::{build_hud, scene_label, HudStats};
 use crate::session::{sample_rate, RateWindow, RpcMeter, Session};
 
 const POLL: Duration = Duration::from_millis(33);
 
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
+    let calibrate = std::env::args().any(|arg| arg == "--calibrate");
     let event_loop = EventLoop::new()?;
-    let mut app = OverlayApp::new();
+    let mut app = OverlayApp::new(calibrate);
     event_loop.run_app(&mut app)?;
     Ok(())
 }
@@ -38,20 +42,43 @@ struct OverlayApp {
     host: OverlayHost,
     tracked: Option<TrackedWindow>,
     layout: LayoutSettings,
+    layout_key: String,
+    layout_watcher: Option<LayoutWatcher>,
+    config: OverlayConfig,
+    config_file: PathBuf,
     snapshots: Arc<Latest<Snapshot>>,
+    delay: SnapshotDelay,
     meter: Arc<RpcMeter>,
     rate: RateWindow,
     clock: FrameClock,
     last_frame: u32,
-    pending: Option<Snapshot>,
+    calibrator: Calibrator,
+    cursor: (f32, f32),
     parked: bool,
     _session: Option<Session>,
 }
 
 impl OverlayApp {
-    fn new() -> Self {
-        let layout = load_layout();
-        let tracker = system_tracker(Insets::chrome(layout.show_status_bar));
+    fn new(calibrate: bool) -> Self {
+        let config_file = config_path();
+        let config = OverlayConfig::load(&config_file);
+        let layout_watcher = azahar_config().and_then(|path| match LayoutWatcher::open(path) {
+            Ok(watcher) => Some(watcher),
+            Err(err) => {
+                eprintln!("mhdn: layout: {err}");
+                None
+            }
+        });
+        let detected = layout_watcher
+            .as_ref()
+            .map(|watcher| watcher.settings().clone())
+            .unwrap_or_else(load_layout);
+        let layout = config.effective_layout(detected);
+        let layout_key = layout_name(layout.option).to_string();
+        let mut calibrator = Calibrator::default();
+        calibrator.calibration = config.calibration_for(&layout_key);
+        calibrator.active = calibrate;
+        let tracker = system_tracker(config.insets_for(layout.show_status_bar));
         let snapshots = Arc::new(Latest::new());
         let meter = Arc::new(RpcMeter::default());
         let session = load_profile()
@@ -63,12 +90,18 @@ impl OverlayApp {
             host: OverlayHost::new(),
             tracked: None,
             layout,
+            layout_key,
+            layout_watcher,
+            config,
+            config_file,
             snapshots,
+            delay: SnapshotDelay::default(),
             meter,
             rate: RateWindow::new(Instant::now()),
             clock: FrameClock::default(),
             last_frame: 0,
-            pending: None,
+            calibrator,
+            cursor: (0.0, 0.0),
             parked: false,
             _session: session,
         }
@@ -110,29 +143,82 @@ impl OverlayApp {
         let Some(snapshot) = self.snapshots.take() else {
             return;
         };
-        if snapshot.guest_frame != self.last_frame {
-            self.last_frame = snapshot.guest_frame;
-            self.clock.request();
-        }
-        self.pending = Some(snapshot);
+        self.delay.push(snapshot);
+        self.clock.request();
     }
 
-    fn quads(&mut self, size: winit::dpi::PhysicalSize<u32>) -> Vec<Quad> {
-        let top = top_screen(&self.layout, size.width, size.height);
-        sample_rate(&mut self.rate, &self.meter, Instant::now());
-        let snapshot = self.pending.as_ref();
-        let stats = HudStats {
-            scene: snapshot
-                .map(|snapshot| scene_label(snapshot.scene))
-                .unwrap_or("WAITING"),
-            guest_frame: snapshot
-                .map(|snapshot| snapshot.guest_frame)
-                .unwrap_or(self.last_frame),
-            requests_per_sec: self.rate.requests_per_sec,
-            rpc_latency_ms: self.rate.latency_ms,
-            rpc_up: self.meter.is_up(),
+    fn reload_layout(&mut self) {
+        let Some(watcher) = self.layout_watcher.as_mut() else {
+            return;
         };
-        build_hud(snapshot, top, &stats)
+        match watcher.poll() {
+            Ok(false) => {}
+            Ok(true) => {
+                let detected = watcher.settings().clone();
+                self.apply_layout(detected);
+            }
+            Err(err) => eprintln!("mhdn: layout: {err}"),
+        }
+    }
+
+    fn apply_layout(&mut self, detected: LayoutSettings) {
+        let layout = self.config.effective_layout(detected);
+        let key = layout_name(layout.option);
+        if key != self.layout_key {
+            self.layout_key = key.to_string();
+            self.calibrator.calibration = self.config.calibration_for(&self.layout_key);
+            self.calibrator.pointer_up();
+        }
+        self.tracker
+            .set_insets(self.config.insets_for(layout.show_status_bar));
+        self.layout = layout;
+        self.clock.request();
+    }
+
+    fn window_size(&self) -> PhysicalSize<u32> {
+        self.window
+            .as_ref()
+            .map(|window| window.inner_size())
+            .unwrap_or(PhysicalSize::new(1, 1))
+    }
+
+    fn calibrated_top(&self, size: PhysicalSize<u32>) -> ScreenRect {
+        self.calibrator
+            .apply(top_screen(&self.layout, size.width, size.height))
+    }
+
+    fn quads(&mut self, size: PhysicalSize<u32>) -> Vec<Quad> {
+        let top = self.calibrated_top(size);
+        if !self.config.debug_hud && !self.calibrator.active {
+            return Vec::new();
+        }
+        sample_rate(&mut self.rate, &self.meter, Instant::now());
+        let snapshot = self.delay.sample(self.config.latency()).cloned();
+        let mut quads = if self.config.debug_hud {
+            let stats = HudStats {
+                scene: snapshot
+                    .as_ref()
+                    .map(|snapshot| scene_label(snapshot.scene))
+                    .unwrap_or("WAITING"),
+                guest_frame: snapshot
+                    .as_ref()
+                    .map(|snapshot| snapshot.guest_frame)
+                    .unwrap_or(self.last_frame),
+                requests_per_sec: self.rate.requests_per_sec,
+                rpc_latency_ms: self.rate.latency_ms,
+                rpc_up: self.meter.is_up(),
+            };
+            if let Some(snapshot) = snapshot.as_ref() {
+                self.last_frame = snapshot.guest_frame;
+            }
+            build_hud(snapshot.as_ref(), top, &stats, self.config.style.text_scale)
+        } else {
+            Vec::new()
+        };
+        if self.calibrator.active {
+            quads.extend(handles(top));
+        }
+        quads
     }
 
     fn draw(&mut self) {
@@ -147,6 +233,44 @@ impl OverlayApp {
         if let Err(RenderError::Outdated) = renderer.draw(&quads) {
             renderer.resize(size.width, size.height);
             let _ = renderer.draw(&quads);
+        }
+    }
+
+    fn set_calibration_active(&mut self, active: bool) {
+        self.calibrator.active = active;
+        self.calibrator.pointer_up();
+        if let Some(window) = &self.window {
+            if let Err(err) = apply_click_through(window, !active) {
+                eprintln!("mhdn: {err}");
+            }
+            if active {
+                window.focus_window();
+            }
+        }
+        self.clock.request();
+    }
+
+    fn save_config(&mut self) {
+        let key = self.layout_key.clone();
+        self.config
+            .set_calibration(key, self.calibrator.calibration);
+        match self.config.save(&self.config_file) {
+            Ok(()) => eprintln!("mhdn: saved {}", self.config_file.display()),
+            Err(err) => eprintln!("mhdn: config: {err}"),
+        }
+    }
+
+    fn on_key(&mut self, key: &winit::keyboard::Key) {
+        let Some(command) = command_from_key(key) else {
+            return;
+        };
+        match command {
+            CalibCommand::Toggle => self.set_calibration_active(!self.calibrator.active),
+            CalibCommand::Save => self.save_config(),
+            CalibCommand::Nudge(dx, dy) => {
+                self.calibrator.command(CalibCommand::Nudge(dx, dy));
+                self.clock.request();
+            }
         }
     }
 }
@@ -169,8 +293,11 @@ impl ApplicationHandler for OverlayApp {
                 return;
             }
         };
-        if let Err(err) = apply_click_through(&window, true) {
+        if let Err(err) = apply_click_through(&window, !self.calibrator.active) {
             eprintln!("mhdn: {err}");
+        }
+        if self.calibrator.active {
+            window.focus_window();
         }
         match Renderer::new(Arc::clone(&window)) {
             Ok(renderer) => self.renderer = Some(renderer),
@@ -193,12 +320,38 @@ impl ApplicationHandler for OverlayApp {
                 }
                 self.clock.request();
             }
+            WindowEvent::CursorMoved { position, .. } => {
+                self.cursor = (position.x as f32, position.y as f32);
+                if self.calibrator.active {
+                    self.calibrator.pointer_move(self.cursor.0, self.cursor.1);
+                    self.clock.request();
+                }
+            }
+            WindowEvent::MouseInput { state, button, .. } => {
+                if button == MouseButton::Left && self.calibrator.active {
+                    match state {
+                        ElementState::Pressed => {
+                            let top = self.calibrated_top(self.window_size());
+                            self.calibrator
+                                .pointer_down(top, self.cursor.0, self.cursor.1);
+                        }
+                        ElementState::Released => self.calibrator.pointer_up(),
+                    }
+                    self.clock.request();
+                }
+            }
+            WindowEvent::KeyboardInput { event, .. } => {
+                if event.state == ElementState::Pressed && !event.repeat {
+                    self.on_key(&event.logical_key);
+                }
+            }
             WindowEvent::RedrawRequested => self.draw(),
             _ => {}
         }
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        self.reload_layout();
         self.follow();
         self.take_snapshot();
         if self.clock.take() {
