@@ -10,3 +10,5 @@ publish = false
 
 [dependencies]
 glam = "0.29"
+notify = "6.1"
+thiserror.workspace = true
