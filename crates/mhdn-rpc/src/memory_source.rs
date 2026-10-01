@@ -75,21 +75,73 @@ impl MemorySource for FileMemorySource {
     }
 }
 
-/// Placeholder for Fase 3 recorded sessions (`.mhrec`).
-#[derive(Debug, Default)]
+/// Playback of sparse guest frames. Each frame is a list of `(address, bytes)` runs.
+/// Reads outside a run return zeroes. An empty recording, or a seek past the end, is an error.
+#[derive(Debug, Clone)]
 pub struct ReplaySource {
-    _private: (),
+    frames: Vec<std::collections::BTreeMap<u32, u8>>,
+    cursor: usize,
 }
 
 impl ReplaySource {
-    pub fn not_implemented() -> Self {
-        Self { _private: () }
+    pub fn from_runs<I, R>(frames: I) -> Self
+    where
+        I: IntoIterator<Item = R>,
+        R: IntoIterator<Item = (u32, Vec<u8>)>,
+    {
+        let frames = frames
+            .into_iter()
+            .map(|runs| {
+                let mut bytes = std::collections::BTreeMap::new();
+                for (addr, data) in runs {
+                    for (index, byte) in data.into_iter().enumerate() {
+                        bytes.insert(addr.wrapping_add(index as u32), byte);
+                    }
+                }
+                bytes
+            })
+            .collect();
+        Self { frames, cursor: 0 }
+    }
+
+    pub fn frame_count(&self) -> usize {
+        self.frames.len()
+    }
+
+    pub fn position(&self) -> usize {
+        self.cursor
+    }
+
+    pub fn seek(&mut self, index: usize) -> Result<()> {
+        if index >= self.frames.len() {
+            return Err(RpcError::InvalidResponse);
+        }
+        self.cursor = index;
+        Ok(())
+    }
+
+    pub fn advance(&mut self) -> bool {
+        let next = self.cursor.saturating_add(1);
+        if next >= self.frames.len() {
+            return false;
+        }
+        self.cursor = next;
+        true
     }
 }
 
 impl MemorySource for ReplaySource {
-    fn read(&mut self, _addr: u32, _buf: &mut [u8]) -> Result<()> {
-        Err(RpcError::InvalidResponse)
+    fn read(&mut self, addr: u32, buf: &mut [u8]) -> Result<()> {
+        let Some(frame) = self.frames.get(self.cursor) else {
+            return Err(RpcError::InvalidResponse);
+        };
+        for (index, slot) in buf.iter_mut().enumerate() {
+            *slot = frame
+                .get(&addr.wrapping_add(index as u32))
+                .copied()
+                .unwrap_or(0);
+        }
+        Ok(())
     }
 }
 
@@ -130,9 +182,20 @@ mod tests {
     }
 
     #[test]
-    fn replay_source_returns_error() {
-        let mut replay = ReplaySource::not_implemented();
+    fn replay_source_plays_frames_in_order() {
+        let mut replay = ReplaySource::from_runs([
+            vec![(0x1000, vec![1, 2, 3, 4])],
+            vec![(0x1000, vec![9, 9, 9, 9])],
+        ]);
         let mut buf = [0u8; 4];
-        assert!(replay.read(0, &mut buf).is_err());
+        replay.read(0x1000, &mut buf).unwrap();
+        assert_eq!(buf, [1, 2, 3, 4]);
+        assert!(replay.advance());
+        replay.read(0x1000, &mut buf).unwrap();
+        assert_eq!(buf, [9, 9, 9, 9]);
+        assert!(!replay.advance());
+        assert!(ReplaySource::from_runs(Vec::<Vec<(u32, Vec<u8>)>>::new())
+            .read(0, &mut buf)
+            .is_err());
     }
 }

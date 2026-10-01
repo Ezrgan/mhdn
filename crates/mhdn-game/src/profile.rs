@@ -213,6 +213,9 @@ impl TapRing {
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct SpeciesProfile {
     pub default_anchor_height: f32,
+    /// Exact HP drop of one poison tick for this profile, when it is known.
+    #[serde(default)]
+    pub poison_tick: Option<u32>,
     #[serde(default, flatten)]
     pub by_id: BTreeMap<String, SpeciesAnchor>,
 }

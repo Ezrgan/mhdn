@@ -29,7 +29,7 @@ The project is under active development. Core reverse engineering, memory struct
 |---|---|---|---|
 | **Phase 1: RPC Engine** | v0.1.0 | ✅ Complete | UDP packet pipeline, batched reads, memory sources |
 | **Phase 2: Reverse Engineering** | v0.2.0 | ✅ Complete | Monster list, camera, frame counter, hitzone transforms, damage tap |
-| **Phase 3: Game Pipeline** | v0.3.0 | 🔄 In Progress | State machine, snapshot seqlock, damage event pipeline |
+| **Phase 3: Game Pipeline** | v0.3.0 | ✅ Complete | Snapshots, scene machine, monster identity, passive and tap events, sampler |
 | **Phase 4: 3D Projection** | v0.4.0 | 📅 Planned | World-to-screen math, camera lerp, Azahar layout resolver |
 | **Phase 5: Overlay Window** | v0.5.0 | 📅 Planned | macOS click-through transparent window & Azahar tracker |
 | **Phase 6: Visuals & MVP** | v0.6.0 | 📅 Planned | Floating text particles, hit animations, combat recount widget |

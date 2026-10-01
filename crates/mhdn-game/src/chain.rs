@@ -26,7 +26,7 @@ pub enum ChainError {
     OutsideHeap { addr: u32 },
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct PointerCache {
     hits: HashMap<(u32, Vec<ChainStep>), u32>,
 }
@@ -40,6 +40,10 @@ impl PointerCache {
 
     pub fn invalidate(&mut self) {
         self.hits.clear();
+    }
+
+    pub fn forget(&mut self, base: u32, steps: &[ChainStep]) {
+        self.hits.remove(&(base, steps.to_vec()));
     }
 
     pub fn resolve(
@@ -113,6 +117,10 @@ fn require_heap(addr: u32) -> Result<(), ChainError> {
     } else {
         Err(ChainError::OutsideHeap { addr })
     }
+}
+
+pub(crate) fn is_guest_heap(addr: u32) -> bool {
+    heap_contains(addr)
 }
 
 fn heap_contains(addr: u32) -> bool {
