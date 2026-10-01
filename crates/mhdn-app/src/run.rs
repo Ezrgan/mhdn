@@ -144,7 +144,9 @@ impl OverlayApp {
             return;
         };
         self.delay.push(snapshot);
-        self.clock.request();
+        if self.config.debug_hud || self.calibrator.active {
+            self.clock.request();
+        }
     }
 
     fn reload_layout(&mut self) {
