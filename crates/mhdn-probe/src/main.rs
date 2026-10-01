@@ -1,6 +1,7 @@
 mod attach;
 mod dump;
 mod error;
+mod events_cmd;
 mod findmat;
 mod fingerprint;
 mod format;
@@ -167,6 +168,16 @@ enum Commands {
         #[command(subcommand)]
         action: TapCmd,
     },
+    /// Print derived damage events for a few seconds (phase 3).
+    Events {
+        #[command(flatten)]
+        conn: ConnArgs,
+        #[arg(long)]
+        profile: PathBuf,
+        /// How long to sample. The tap is removed when this returns.
+        #[arg(long, default_value_t = 30)]
+        seconds: u64,
+    },
     /// Measure Azahar RPC latency and throughput on localhost.
     BenchRpc {
         /// RPC server address (Azahar default: 127.0.0.1:45987).
@@ -321,6 +332,11 @@ fn run() -> Result<()> {
             seconds,
         } => cmd_watch(conn, guest, len, hz, seconds),
         Commands::Peek { conn, ty, guest } => cmd_peek(conn, ty, guest),
+        Commands::Events {
+            conn,
+            profile,
+            seconds,
+        } => events_cmd::follow(conn.addr, conn.title_id, conn.timeout(), &profile, seconds),
         Commands::Tap { action } => match action {
             TapCmd::Install { conn } => tap_cmd::install(conn.addr, conn.title_id, conn.timeout()),
             TapCmd::Uninstall { conn } => {
