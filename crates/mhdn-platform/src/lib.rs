@@ -1,6 +1,7 @@
 //! Platform-specific window tracking and overlay surfaces.
 
 mod error;
+mod follow;
 mod geom;
 #[cfg(target_os = "macos")]
 mod macos_list;
@@ -14,6 +15,9 @@ mod macos;
 mod other;
 
 pub use error::PlatformError;
+pub use follow::{
+    round_rect, FollowController, OverlayHost, PixelRect, SurfaceUpdate, MIN_SURFACE_INTERVAL,
+};
 pub use geom::{
     content_rect, is_fullscreen, Insets, Rect, DEFAULT_STATUS_BAR_PT, DEFAULT_TITLE_BAR_PT,
 };
