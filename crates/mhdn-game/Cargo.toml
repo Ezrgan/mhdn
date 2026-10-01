@@ -13,3 +13,4 @@ mhdn-rpc = { path = "../mhdn-rpc" }
 serde.workspace = true
 thiserror.workspace = true
 toml.workspace = true
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
