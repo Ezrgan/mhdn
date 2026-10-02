@@ -32,7 +32,7 @@ The project is under active development. Core reverse engineering, memory struct
 | **Phase 3: Game Pipeline** | v0.3.0 | ✅ Complete | Snapshots, scene machine, monster identity, passive and tap events, sampler |
 | **Phase 4: 3D Projection** | v0.4.0 | ✅ Complete | World-to-screen math, camera lerp, Azahar layout resolver |
 | **Phase 5: Overlay Window** | v0.5.0 | ✅ Complete | Click-through overlay, Azahar tracking, debug HUD, calibration |
-| **Phase 6: Visuals & MVP** | v0.6.0 | 📅 Planned | Floating text particles, hit animations, combat recount widget |
+| **Phase 6: Visuals & MVP** | v0.1.0 | ✅ Complete | Floating damage numbers, hit colors, hunt damage recount |
 
 Detailed technical specifications and findings are available in [`docs/TECHNICAL_DESIGN.md`](docs/TECHNICAL_DESIGN.md) and [`docs/RE_NOTES.md`](docs/RE_NOTES.md).
 
@@ -69,6 +69,29 @@ cargo build --workspace
 # Run automated tests
 cargo test --workspace
 ```
+
+### Run the overlay
+
+Start Azahar with the RPC server enabled (see [Azahar Setup Guide](docs/SETUP_AZAHAR.md)), boot MHXX, then from this repo:
+
+```bash
+cargo run -p mhdn-app --release
+```
+
+The overlay follows the Azahar window. A menu-bar title reports the link:
+
+| Title | Meaning |
+|---|---|
+| `mhdn: esperando Azahar` | Azahar is not on screen, or MHXX is not the running title |
+| `mhdn: RPC desactivado` | Nothing is listening on `127.0.0.1:45987` |
+| `mhdn: juego no soportado (...)` | The running build does not match `profiles/mhxx-jp-v1.4-es.toml` |
+| `mhdn: activo` | The window is on screen and the profile matches |
+
+Hits show as floating numbers on the monster. A bone position from the damage tap is used when the tap is installed; otherwise the number sits above the body by the species anchor height, with a few pixels of scatter. White / yellow / orange is how the hit compares with the last 50 hits. Poison ticks are small and purple. `DMG` / `DPS` in the corner is this hunt only.
+
+The window does not take clicks. Stop it with Ctrl-C in the terminal. Config lives at `~/Library/Application Support/mhdn/config.toml` on macOS (`%APPDATA%\mhdn\config.toml` on Windows). `debug_hud = false` hides the alignment crosses. `show_numbers`, `show_recount`, and `number_px` control the fight text.
+
+**Limits of this build:** hits that land in the same guest frame still merge when the damage tap is not installed. The overlay does not yet know who swung, whether the hit was a crit, or which element it was. Those need another reverse-engineering pass. Team damage percentage is not shown because attacker identity is not in the event yet.
 
 ### RE & Probe CLI
 
