@@ -41,6 +41,12 @@ pub struct InsetConfig {
 pub struct StyleConfig {
     #[serde(default = "default_text_scale")]
     pub text_scale: f32,
+    #[serde(default = "default_on")]
+    pub show_numbers: bool,
+    #[serde(default = "default_on")]
+    pub show_recount: bool,
+    #[serde(default = "default_number_px")]
+    pub number_px: f32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
@@ -70,9 +76,14 @@ impl Default for StyleConfig {
     fn default() -> Self {
         Self {
             text_scale: DEFAULT_TEXT_SCALE,
+            show_numbers: true,
+            show_recount: true,
+            number_px: DEFAULT_NUMBER_PX,
         }
     }
 }
+
+const DEFAULT_NUMBER_PX: f32 = 36.0;
 
 fn default_latency() -> u64 {
     DEFAULT_LATENCY_MS
@@ -84,6 +95,14 @@ fn default_debug_hud() -> bool {
 
 fn default_text_scale() -> f32 {
     DEFAULT_TEXT_SCALE
+}
+
+fn default_on() -> bool {
+    true
+}
+
+fn default_number_px() -> f32 {
+    DEFAULT_NUMBER_PX
 }
 
 impl OverlayConfig {
@@ -191,6 +210,10 @@ impl SnapshotDelay {
         }
     }
 
+    pub fn latest(&self) -> Option<&Snapshot> {
+        self.frames.back()
+    }
+
     pub fn sample(&self, latency: Duration) -> Option<&Snapshot> {
         let latest = self.frames.back()?;
         let lag = u64::try_from(latency.as_micros()).unwrap_or(u64::MAX);
@@ -251,7 +274,10 @@ mod tests {
                 title_bar_pt: Some(30.0),
                 ..InsetConfig::default()
             },
-            style: StyleConfig { text_scale: 3.0 },
+            style: StyleConfig {
+                text_scale: 3.0,
+                ..StyleConfig::default()
+            },
             ..OverlayConfig::default()
         };
         config.set_calibration(

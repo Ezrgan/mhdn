@@ -31,6 +31,6 @@ pub use track::{
 };
 
 #[cfg(target_os = "macos")]
-pub use macos::{apply_click_through, tint_spike};
+pub use macos::{apply_click_through, tint_spike, MenuStatus};
 #[cfg(not(target_os = "macos"))]
-pub use other::apply_click_through;
+pub use other::{apply_click_through, MenuStatus};

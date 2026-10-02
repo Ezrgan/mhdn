@@ -1,7 +1,7 @@
 //! Sampler thread. In a hunt it polls at 60 Hz; everywhere else, and when RPC fails, it backs off.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -32,6 +32,8 @@ pub struct EventQueue {
     events: Mutex<VecDeque<DamageEvent>>,
     capacity: usize,
     dropped: AtomicU64,
+    /// 0 unknown, 1 fingerprint matched, 2 this build is not the profile.
+    supported: AtomicU8,
 }
 
 impl EventQueue {
@@ -40,6 +42,7 @@ impl EventQueue {
             events: Mutex::new(VecDeque::new()),
             capacity: capacity.max(1),
             dropped: AtomicU64::new(0),
+            supported: AtomicU8::new(0),
         }
     }
 
@@ -58,6 +61,19 @@ impl EventQueue {
 
     pub fn dropped(&self) -> u64 {
         self.dropped.load(Ordering::Relaxed)
+    }
+
+    pub fn set_supported(&self, ok: bool) {
+        self.supported
+            .store(if ok { 1 } else { 2 }, Ordering::Relaxed);
+    }
+
+    pub fn supported(&self) -> Option<bool> {
+        match self.supported.load(Ordering::Relaxed) {
+            1 => Some(true),
+            2 => Some(false),
+            _ => None,
+        }
     }
 }
 
@@ -152,6 +168,9 @@ pub fn run_session<M, S>(
             }
         }
         let _ = pipeline.maintain_tap(&mut mem, &profile);
+        if let Some(ok) = pipeline.supported() {
+            events.set_supported(ok);
+        }
         if stop.load(Ordering::Relaxed) {
             break;
         }

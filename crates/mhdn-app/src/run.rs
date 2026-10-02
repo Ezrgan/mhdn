@@ -6,9 +6,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use mhdn_game::{Latest, Profile, Snapshot};
+use mhdn_game::{EventQueue, Latest, Profile, Scene, Snapshot};
 use mhdn_platform::{
-    apply_click_through, system_tracker, OverlayHost, SurfaceUpdate, TrackedWindow, WindowTracker,
+    apply_click_through, system_tracker, MenuStatus, OverlayHost, SurfaceUpdate, TrackedWindow,
+    WindowTracker,
 };
 use mhdn_proj::{
     parse_layout_settings, resolve, LayoutOption, LayoutSettings, LayoutWatcher, ScreenRect,
@@ -23,7 +24,9 @@ use winit::window::{Window, WindowAttributes, WindowId};
 use crate::calibrate::{command_from_key, handles, CalibCommand, Calibrator};
 use crate::config::{config_path, layout_name, OverlayConfig, SnapshotDelay};
 use crate::hud::{build_hud, scene_label, HudStats};
+use crate::numbers::CombatView;
 use crate::session::{sample_rate, RateWindow, RpcMeter, Session};
+use crate::status::{link_state, status_title};
 
 const POLL: Duration = Duration::from_millis(33);
 
@@ -55,6 +58,13 @@ struct OverlayApp {
     calibrator: Calibrator,
     cursor: (f32, f32),
     parked: bool,
+    events: Arc<EventQueue>,
+    combat: CombatView,
+    profile: Option<Profile>,
+    version: String,
+    last_tick: Instant,
+    menu: Option<MenuStatus>,
+    status_text: String,
     _session: Option<Session>,
 }
 
@@ -81,8 +91,20 @@ impl OverlayApp {
         let tracker = system_tracker(config.insets_for(layout.show_status_bar));
         let snapshots = Arc::new(Latest::new());
         let meter = Arc::new(RpcMeter::default());
-        let session = load_profile()
-            .map(|profile| Session::start(profile, Arc::clone(&snapshots), Arc::clone(&meter)));
+        let events = Arc::new(EventQueue::new(64));
+        let profile = load_profile();
+        let version = profile
+            .as_ref()
+            .map(|profile| profile.meta.version.clone())
+            .unwrap_or_else(|| "desconocida".to_string());
+        let session = profile.clone().map(|profile| {
+            Session::start(
+                profile,
+                Arc::clone(&snapshots),
+                Arc::clone(&meter),
+                Arc::clone(&events),
+            )
+        });
         Self {
             window: None,
             renderer: None,
@@ -103,6 +125,13 @@ impl OverlayApp {
             calibrator,
             cursor: (0.0, 0.0),
             parked: false,
+            events,
+            combat: CombatView::new(),
+            profile,
+            version,
+            last_tick: Instant::now(),
+            menu: None,
+            status_text: String::new(),
             _session: session,
         }
     }
@@ -189,11 +218,61 @@ impl OverlayApp {
             .apply(top_screen(&self.layout, size.width, size.height))
     }
 
+    fn refresh_combat(&mut self) {
+        let now = Instant::now();
+        let dt = now.saturating_duration_since(self.last_tick);
+        self.last_tick = now;
+        let was_alive = self.combat.alive();
+        self.combat.tick(dt);
+        let newest = self.delay.latest().cloned();
+        let scene = newest
+            .as_ref()
+            .map(|snapshot| snapshot.scene)
+            .unwrap_or(Scene::Disconnected);
+        let frame = newest
+            .as_ref()
+            .map(|snapshot| snapshot.guest_frame)
+            .unwrap_or(self.last_frame);
+        self.combat.observe(scene, frame);
+        if self.events.supported() == Some(false) {
+            let _ = self.events.drain();
+            self.combat.clear();
+        } else {
+            let events = self.events.drain();
+            let monsters = newest
+                .as_ref()
+                .map(|snapshot| snapshot.monsters.as_slice())
+                .unwrap_or(&[]);
+            let profile = self.profile.clone();
+            self.combat.ingest(&events, monsters, |species, large| {
+                profile
+                    .as_ref()
+                    .map(|profile| profile.species.anchor_for(species, large))
+                    .unwrap_or(if large { 150.0 } else { 52.0 })
+            });
+        }
+        if was_alive || self.combat.alive() {
+            self.clock.request();
+        }
+    }
+
+    fn refresh_status(&mut self) {
+        let onscreen = self.tracked.as_ref().is_some_and(|window| window.onscreen);
+        let title = status_title(link_state(self.meter.phase(), onscreen), &self.version);
+        if title == self.status_text {
+            return;
+        }
+        self.status_text = title;
+        if let Some(menu) = &self.menu {
+            menu.set_title(&self.status_text);
+        }
+        if let Some(window) = &self.window {
+            window.set_title(&self.status_text);
+        }
+    }
+
     fn quads(&mut self, size: PhysicalSize<u32>) -> Vec<Quad> {
         let top = self.calibrated_top(size);
-        if !self.config.debug_hud && !self.calibrator.active {
-            return Vec::new();
-        }
         sample_rate(&mut self.rate, &self.meter, Instant::now());
         let snapshot = self.delay.sample(self.config.latency()).cloned();
         let mut quads = if self.config.debug_hud {
@@ -217,6 +296,20 @@ impl OverlayApp {
         } else {
             Vec::new()
         };
+        if self.config.style.show_numbers {
+            if let Some(camera) = snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.camera.as_ref().and_then(crate::hud::camera_from))
+            {
+                quads.extend(
+                    self.combat
+                        .number_quads(&camera, top, self.config.style.number_px),
+                );
+            }
+        }
+        if self.config.style.show_recount {
+            quads.extend(self.combat.recount_quads(top));
+        }
         if self.calibrator.active {
             quads.extend(handles(top));
         }
@@ -309,6 +402,13 @@ impl ApplicationHandler for OverlayApp {
                 return;
             }
         }
+        self.menu = match MenuStatus::install() {
+            Ok(status) => Some(status),
+            Err(err) => {
+                eprintln!("mhdn: status item: {err}");
+                None
+            }
+        };
         self.window = Some(window);
         self.clock.request();
     }
@@ -356,12 +456,19 @@ impl ApplicationHandler for OverlayApp {
         self.reload_layout();
         self.follow();
         self.take_snapshot();
+        self.refresh_combat();
+        self.refresh_status();
         if self.clock.take() {
             if let Some(window) = &self.window {
                 window.request_redraw();
             }
         }
-        event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + POLL));
+        let wait = if self.combat.alive() {
+            Duration::from_millis(16)
+        } else {
+            POLL
+        };
+        event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + wait));
     }
 }
 

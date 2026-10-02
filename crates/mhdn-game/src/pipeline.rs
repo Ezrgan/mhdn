@@ -65,6 +65,11 @@ impl Pipeline {
         self.scene.committed()
     }
 
+    /// `None` until the fingerprint has been read. `false` means this build is not the profile.
+    pub fn supported(&self) -> Option<bool> {
+        self.fingerprints_ok
+    }
+
     pub fn failures(&self) -> u32 {
         self.failures
     }

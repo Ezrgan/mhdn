@@ -2,21 +2,38 @@
 
 #![forbid(unsafe_code)]
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use mhdn_game::{spawn, Latest, PatchMemory, Profile, Snapshot, TapError, MHXX_JP_TITLE_ID};
-use mhdn_rpc::{MemorySource, RpcClient, RpcError};
+use mhdn_rpc::{MemorySource, RpcClient};
 
 const RPC_ADDR: &str = "127.0.0.1:45987";
 
-#[derive(Debug, Default)]
+pub const PHASE_DOWN: u8 = 0;
+pub const PHASE_WAITING: u8 = 1;
+pub const PHASE_LIVE: u8 = 2;
+pub const PHASE_UNSUPPORTED: u8 = 3;
+
+#[derive(Debug)]
 pub struct RpcMeter {
     reads: AtomicU64,
     nanos: AtomicU64,
     up: AtomicBool,
+    phase: AtomicU8,
+}
+
+impl Default for RpcMeter {
+    fn default() -> Self {
+        Self {
+            reads: AtomicU64::new(0),
+            nanos: AtomicU64::new(0),
+            up: AtomicBool::new(false),
+            phase: AtomicU8::new(PHASE_WAITING),
+        }
+    }
 }
 
 impl RpcMeter {
@@ -32,6 +49,14 @@ impl RpcMeter {
 
     pub fn is_up(&self) -> bool {
         self.up.load(Ordering::Relaxed)
+    }
+
+    pub fn set_phase(&self, phase: u8) {
+        self.phase.store(phase, Ordering::Relaxed);
+    }
+
+    pub fn phase(&self) -> u8 {
+        self.phase.load(Ordering::Relaxed)
     }
 
     fn reads(&self) -> u64 {
@@ -89,10 +114,16 @@ pub struct Session {
 }
 
 impl Session {
-    pub fn start(profile: Profile, snapshots: Arc<Latest<Snapshot>>, meter: Arc<RpcMeter>) -> Self {
+    pub fn start(
+        profile: Profile,
+        snapshots: Arc<Latest<Snapshot>>,
+        meter: Arc<RpcMeter>,
+        events: Arc<mhdn_game::EventQueue>,
+    ) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&stop);
-        let thread = thread::spawn(move || run_until_stopped(profile, snapshots, meter, flag));
+        let thread =
+            thread::spawn(move || run_until_stopped(profile, snapshots, meter, events, flag));
         Self {
             stop,
             thread: Some(thread),
@@ -113,12 +144,14 @@ fn run_until_stopped(
     profile: Profile,
     snapshots: Arc<Latest<Snapshot>>,
     meter: Arc<RpcMeter>,
+    events: Arc<mhdn_game::EventQueue>,
     stop: Arc<AtomicBool>,
 ) {
     while !stop.load(Ordering::Relaxed) {
         match connect() {
             Ok(client) => {
                 meter.set_up(true);
+                meter.set_phase(PHASE_LIVE);
                 let mem = Metered {
                     client,
                     meter: Arc::clone(&meter),
@@ -127,39 +160,53 @@ fn run_until_stopped(
                     mem,
                     profile.clone(),
                     Arc::clone(&snapshots),
-                    events(),
+                    Arc::clone(&events),
                     thread::sleep,
                 );
                 while !stop.load(Ordering::Relaxed) {
+                    if events.supported() == Some(false) {
+                        meter.set_phase(PHASE_UNSUPPORTED);
+                    }
                     thread::sleep(Duration::from_millis(100));
                 }
                 drop(join);
                 meter.set_up(false);
+                if !stop.load(Ordering::Relaxed) {
+                    meter.set_phase(PHASE_WAITING);
+                }
             }
-            Err(_) => {
+            Err(ConnectFail::Rpc) => {
                 meter.set_up(false);
+                meter.set_phase(PHASE_DOWN);
+                thread::sleep(Duration::from_secs(1));
+            }
+            Err(ConnectFail::NoGame) => {
+                meter.set_up(false);
+                meter.set_phase(PHASE_WAITING);
                 thread::sleep(Duration::from_secs(1));
             }
         }
     }
 }
 
-fn events() -> Arc<mhdn_game::EventQueue> {
-    Arc::new(mhdn_game::EventQueue::new(64))
+enum ConnectFail {
+    Rpc,
+    NoGame,
 }
 
-fn connect() -> Result<RpcClient, RpcError> {
+fn connect() -> Result<RpcClient, ConnectFail> {
     let addr = RPC_ADDR
         .parse()
         .expect("127.0.0.1:45987 is a valid socket address");
-    let mut client = RpcClient::connect(addr, Duration::from_millis(50))?;
-    let processes = client.list_processes()?;
+    let mut client =
+        RpcClient::connect(addr, Duration::from_millis(50)).map_err(|_| ConnectFail::Rpc)?;
+    let processes = client.list_processes().map_err(|_| ConnectFail::Rpc)?;
     let pid = processes
         .iter()
         .find(|process| process.title_id == MHXX_JP_TITLE_ID)
         .map(|process| process.pid)
-        .ok_or(RpcError::InvalidResponse)?;
-    client.select_process(pid)?;
+        .ok_or(ConnectFail::NoGame)?;
+    client.select_process(pid).map_err(|_| ConnectFail::Rpc)?;
     Ok(client)
 }
 

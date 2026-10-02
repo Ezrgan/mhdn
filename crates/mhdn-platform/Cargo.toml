@@ -22,8 +22,14 @@ objc2-app-kit = { version = "0.3.2", default-features = false, features = [
     "NSApplication",
     "NSColor",
     "NSResponder",
+    "NSButton",
+    "NSControl",
     "NSRunningApplication",
     "NSScreen",
+    "NSStatusBar",
+    "NSStatusBarButton",
+    "NSStatusItem",
     "NSView",
     "NSWindow",
 ] }
+objc2-foundation = "0.3.2"
