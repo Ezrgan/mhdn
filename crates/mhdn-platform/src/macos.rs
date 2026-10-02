@@ -3,9 +3,10 @@
 use objc2::rc::Retained;
 use objc2::MainThreadMarker;
 use objc2_app_kit::{
-    NSApplication, NSApplicationActivationPolicy, NSColor, NSScreenSaverWindowLevel, NSView,
-    NSWindow, NSWindowCollectionBehavior,
+    NSApplication, NSApplicationActivationPolicy, NSColor, NSScreenSaverWindowLevel, NSStatusBar,
+    NSStatusItem, NSVariableStatusItemLength, NSView, NSWindow, NSWindowCollectionBehavior,
 };
+use objc2_foundation::NSString;
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use winit::window::Window;
 
@@ -43,6 +44,30 @@ pub fn tint_spike(window: &Window) -> Result<(), PlatformError> {
     let color = NSColor::colorWithRed_green_blue_alpha(1.0, 0.2, 0.15, 0.45);
     ns_window.setBackgroundColor(Some(&color));
     Ok(())
+}
+
+/// Menu-bar title. The item has to stay alive or AppKit removes it.
+pub struct MenuStatus {
+    item: Retained<NSStatusItem>,
+    marker: MainThreadMarker,
+}
+
+impl MenuStatus {
+    pub fn install() -> Result<Self, PlatformError> {
+        let marker = MainThreadMarker::new().ok_or(PlatformError::NotMainThread)?;
+        let bar = NSStatusBar::systemStatusBar();
+        let item = bar.statusItemWithLength(NSVariableStatusItemLength);
+        let status = Self { item, marker };
+        status.set_title("mhdn");
+        Ok(status)
+    }
+
+    pub fn set_title(&self, title: &str) {
+        let Some(button) = self.item.button(self.marker) else {
+            return;
+        };
+        button.setTitle(&NSString::from_str(title));
+    }
 }
 
 fn collection_behavior() -> NSWindowCollectionBehavior {

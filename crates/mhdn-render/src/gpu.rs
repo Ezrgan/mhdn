@@ -1,4 +1,4 @@
-//! Low-power wgpu surface. Presents only when the caller submits quads or a clear.
+//! Low-power wgpu surface. One instanced draw for every quad in the frame.
 
 #![forbid(unsafe_code)]
 
@@ -7,7 +7,8 @@ use std::sync::Arc;
 use bytemuck::{Pod, Zeroable};
 use winit::window::Window;
 
-use crate::draw::{Quad, QUADS_PER_BATCH};
+use crate::atlas::atlas;
+use crate::draw::{Quad, INSTANCE_LIMIT};
 use crate::error::RenderError;
 use crate::schedule::{pick_format, select_alpha_mode, POWER_PREFERENCE, PRESENT_MODE};
 use crate::SHADER;
@@ -17,14 +18,14 @@ use crate::SHADER;
 struct GpuQuad {
     rect: [f32; 4],
     color: [f32; 4],
+    uv: [f32; 4],
 }
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
-struct GpuFrame {
-    screen: [f32; 2],
+struct GpuScreen {
+    size: [f32; 2],
     pad: [f32; 2],
-    quads: [GpuQuad; QUADS_PER_BATCH],
 }
 
 pub struct Renderer {
@@ -35,6 +36,8 @@ pub struct Renderer {
     pipeline: wgpu::RenderPipeline,
     bind_group: wgpu::BindGroup,
     uniform: wgpu::Buffer,
+    instances: wgpu::Buffer,
+    scratch: Vec<GpuQuad>,
 }
 
 impl Renderer {
@@ -84,16 +87,34 @@ impl Renderer {
         });
         let bind_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("frame"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
                 },
-                count: None,
-            }],
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
         });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("quads"),
@@ -106,7 +127,7 @@ impl Renderer {
             vertex: wgpu::VertexState {
                 module: &shader,
                 entry_point: Some("vs_main"),
-                buffers: &[],
+                buffers: &[Some(instance_layout())],
                 compilation_options: Default::default(),
             },
             fragment: Some(wgpu::FragmentState {
@@ -126,18 +147,66 @@ impl Renderer {
             cache: None,
         });
         let uniform = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("frame"),
-            size: std::mem::size_of::<GpuFrame>() as u64,
+            label: Some("screen"),
+            size: std::mem::size_of::<GpuScreen>() as u64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
+        });
+        let instances = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("quads"),
+            size: (std::mem::size_of::<GpuQuad>() * INSTANCE_LIMIT) as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let glyphs = atlas();
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("glyphs"),
+            size: wgpu::Extent3d {
+                width: glyphs.width,
+                height: glyphs.height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::R8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        queue.write_texture(
+            texture.as_image_copy(),
+            &glyphs.pixels,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(glyphs.width),
+                rows_per_image: Some(glyphs.height),
+            },
+            texture.size(),
+        );
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("glyphs"),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
         });
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("frame"),
             layout: &bind_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: uniform.as_entire_binding(),
-            }],
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: uniform.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&sampler),
+                },
+            ],
         });
 
         Ok(Self {
@@ -148,6 +217,8 @@ impl Renderer {
             pipeline,
             bind_group,
             uniform,
+            instances,
+            scratch: Vec::with_capacity(INSTANCE_LIMIT),
         })
     }
 
@@ -174,42 +245,76 @@ impl Renderer {
         let view = frame
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("overlay"),
-            });
         if quads.is_empty() {
+            let mut encoder = self.encoder();
             clear(&mut encoder, &view);
+            self.queue.submit(Some(encoder.finish()));
         } else {
-            for (index, chunk) in quads.chunks(QUADS_PER_BATCH).enumerate() {
+            for (index, chunk) in quads.chunks(INSTANCE_LIMIT).enumerate() {
                 self.upload(chunk);
+                let mut encoder = self.encoder();
                 draw_batch(
                     &mut encoder,
                     &view,
                     &self.pipeline,
                     &self.bind_group,
+                    &self.instances,
                     chunk.len() as u32,
                     index == 0,
                 );
+                self.queue.submit(Some(encoder.finish()));
             }
         }
-        self.queue.submit(Some(encoder.finish()));
         self.queue.present(frame);
         Ok(())
     }
 
-    fn upload(&self, chunk: &[Quad]) {
-        let mut frame = GpuFrame::zeroed();
-        frame.screen = [self.config.width as f32, self.config.height as f32];
-        for (slot, quad) in chunk.iter().enumerate() {
-            frame.quads[slot] = GpuQuad {
-                rect: [quad.x, quad.y, quad.w, quad.h],
-                color: quad.color,
-            };
-        }
+    fn encoder(&self) -> wgpu::CommandEncoder {
+        self.device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("overlay"),
+            })
+    }
+
+    fn upload(&mut self, chunk: &[Quad]) {
+        self.scratch.clear();
+        self.scratch.extend(chunk.iter().map(|quad| GpuQuad {
+            rect: [quad.x, quad.y, quad.w, quad.h],
+            color: quad.color,
+            uv: quad.uv,
+        }));
+        let screen = GpuScreen {
+            size: [self.config.width as f32, self.config.height as f32],
+            pad: [0.0, 0.0],
+        };
         self.queue
-            .write_buffer(&self.uniform, 0, bytemuck::bytes_of(&frame));
+            .write_buffer(&self.uniform, 0, bytemuck::bytes_of(&screen));
+        self.queue
+            .write_buffer(&self.instances, 0, bytemuck::cast_slice(&self.scratch));
+    }
+}
+
+fn instance_layout() -> wgpu::VertexBufferLayout<'static> {
+    wgpu::VertexBufferLayout {
+        array_stride: std::mem::size_of::<GpuQuad>() as u64,
+        step_mode: wgpu::VertexStepMode::Instance,
+        attributes: &[
+            wgpu::VertexAttribute {
+                format: wgpu::VertexFormat::Float32x4,
+                offset: 0,
+                shader_location: 0,
+            },
+            wgpu::VertexAttribute {
+                format: wgpu::VertexFormat::Float32x4,
+                offset: 16,
+                shader_location: 1,
+            },
+            wgpu::VertexAttribute {
+                format: wgpu::VertexFormat::Float32x4,
+                offset: 32,
+                shader_location: 2,
+            },
+        ],
     }
 }
 
@@ -230,6 +335,7 @@ fn draw_batch(
     view: &wgpu::TextureView,
     pipeline: &wgpu::RenderPipeline,
     bind_group: &wgpu::BindGroup,
+    instances: &wgpu::Buffer,
     count: u32,
     clear_first: bool,
 ) {
@@ -244,6 +350,7 @@ fn draw_batch(
     });
     pass.set_pipeline(pipeline);
     pass.set_bind_group(0, bind_group, &[]);
+    pass.set_vertex_buffer(0, instances.slice(..));
     pass.draw(0..6, 0..count);
 }
 
@@ -278,11 +385,8 @@ mod tests {
     }
 
     #[test]
-    fn a_frame_of_quads_fits_in_one_uniform() {
-        assert!(std::mem::size_of::<GpuFrame>() <= 16 * 1024);
-        assert_eq!(
-            std::mem::size_of::<GpuQuad>() * QUADS_PER_BATCH + 16,
-            std::mem::size_of::<GpuFrame>()
-        );
+    fn one_instance_is_three_vec4s() {
+        assert_eq!(std::mem::size_of::<GpuQuad>(), 48);
+        assert!(std::mem::size_of::<GpuScreen>() <= 16);
     }
 }

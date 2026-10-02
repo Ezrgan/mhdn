@@ -23,7 +23,7 @@ pub use chain::{ChainError, ChainStep, PointerCache};
 pub use damage::{
     events_from_tap, overkill, tap_sum_for, DamageConfidence, DamageEvent, DamageKind, EventSource,
 };
-pub use model::{Anchor, CameraState, MonsterKey, MonsterState, Snapshot, Vec3};
+pub use model::{Anchor, CameraState, MonsterKey, MonsterState, Snapshot, Vec3, HP_FROM_OBJECT};
 pub use pipeline::{Pipeline, Sample};
 pub use profile::{
     load_dir, select, CameraMode, CameraProfile, ChainSpec, DamageTap, ExpectedWord, FieldRef,

@@ -10,6 +10,7 @@ publish = false
 
 [dependencies]
 bytemuck = { version = "1.25.2", features = ["derive"] }
+fontdue = "0.9.3"
 pollster = "1.0.1"
 thiserror.workspace = true
 wgpu = "30.0.1"

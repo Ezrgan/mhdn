@@ -5,15 +5,16 @@
 
 #![forbid(unsafe_code)]
 
+mod atlas;
 mod draw;
 mod error;
 mod font;
 mod gpu;
 mod schedule;
 
-pub use draw::{cross, stroke_rect, Quad, QUADS_PER_BATCH};
+pub use draw::{batch_count, cross, stroke_rect, Quad, INSTANCE_LIMIT};
 pub use error::RenderError;
-pub use font::{text_quads, ADVANCE, GLYPH_H, GLYPH_W};
+pub use font::{glyph_quads, text_quads};
 pub use gpu::Renderer;
 pub use schedule::{
     pick_format, premul, select_alpha_mode, FrameClock, POWER_PREFERENCE, PRESENT_MODE,

@@ -128,13 +128,7 @@ pub fn handles(rect: ScreenRect) -> Vec<Quad> {
     [rect.x, right, rect.x, right]
         .into_iter()
         .zip([rect.y, rect.y, bottom, bottom])
-        .map(|(x, y)| Quad {
-            x: x - size * 0.5,
-            y: y - size * 0.5,
-            w: size,
-            h: size,
-            color,
-        })
+        .map(|(x, y)| Quad::solid(x - size * 0.5, y - size * 0.5, size, size, color))
         .collect()
 }
 

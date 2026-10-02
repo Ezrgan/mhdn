@@ -226,6 +226,23 @@ pub struct SpeciesAnchor {
     pub anchor_height: f32,
 }
 
+impl SpeciesProfile {
+    /// World-space Y offset for a floating number. Small monsters sit lower.
+    pub fn anchor_for(&self, species: u16, large: bool) -> f32 {
+        let base = self
+            .by_id
+            .iter()
+            .find(|(id, _)| id.parse::<u16>().ok() == Some(species))
+            .map(|(_, row)| row.anchor_height)
+            .unwrap_or(self.default_anchor_height);
+        if large {
+            base
+        } else {
+            base * 0.35
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum ChainSpec {
     Unresolved,

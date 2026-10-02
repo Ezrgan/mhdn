@@ -15,6 +15,7 @@ path = "src/main.rs"
 
 [dependencies]
 glam = "0.29"
+mhdn-fx = { path = "../mhdn-fx" }
 mhdn-game = { path = "../mhdn-game" }
 mhdn-platform = { path = "../mhdn-platform" }
 mhdn-proj = { path = "../mhdn-proj" }
