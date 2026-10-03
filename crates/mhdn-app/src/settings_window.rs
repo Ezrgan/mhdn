@@ -136,6 +136,14 @@ impl SettingsWindow {
         self.window.set_minimized(true);
     }
 
+    /// True while the window is visible and is the key window (`isKeyWindow` on macOS).
+    /// A hidden or minimized window is never key.
+    pub fn is_focused(&self) -> bool {
+        self.window.is_visible().unwrap_or(true)
+            && !self.window.is_minimized().unwrap_or(false)
+            && self.window.has_focus()
+    }
+
     pub fn show(&self) {
         #[cfg(target_os = "macos")]
         self.window.set_visible(true);

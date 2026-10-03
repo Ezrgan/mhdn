@@ -41,8 +41,8 @@ pub use style::{
     SCREEN_SAVER_LEVEL, STATIONARY,
 };
 pub use track::{
-    host_in_front, system_tracker, track_windows, Display, ListTracker, NullTracker, TrackedWindow,
-    WindowTracker,
+    host_in_front, overlay_parked, system_tracker, track_windows, Display, ListTracker,
+    NullTracker, TrackedWindow, WindowTracker,
 };
 
 #[cfg(target_os = "macos")]
