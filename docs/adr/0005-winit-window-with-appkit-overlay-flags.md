@@ -49,24 +49,6 @@ on other hosts the same winit window is created and the AppKit call is a no-op.
 
 ## Addendum: native fullscreen and Game Mode (measured)
 
-- **Space membership.** The flags alone were not enough. The window was created visible while the app was
-  still `Regular` and only switched to `Accessory` afterwards, so it never joined Azahar's fullscreen space:
-  `CGWindowList` showed no mhdn window there. The event loop now starts as `Accessory`, and the window is
-  created hidden, configured, then shown. `join_active_space` reorders it if it is ever off the active space.
-- **Game Mode throttling.** Azahar's fullscreen turns on Game Mode. In that mode every wake of a thread in
-  a background process lands about 116 ms late. This was measured with `tools/sleepprobe.swift`:
-  - it applies to default QoS, user-interactive QoS, Mach time-constraint (real-time) threads, and threads
-    woken by a `CVDisplayLink`;
-  - `NSActivityUserInteractive` does not lift it either;
-  - RPC latency stays at 0.1 ms, but the sampler thread fell from about 57 to 8 samples/s and the numbers
-    stuttered.
-- **Main-thread pump.** The main thread keeps vsync while it presents frames. In a fullscreen hunt it
-  therefore renders continuously and calls `Pump::pump()` every frame, sampling on the sampler's own
-  schedule. This restores about 42 samples/s, above the game's 30 fps. Elsewhere the sampler thread alone
-  does the work.
-
-## Addendum: native fullscreen and Game Mode (measured)
-
 - **Space membership.** Setting the flags after winit shows the window as a regular app is not enough. The
   window stayed on the desktop space and never appeared in Azahar's fullscreen space. The event loop now
   starts with the accessory policy, and the window is created hidden, configured, and then shown. `follow()`
