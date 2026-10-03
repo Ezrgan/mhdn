@@ -15,7 +15,7 @@ mod schedule;
 pub use draw::{batch_count, cross, stroke_rect, Quad, INSTANCE_LIMIT};
 pub use error::RenderError;
 pub use font::{glyph_quads, text_quads};
-pub use gpu::Renderer;
+pub use gpu::{required_device_limits, Renderer};
 pub use schedule::{
     pick_format, premul, select_alpha_mode, FrameClock, POWER_PREFERENCE, PRESENT_MODE,
 };

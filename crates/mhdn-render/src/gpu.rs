@@ -48,22 +48,21 @@ impl Renderer {
         let surface = instance
             .create_surface(Arc::clone(&window))
             .map_err(|err| RenderError::Surface(err.to_string()))?;
-        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+        let adapter_options = wgpu::RequestAdapterOptions {
             power_preference: POWER_PREFERENCE,
             compatible_surface: Some(&surface),
             force_fallback_adapter: false,
             apply_limit_buckets: true,
-        }))
-        .map_err(|err| RenderError::NoAdapter(err.to_string()))?;
-        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-            label: Some("mhdn"),
-            required_features: wgpu::Features::empty(),
-            required_limits: wgpu::Limits::default(),
-            experimental_features: wgpu::ExperimentalFeatures::disabled(),
-            memory_hints: wgpu::MemoryHints::MemoryUsage,
-            trace: wgpu::Trace::Off,
-        }))
-        .map_err(|err| RenderError::Device(err.to_string()))?;
+        };
+        let preferred = pollster::block_on(instance.request_adapter(&adapter_options)).ok();
+        let enumerated = pollster::block_on(instance.enumerate_adapters(wgpu::Backends::all()));
+        let adapters = ordered_adapters(preferred, enumerated);
+        if adapters.is_empty() {
+            return Err(RenderError::NoAdapter(
+                "no compatible GPU adapters found".to_string(),
+            ));
+        }
+        let (adapter, device, queue) = open_device(&adapters, &surface)?;
 
         let caps = surface.get_capabilities(&adapter);
         let format = pick_format(&caps.formats).unwrap_or(wgpu::TextureFormat::Bgra8Unorm);
@@ -352,6 +351,56 @@ fn draw_batch(
     pass.set_bind_group(0, bind_group, &[]);
     pass.set_vertex_buffer(0, instances.slice(..));
     pass.draw(0..6, 0..count);
+}
+
+/// Limits for [`Adapter::request_device`]: never above what the adapter reports.
+pub fn required_device_limits(adapter: &wgpu::Adapter) -> wgpu::Limits {
+    adapter.limits()
+}
+
+fn ordered_adapters(
+    preferred: Option<wgpu::Adapter>,
+    enumerated: Vec<wgpu::Adapter>,
+) -> Vec<wgpu::Adapter> {
+    let mut adapters = Vec::new();
+    if let Some(adapter) = preferred {
+        adapters.push(adapter);
+    }
+    for adapter in enumerated {
+        if !adapters.contains(&adapter) {
+            adapters.push(adapter);
+        }
+    }
+    adapters
+}
+
+fn open_device(
+    adapters: &[wgpu::Adapter],
+    surface: &wgpu::Surface<'_>,
+) -> Result<(wgpu::Adapter, wgpu::Device, wgpu::Queue), RenderError> {
+    let mut last_err = String::new();
+    for adapter in adapters {
+        if !adapter.is_surface_supported(surface) {
+            continue;
+        }
+        let limits = required_device_limits(adapter);
+        match pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some("mhdn"),
+            required_features: wgpu::Features::empty(),
+            required_limits: limits,
+            experimental_features: wgpu::ExperimentalFeatures::disabled(),
+            memory_hints: wgpu::MemoryHints::MemoryUsage,
+            trace: wgpu::Trace::Off,
+        })) {
+            Ok((device, queue)) => return Ok((adapter.clone(), device, queue)),
+            Err(err) => last_err = err.to_string(),
+        }
+    }
+    Err(RenderError::Device(if last_err.is_empty() {
+        "no adapter could open a GPU device".to_string()
+    } else {
+        last_err
+    }))
 }
 
 fn color_attachment(view: &wgpu::TextureView, clear: bool) -> wgpu::RenderPassColorAttachment<'_> {
