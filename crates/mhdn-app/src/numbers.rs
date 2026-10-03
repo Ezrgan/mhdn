@@ -10,6 +10,7 @@ use mhdn_proj::{project, Camera, EdgeMode, Projected, ScreenRect};
 use mhdn_render::{glyph_quads, premul, Quad};
 
 use crate::config::NumberAnchor;
+use crate::settings::{CornerSettings, NumberSettings};
 
 /// A forward jump larger than this is a save state, not a dropped sample.
 const FRAME_JUMP: u32 = 90;
@@ -161,18 +162,29 @@ impl CombatView {
         }
     }
 
-    pub fn number_quads(&self, camera: &Camera, top: ScreenRect, number_px: f32) -> Vec<Quad> {
+    /// Hidden categories draw nothing. The category is read from the number's spawn color
+    /// each frame, so a settings change also reaches numbers that are already flying.
+    pub fn number_quads(
+        &self,
+        camera: &Camera,
+        top: ScreenRect,
+        number_px: f32,
+        settings: &NumberSettings,
+    ) -> Vec<Quad> {
         let mut quads = Vec::new();
         for live in self.pool.live() {
             if live.pose.alpha <= 0.0 {
                 continue;
             }
+            let Some(rgb) = settings.color_for(live.rgb) else {
+                continue;
+            };
             let world = glam::Vec3::new(live.world[0], live.world[1], live.world[2]);
             let Some(pos) = project(world, camera, top, EdgeMode::Hide).visible_pos() else {
                 continue;
             };
             let px = (number_px * live.pose.scale * live.mag_scale).max(8.0);
-            let color = premul(live.rgb, live.pose.alpha);
+            let color = premul(rgb, live.pose.alpha);
             let glyphs = glyph_quads(live.text, 0.0, 0.0, px, color);
             if glyphs.is_empty() {
                 continue;
@@ -194,11 +206,13 @@ impl CombatView {
     }
 
     /// `px` is the glyph height in physical pixels.
-    pub fn recount_quads(&self, top: ScreenRect, px: f32) -> Vec<Quad> {
+    pub fn recount_quads(&self, top: ScreenRect, px: f32, corner: &CornerSettings) -> Vec<Quad> {
         if self.recount.total == 0 {
             return Vec::new();
         }
-        let line = format!("DMG {}  DPS {:.0}", self.recount.total, self.recount.dps());
+        let Some(line) = corner.line(self.recount.total, self.recount.dps()) else {
+            return Vec::new();
+        };
         let margin = px * 0.5;
         glyph_quads(
             &line,
@@ -481,12 +495,94 @@ mod tests {
         );
         assert_eq!(view.recount.total, 40);
         let top = ScreenRect::new(0.0, 0.0, 800.0, 480.0);
-        let quads = view.number_quads(&hunt_camera(), top, 36.0);
+        let quads = view.number_quads(&hunt_camera(), top, 36.0, &NumberSettings::default());
         assert!(!quads.is_empty());
         assert!(quads.iter().all(|quad| top.contains(quad.x, quad.y)));
-        let recount = view.recount_quads(top, 44.0);
+        let recount = view.recount_quads(top, 44.0, &CornerSettings::default());
         assert!(recount.len() > 4);
         assert!(recount.iter().all(|quad| top.contains(quad.x, quad.y)));
+    }
+
+    fn spawn_one(view: &mut CombatView, amount: u32, kind: DamageKind) {
+        view.ingest(
+            &[event(
+                amount,
+                Anchor::World(GameVec3::new(0.0, 1.0, 0.0)),
+                kind,
+            )],
+            &[monster(0x1000, true)],
+            |_, _| 10.0,
+        );
+    }
+
+    #[test]
+    fn a_hidden_category_produces_no_quad_but_still_counts_in_the_recount() {
+        let top = ScreenRect::new(0.0, 0.0, 800.0, 480.0);
+        let mut view = CombatView::new();
+        view.observe(Scene::InQuest, 10);
+        spawn_one(&mut view, 3, DamageKind::Poison);
+        let shown = NumberSettings::default();
+        assert!(!view
+            .number_quads(&hunt_camera(), top, 36.0, &shown)
+            .is_empty());
+
+        let mut hidden = NumberSettings::default();
+        hidden.poison.show = false;
+        assert!(view
+            .number_quads(&hunt_camera(), top, 36.0, &hidden)
+            .is_empty());
+        assert_eq!(view.recount.total, 3);
+
+        // The same poison number comes back as soon as the setting does.
+        assert!(!view
+            .number_quads(&hunt_camera(), top, 36.0, &shown)
+            .is_empty());
+    }
+
+    #[test]
+    fn hiding_one_category_leaves_the_others_on_screen() {
+        let top = ScreenRect::new(0.0, 0.0, 800.0, 480.0);
+        let mut view = CombatView::new();
+        view.observe(Scene::InQuest, 10);
+        spawn_one(&mut view, 3, DamageKind::Poison);
+        spawn_one(&mut view, 40, DamageKind::Hit);
+        let all = view
+            .number_quads(&hunt_camera(), top, 36.0, &NumberSettings::default())
+            .len();
+        let mut hidden = NumberSettings::default();
+        hidden.poison.show = false;
+        let without_poison = view.number_quads(&hunt_camera(), top, 36.0, &hidden).len();
+        assert!(without_poison > 0);
+        assert!(without_poison < all);
+    }
+
+    #[test]
+    fn a_recolor_reaches_a_number_that_is_already_flying() {
+        let top = ScreenRect::new(0.0, 0.0, 800.0, 480.0);
+        let mut view = CombatView::new();
+        view.observe(Scene::InQuest, 10);
+        spawn_one(&mut view, 3, DamageKind::Poison);
+        let mut green = NumberSettings::default();
+        green.poison.rgb = [0.0, 1.0, 0.0];
+        let quads = view.number_quads(&hunt_camera(), top, 36.0, &green);
+        assert!(quads
+            .iter()
+            .all(|quad| quad.color[0] == 0.0 && quad.color[1] > 0.0));
+    }
+
+    #[test]
+    fn the_corner_hides_when_both_parts_are_off() {
+        let top = ScreenRect::new(0.0, 0.0, 800.0, 480.0);
+        let mut view = CombatView::new();
+        view.observe(Scene::InQuest, 10);
+        spawn_one(&mut view, 40, DamageKind::Hit);
+        let mut corner = CornerSettings::default();
+        let both = view.recount_quads(top, 44.0, &corner).len();
+        corner.show_dps = false;
+        let total_only = view.recount_quads(top, 44.0, &corner).len();
+        assert!(total_only > 0 && total_only < both);
+        corner.show_total = false;
+        assert!(view.recount_quads(top, 44.0, &corner).is_empty());
     }
 
     #[test]

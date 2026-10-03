@@ -3,6 +3,7 @@
 #![forbid(unsafe_code)]
 
 use crate::error::PlatformError;
+use crate::OverlayUserEvent;
 
 pub fn apply_click_through(
     _window: &winit::window::Window,
@@ -11,9 +12,9 @@ pub fn apply_click_through(
     Ok(())
 }
 
-pub fn overlay_event_loop() -> Result<winit::event_loop::EventLoop<()>, winit::error::EventLoopError>
-{
-    winit::event_loop::EventLoop::new()
+pub fn overlay_event_loop(
+) -> Result<winit::event_loop::EventLoop<OverlayUserEvent>, winit::error::EventLoopError> {
+    winit::event_loop::EventLoop::<OverlayUserEvent>::with_user_event().build()
 }
 
 pub fn join_active_space(_window: &winit::window::Window) -> Result<bool, PlatformError> {
@@ -38,7 +39,7 @@ pub fn frontmost_pid() -> Option<i32> {
 pub struct MenuStatus;
 
 impl MenuStatus {
-    pub fn install() -> Result<Self, PlatformError> {
+    pub fn install(_on_event: impl Fn(OverlayUserEvent) + 'static) -> Result<Self, PlatformError> {
         Ok(Self)
     }
 

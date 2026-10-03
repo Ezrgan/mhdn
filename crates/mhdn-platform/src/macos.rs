@@ -1,14 +1,14 @@
 //! AppKit adjustments on the winit `NSWindow`. See `docs/adr/0005`.
 
 use objc2::rc::Retained;
-use objc2::runtime::{NSObjectProtocol, ProtocolObject};
-use objc2::MainThreadMarker;
+use objc2::runtime::{AnyObject, NSObjectProtocol, ProtocolObject};
+use objc2::{define_class, msg_send, sel, DefinedClass, MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
-    NSApplication, NSApplicationActivationPolicy, NSColor, NSScreenSaverWindowLevel, NSStatusBar,
-    NSStatusItem, NSVariableStatusItemLength, NSView, NSWindow, NSWindowCollectionBehavior,
-    NSWorkspace,
+    NSApplication, NSApplicationActivationPolicy, NSColor, NSMenu, NSMenuItem,
+    NSScreenSaverWindowLevel, NSStatusBar, NSStatusItem, NSVariableStatusItemLength, NSView,
+    NSWindow, NSWindowCollectionBehavior, NSWorkspace,
 };
-use objc2_foundation::{NSActivityOptions, NSProcessInfo, NSString};
+use objc2_foundation::{NSActivityOptions, NSObject, NSProcessInfo, NSString};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use winit::error::EventLoopError;
 use winit::event_loop::EventLoop;
@@ -16,6 +16,7 @@ use winit::platform::macos::{ActivationPolicy, EventLoopBuilderExtMacOS};
 use winit::window::Window;
 
 use crate::error::PlatformError;
+use crate::OverlayUserEvent;
 
 /// Click-through, clear, topmost, and allowed next to a native fullscreen space.
 ///
@@ -46,8 +47,9 @@ pub fn apply_click_through(window: &Window, click_through: bool) -> Result<(), P
 /// Event loop for an accessory app. Space membership is decided when a window is
 /// first ordered in, and a regular app's windows never join another app's
 /// native fullscreen space.
-pub fn overlay_event_loop() -> Result<EventLoop<()>, EventLoopError> {
-    EventLoop::builder()
+pub fn overlay_event_loop() -> Result<EventLoop<OverlayUserEvent>, EventLoopError> {
+    let mut builder = EventLoop::<OverlayUserEvent>::with_user_event();
+    builder
         .with_activation_policy(ActivationPolicy::Accessory)
         .with_activate_ignoring_other_apps(false)
         .build()
@@ -109,18 +111,87 @@ pub fn tint_spike(window: &Window) -> Result<(), PlatformError> {
     Ok(())
 }
 
-/// Menu-bar title. The item has to stay alive or AppKit removes it.
+struct MenuIvars {
+    on_event: Box<dyn Fn(OverlayUserEvent)>,
+}
+
+define_class!(
+    #[unsafe(super(NSObject))]
+    #[thread_kind = MainThreadOnly]
+    #[ivars = MenuIvars]
+    struct MenuHandler;
+
+    impl MenuHandler {
+        #[unsafe(method(quit:))]
+        fn quit(&self, _sender: Option<&AnyObject>) {
+            (self.ivars().on_event)(OverlayUserEvent::Quit);
+        }
+
+        #[unsafe(method(showSettings:))]
+        fn show_settings(&self, _sender: Option<&AnyObject>) {
+            (self.ivars().on_event)(OverlayUserEvent::ShowSettings);
+        }
+    }
+);
+
+impl MenuHandler {
+    fn new(marker: MainThreadMarker, on_event: Box<dyn Fn(OverlayUserEvent)>) -> Retained<Self> {
+        let this = Self::alloc(marker).set_ivars(MenuIvars { on_event });
+        unsafe { msg_send![super(this), init] }
+    }
+}
+
+/// Menu-bar item. The item, its menu, and the quit target have to stay alive
+/// or AppKit drops them. The button shows the live status; the menu is how you quit.
 pub struct MenuStatus {
     item: Retained<NSStatusItem>,
+    /// AppKit does not retain the menu on our behalf for the lifetime we need.
+    #[allow(dead_code)]
+    menu: Retained<NSMenu>,
+    /// `setTarget` does not retain the action target.
+    #[allow(dead_code)]
+    handler: Retained<MenuHandler>,
     marker: MainThreadMarker,
 }
 
 impl MenuStatus {
-    pub fn install() -> Result<Self, PlatformError> {
+    pub fn install(on_event: impl Fn(OverlayUserEvent) + 'static) -> Result<Self, PlatformError> {
         let marker = MainThreadMarker::new().ok_or(PlatformError::NotMainThread)?;
         let bar = NSStatusBar::systemStatusBar();
         let item = bar.statusItemWithLength(NSVariableStatusItemLength);
-        let status = Self { item, marker };
+        let handler = MenuHandler::new(marker, Box::new(on_event));
+        let menu = NSMenu::new(marker);
+        let settings = unsafe {
+            NSMenuItem::initWithTitle_action_keyEquivalent(
+                NSMenuItem::alloc(marker),
+                &NSString::from_str("Settings\u{2026}"),
+                Some(sel!(showSettings:)),
+                &NSString::from_str(""),
+            )
+        };
+        let quit = unsafe {
+            NSMenuItem::initWithTitle_action_keyEquivalent(
+                NSMenuItem::alloc(marker),
+                &NSString::from_str("Quit"),
+                Some(sel!(quit:)),
+                &NSString::from_str("q"),
+            )
+        };
+        let target = Retained::as_ptr(&handler).cast::<AnyObject>();
+        // The status item does not retain the action target.
+        unsafe {
+            settings.setTarget(Some(&*target));
+            quit.setTarget(Some(&*target));
+        };
+        menu.addItem(&settings);
+        menu.addItem(&quit);
+        item.setMenu(Some(&menu));
+        let status = Self {
+            item,
+            menu,
+            handler,
+            marker,
+        };
         status.set_title("mhdn");
         Ok(status)
     }

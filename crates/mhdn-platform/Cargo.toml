@@ -27,6 +27,8 @@ objc2-app-kit = { version = "0.3.2", default-features = false, features = [
     "NSControl",
     "NSRunningApplication",
     "NSScreen",
+    "NSMenu",
+    "NSMenuItem",
     "NSStatusBar",
     "NSStatusBarButton",
     "NSStatusItem",

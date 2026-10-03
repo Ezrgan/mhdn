@@ -11,7 +11,7 @@ use mhdn_game::{EventQueue, Latest, Profile, Scene, Snapshot};
 use mhdn_platform::{
     apply_click_through, begin_latency_critical, frontmost_pid, host_in_front, join_active_space,
     overlay_event_loop, report_startup_failure, system_tracker, MenuStatus, OverlayHost,
-    SurfaceUpdate, TrackedWindow, WindowTracker,
+    OverlayUserEvent, SurfaceUpdate, TrackedWindow, WindowTracker,
 };
 use mhdn_proj::{
     parse_layout_settings, project, resolve, Camera, EdgeMode, LayoutOption, LayoutSettings,
@@ -21,19 +21,21 @@ use mhdn_render::{FrameClock, Quad, RenderError, Renderer};
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalPosition, LogicalSize, PhysicalSize};
 use winit::event::{ElementState, MouseButton, WindowEvent};
-use winit::event_loop::{ActiveEventLoop, ControlFlow};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoopProxy};
 use winit::window::{Window, WindowAttributes, WindowId};
 
 use crate::calibrate::{command_from_key, handles, CalibCommand, Calibrator};
 use crate::config::{config_path, layout_name, OverlayConfig, SnapshotDelay};
 use crate::hud::{build_hud, scene_label, HudStats};
 use crate::numbers::CombatView;
-use crate::session::{sample_rate, RateWindow, RpcMeter, Session};
+use crate::session::{sample_rate, RateWindow, RpcMeter, Session, PHASE_WAITING};
+use crate::settings_window::{Action, Dashboard, SettingsWindow, WindowFlow};
 use crate::status::{link_state, status_title};
 use crate::trace::Trace;
 
+/// Shown in the menu bar and the dashboard while the session is dropped.
+const STOPPED_TITLE: &str = "mhdn: Stopped";
 const POLL: Duration = Duration::from_millis(33);
-const RECOUNT_PT: f32 = 22.0;
 /// The sampler publishes at 4–60 Hz in every scene, including the in-game pause.
 const STALE_AFTER: Duration = Duration::from_secs(2);
 
@@ -41,7 +43,8 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let calibrate = std::env::args().any(|arg| arg == "--calibrate");
     let _latency = begin_latency_critical();
     let event_loop = overlay_event_loop()?;
-    let mut app = OverlayApp::new(calibrate);
+    let user_events = event_loop.create_proxy();
+    let mut app = OverlayApp::new(calibrate, user_events);
     event_loop.run_app(&mut app)?;
     Ok(())
 }
@@ -78,14 +81,16 @@ struct OverlayApp {
     version: String,
     last_tick: Instant,
     menu: Option<MenuStatus>,
+    user_events: EventLoopProxy<OverlayUserEvent>,
     status_text: String,
     trace: Option<Trace>,
     last_snapshot_at: Instant,
     session: Option<Session>,
+    settings: Option<SettingsWindow>,
 }
 
 impl OverlayApp {
-    fn new(calibrate: bool) -> Self {
+    fn new(calibrate: bool, user_events: EventLoopProxy<OverlayUserEvent>) -> Self {
         let config_file = config_path();
         let config = OverlayConfig::load(&config_file);
         let layout_watcher = azahar_config().and_then(|path| match LayoutWatcher::open(path) {
@@ -150,10 +155,12 @@ impl OverlayApp {
             version,
             last_tick: Instant::now(),
             menu: None,
+            user_events,
             status_text: String::new(),
             trace: Trace::from_env(),
             last_snapshot_at: Instant::now(),
             session,
+            settings: None,
         }
     }
 
@@ -400,11 +407,18 @@ impl OverlayApp {
 
     fn refresh_status(&mut self) {
         let onscreen = self.tracked.as_ref().is_some_and(|window| window.onscreen);
-        let title = status_title(link_state(self.meter.phase(), onscreen), &self.version);
+        let title = if self.session.is_some() {
+            status_title(link_state(self.meter.phase(), onscreen), &self.version)
+        } else {
+            STOPPED_TITLE.to_string()
+        };
         if title == self.status_text {
             return;
         }
         self.status_text = title;
+        if let Some(settings) = &self.settings {
+            settings.request_redraw();
+        }
         if let Some(menu) = &self.menu {
             menu.set_title(&self.status_text);
         }
@@ -450,7 +464,7 @@ impl OverlayApp {
         } else {
             Vec::new()
         };
-        if self.config.style.show_numbers {
+        if self.session.is_some() && self.config.style.show_numbers {
             let camera = snapshot
                 .as_ref()
                 .and_then(|snapshot| snapshot.camera.as_ref().and_then(crate::hud::camera_from));
@@ -467,12 +481,17 @@ impl OverlayApp {
                 quads.extend(self.combat.number_quads(
                     &camera,
                     top,
-                    self.config.style.number_px * ui,
+                    self.config.style.number_size() * ui,
+                    &self.config.style.numbers,
                 ));
             }
         }
-        if self.config.style.show_recount {
-            quads.extend(self.combat.recount_quads(top, RECOUNT_PT * ui));
+        if self.session.is_some() && self.config.style.show_recount {
+            quads.extend(self.combat.recount_quads(
+                top,
+                self.config.style.corner_size() * ui,
+                &self.config.style.corner,
+            ));
         }
         if self.calibrator.active {
             quads.extend(handles(top));
@@ -492,6 +511,91 @@ impl OverlayApp {
         if let Err(RenderError::Outdated) = renderer.draw(&quads) {
             renderer.resize(size.width, size.height);
             let _ = renderer.draw(&quads);
+        }
+    }
+
+    /// Dropping the session joins its thread, which uninstalls the damage tap.
+    fn stop_session(&mut self) {
+        if self.session.take().is_none() {
+            return;
+        }
+        let _ = self.events.drain();
+        self.combat.clear();
+        self.meter.set_up(false);
+        self.clock.request();
+        self.refresh_status();
+    }
+
+    /// A fresh session starts from clean queues, so nothing from before the stop leaks in.
+    fn start_session(&mut self) {
+        if self.session.is_some() {
+            return;
+        }
+        let Some(profile) = self.profile.clone() else {
+            return;
+        };
+        self.snapshots = Arc::new(Latest::new());
+        self.events = Arc::new(EventQueue::new(64));
+        self.delay = SnapshotDelay::default();
+        self.combat.clear();
+        self.meter.set_up(false);
+        self.meter.set_phase(PHASE_WAITING);
+        self.last_snapshot_at = Instant::now();
+        self.session = Some(Session::start(
+            profile,
+            Arc::clone(&self.snapshots),
+            Arc::clone(&self.meter),
+            Arc::clone(&self.events),
+        ));
+        self.clock.request();
+        self.refresh_status();
+    }
+
+    fn draw_settings(&mut self) {
+        let Some(settings) = self.settings.as_mut() else {
+            return;
+        };
+        let dashboard = Dashboard {
+            status: &self.status_text,
+            running: self.session.is_some(),
+            can_start: self.profile.is_some(),
+        };
+        let outcome = settings.draw(&mut self.config.style, dashboard);
+        if outcome.changed {
+            self.clock.request();
+        }
+        if outcome.save {
+            settings.take_unsaved();
+            match self.config.save(&self.config_file) {
+                Ok(()) => eprintln!("mhdn: saved {}", self.config_file.display()),
+                Err(err) => eprintln!("mhdn: config: {err}"),
+            }
+        }
+        match outcome.action {
+            Some(Action::Start) => self.start_session(),
+            Some(Action::Stop) => self.stop_session(),
+            None => {}
+        }
+    }
+
+    fn settings_event(&mut self, event: &WindowEvent) {
+        let Some(settings) = self.settings.as_mut() else {
+            return;
+        };
+        match settings.on_event(event) {
+            WindowFlow::Nothing => {}
+            WindowFlow::Redraw => settings.request_redraw(),
+            WindowFlow::CloseRequested => {
+                if settings.take_unsaved() {
+                    if let Err(err) = self.config.save(&self.config_file) {
+                        eprintln!("mhdn: config: {err}");
+                    }
+                }
+                settings.put_away();
+            }
+        }
+        if matches!(event, WindowEvent::RedrawRequested) {
+            self.draw_settings();
         }
     }
 
@@ -534,7 +638,7 @@ impl OverlayApp {
     }
 }
 
-impl ApplicationHandler for OverlayApp {
+impl ApplicationHandler<OverlayUserEvent> for OverlayApp {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_some() {
             return;
@@ -568,7 +672,10 @@ impl ApplicationHandler for OverlayApp {
                 return;
             }
         }
-        self.menu = match MenuStatus::install() {
+        let user_events = self.user_events.clone();
+        self.menu = match MenuStatus::install(move |event| {
+            let _ = user_events.send_event(event);
+        }) {
             Ok(status) => Some(status),
             Err(err) => {
                 eprintln!("mhdn: status item: {err}");
@@ -577,9 +684,33 @@ impl ApplicationHandler for OverlayApp {
         };
         self.window = Some(window);
         self.clock.request();
+        match SettingsWindow::new(event_loop) {
+            Ok(settings) => self.settings = Some(settings),
+            Err(err) => eprintln!("mhdn: settings window: {err}"),
+        }
     }
 
-    fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+    fn user_event(&mut self, event_loop: &ActiveEventLoop, event: OverlayUserEvent) {
+        match event {
+            OverlayUserEvent::Quit => event_loop.exit(),
+            OverlayUserEvent::ShowSettings => {
+                if let Some(settings) = &self.settings {
+                    settings.show();
+                    settings.request_redraw();
+                }
+            }
+        }
+    }
+
+    fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
+        if self
+            .settings
+            .as_ref()
+            .is_some_and(|settings| settings.id() == id)
+        {
+            self.settings_event(&event);
+            return;
+        }
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(size) => {

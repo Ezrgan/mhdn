@@ -23,10 +23,10 @@ pub fn link_state(phase: u8, window_onscreen: bool) -> LinkState {
 
 pub fn status_title(state: LinkState, version: &str) -> String {
     match state {
-        LinkState::WaitingForAzahar => "mhdn: esperando Azahar".to_string(),
-        LinkState::RpcDisabled => "mhdn: RPC desactivado".to_string(),
-        LinkState::Unsupported => format!("mhdn: juego no soportado ({version})"),
-        LinkState::Active => "mhdn: activo".to_string(),
+        LinkState::WaitingForAzahar => "mhdn: Waiting for Azahar".to_string(),
+        LinkState::RpcDisabled => "mhdn: RPC off".to_string(),
+        LinkState::Unsupported => format!("mhdn: Unsupported game ({version})"),
+        LinkState::Active => "mhdn: Active".to_string(),
     }
 }
 
@@ -47,8 +47,16 @@ mod tests {
         assert_eq!(link_state(PHASE_LIVE, true), LinkState::Active);
         assert_eq!(
             status_title(LinkState::Unsupported, "v1.4-es"),
-            "mhdn: juego no soportado (v1.4-es)"
+            "mhdn: Unsupported game (v1.4-es)"
         );
-        assert_eq!(status_title(LinkState::Active, "v1.4-es"), "mhdn: activo");
+        assert_eq!(status_title(LinkState::Active, "v1.4-es"), "mhdn: Active");
+        assert_eq!(
+            status_title(LinkState::WaitingForAzahar, "v1.4-es"),
+            "mhdn: Waiting for Azahar"
+        );
+        assert_eq!(
+            status_title(LinkState::RpcDisabled, "v1.4-es"),
+            "mhdn: RPC off"
+        );
     }
 }

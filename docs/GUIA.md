@@ -52,17 +52,17 @@ Esta versión está marcada como **beta**: todavía no se ha validado en un PC W
 
 ### Estados de la app
 
-- **`mhdn: esperando Azahar`:** Azahar no está visible o MHXX todavía no está abierto.
-- **`mhdn: RPC desactivado`:** Azahar no responde en su servidor RPC; comprueba **Enable RPC server** y
+- **`mhdn: Waiting for Azahar`:** Azahar no está visible o MHXX todavía no está abierto.
+- **`mhdn: RPC off`:** Azahar no responde en su servidor RPC; comprueba **Enable RPC server** y
   reinícialo.
-- **`mhdn: juego no soportado (...)`:** el juego, región o versión no coincide con MHXX JP v1.4 compatible.
-- **`mhdn: activo`:** la conexión y el perfil son correctos; el overlay está listo.
+- **`mhdn: Unsupported game (...)`:** el juego, región o versión no coincide con MHXX JP v1.4 compatible.
+- **`mhdn: Active`:** la conexión y el perfil son correctos; el overlay está listo.
 
 El overlay se oculta cuando otra aplicación está en primer plano. Vuelve a Azahar para verlo.
 
 ### Cómo salir
 
-- **macOS:** abre el menú de `mhdn` en la barra de menús y elige **Salir**.
+- **macOS:** en la barra de menús, haz clic en el texto de estado (`mhdn: Active`, `mhdn: Waiting for Azahar`, …) y elige **Salir**.
 - **Windows:** abre el icono de `mhdn` en la bandeja del sistema y elige **Exit/Salir**.
 
 ### Solución de problemas
@@ -156,17 +156,17 @@ This build is marked **beta** because it has not yet been validated on a real Wi
 
 ### App status
 
-- **`mhdn: esperando Azahar` (waiting for Azahar):** Azahar is not visible or MHXX is not running yet.
-- **`mhdn: RPC desactivado` (RPC off):** Azahar's RPC server is not responding; enable it and restart Azahar.
-- **`mhdn: juego no soportado (...)` (unsupported game):** the game, region, or version does not match a
+- **`mhdn: Waiting for Azahar`:** Azahar is not visible or MHXX is not running yet.
+- **`mhdn: RPC off`:** Azahar's RPC server is not responding; enable it and restart Azahar.
+- **`mhdn: Unsupported game (...)`:** the game, region, or version does not match a
   supported MHXX JP v1.4 build.
-- **`mhdn: activo` (active):** the connection and profile are correct; the overlay is ready.
+- **`mhdn: Active`:** the connection and profile are correct; the overlay is ready.
 
 The overlay hides while another application is frontmost. Return to Azahar to show it.
 
 ### How to quit
 
-- **macOS:** open the `mhdn` menu-bar item and choose **Quit**.
+- **macOS:** click the status text in the menu bar (`mhdn: Active`, `mhdn: Waiting for Azahar`, …) and choose **Salir**.
 - **Windows:** open the `mhdn` system-tray icon and choose **Exit**.
 
 ### Troubleshooting

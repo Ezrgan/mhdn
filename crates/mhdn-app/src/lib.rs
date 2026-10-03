@@ -8,6 +8,8 @@ mod hud;
 mod numbers;
 mod run;
 mod session;
+mod settings;
+mod settings_window;
 mod status;
 mod trace;
 

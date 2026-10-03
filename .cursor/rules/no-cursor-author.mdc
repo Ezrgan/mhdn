@@ -1,0 +1,10 @@
+---
+description: Do not attribute git commits to Cursor or add Cursor co-author trailers
+alwaysApply: true
+---
+
+# Git attribution (no Cursor)
+
+- Never set git **author** or **committer** to Cursor, cursoragent, or any `@cursor.com` address.
+- Never add **Co-authored-by**, **Signed-off-by**, or any other commit trailer that names Cursor, cursoragent, or cursor.com.
+- If a tool or template inserts such a trailer, remove it before the commit is created.

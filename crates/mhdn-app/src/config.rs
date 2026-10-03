@@ -12,6 +12,11 @@ use mhdn_platform::Insets;
 use mhdn_proj::{LayoutOption, LayoutSettings, ScreenRect};
 use serde::{Deserialize, Serialize};
 
+use crate::settings::{
+    clamp_px, CornerSettings, NumberSettings, CORNER_PT_RANGE, DEFAULT_CORNER_PT,
+    DEFAULT_NUMBER_PX, NUMBER_PX_RANGE,
+};
+
 const DEFAULT_LATENCY_MS: u64 = 33;
 const DEFAULT_TEXT_SCALE: f32 = 2.0;
 
@@ -49,6 +54,12 @@ pub struct StyleConfig {
     pub number_px: f32,
     #[serde(default)]
     pub anchor: NumberAnchor,
+    /// Per-category color and visibility. Missing in older files, which show everything.
+    #[serde(default)]
+    pub numbers: NumberSettings,
+    /// The total and DPS recount in the corner. Missing in older files, which show both.
+    #[serde(default)]
+    pub corner: CornerSettings,
 }
 
 /// Where a hit's number spawns until the exact contact point is known.
@@ -93,11 +104,23 @@ impl Default for StyleConfig {
             show_recount: true,
             number_px: DEFAULT_NUMBER_PX,
             anchor: NumberAnchor::default(),
+            numbers: NumberSettings::default(),
+            corner: CornerSettings::default(),
         }
     }
 }
 
-const DEFAULT_NUMBER_PX: f32 = 36.0;
+impl StyleConfig {
+    /// Floating number size in points, kept inside what the renderer can draw.
+    pub fn number_size(&self) -> f32 {
+        clamp_px(self.number_px, NUMBER_PX_RANGE, DEFAULT_NUMBER_PX)
+    }
+
+    /// Corner recount size in points, kept inside what the renderer can draw.
+    pub fn corner_size(&self) -> f32 {
+        clamp_px(self.corner.size_pt, CORNER_PT_RANGE, DEFAULT_CORNER_PT)
+    }
+}
 
 fn default_latency() -> u64 {
     DEFAULT_LATENCY_MS
@@ -306,6 +329,65 @@ mod tests {
         let loaded = OverlayConfig::load(&path);
         assert_eq!(loaded, config);
         let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn an_old_config_without_the_new_keys_still_loads_with_todays_look() {
+        let old = "display_latency_ms = 40\n\n[style]\ntext_scale = 2.5\nshow_numbers = false\nshow_recount = true\nnumber_px = 30.0\nanchor = \"monster\"\n";
+        let config: OverlayConfig = toml::from_str(old).expect("old file parses");
+        assert_eq!(config.display_latency_ms, 40);
+        assert_eq!(config.style.text_scale, 2.5);
+        assert!(!config.style.show_numbers);
+        assert_eq!(config.style.number_px, 30.0);
+        assert_eq!(config.style.anchor, NumberAnchor::Monster);
+        assert_eq!(config.style.numbers, NumberSettings::default());
+        assert_eq!(config.style.corner, CornerSettings::default());
+        let bare: OverlayConfig = toml::from_str("").expect("empty file parses");
+        assert_eq!(bare, OverlayConfig::default());
+    }
+
+    #[test]
+    fn a_partial_new_section_fills_the_rest_with_defaults() {
+        let text = "[style.numbers.poison]\nshow = false\nrgb = [0.1, 0.2, 0.3]\n\n[style.corner]\nshow_dps = false\n";
+        let config: OverlayConfig = toml::from_str(text).expect("partial file parses");
+        assert!(!config.style.numbers.poison.show);
+        assert_eq!(config.style.numbers.poison.rgb, [0.1, 0.2, 0.3]);
+        assert_eq!(config.style.numbers.large, NumberSettings::default().large);
+        assert!(!config.style.corner.show_dps);
+        assert!(config.style.corner.show_total);
+        assert_eq!(config.style.corner.size_pt, DEFAULT_CORNER_PT);
+    }
+
+    #[test]
+    fn edited_settings_roundtrip_through_the_file() {
+        let path =
+            std::env::temp_dir().join(format!("mhdn-settings-test-{}.toml", std::process::id()));
+        let mut config = OverlayConfig::default();
+        config.style.anchor = NumberAnchor::Monster;
+        config.style.number_px = 48.0;
+        config.style.numbers.small.show = false;
+        config.style.numbers.large.rgb = [0.25, 0.5, 0.75];
+        config.style.corner.show_total = false;
+        config.style.corner.size_pt = 30.0;
+        config.save(&path).unwrap();
+        assert_eq!(OverlayConfig::load(&path), config);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_bad_size_in_the_file_is_clamped_when_used() {
+        let style = StyleConfig {
+            number_px: f32::NAN,
+            corner: CornerSettings {
+                size_pt: 5000.0,
+                ..CornerSettings::default()
+            },
+            ..StyleConfig::default()
+        };
+        assert_eq!(style.number_size(), DEFAULT_NUMBER_PX);
+        assert_eq!(style.corner_size(), CORNER_PT_RANGE.1);
+        assert_eq!(StyleConfig::default().number_size(), 36.0);
+        assert_eq!(StyleConfig::default().corner_size(), 22.0);
     }
 
     #[test]
