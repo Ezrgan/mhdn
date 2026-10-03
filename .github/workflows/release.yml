@@ -1,0 +1,70 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  macos:
+    name: macOS universal
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - name: Cache cargo
+        uses: swatinem/rust-cache@v2
+
+      - name: Build aarch64
+        run: cargo build -p mhdn-app --release --target aarch64-apple-darwin
+
+      - name: Build x86_64
+        run: cargo build -p mhdn-app --release --target x86_64-apple-darwin
+
+      - name: Package mhdn.app
+        run: bash tools/package-macos.sh
+
+      - name: Zip macOS bundle
+        run: ditto -c -k --sequesterResource --keepParent dist/mhdn.app mhdn-macos-universal.zip
+
+      - name: Upload to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          body: The Windows build is an untested beta.
+          files: mhdn-macos-universal.zip
+
+  windows:
+    name: Windows x64
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: swatinem/rust-cache@v2
+
+      - name: Build release
+        run: cargo build -p mhdn-app --release
+
+      - name: Zip Windows binary
+        shell: pwsh
+        run: Compress-Archive -Path target/release/mhdn.exe -DestinationPath mhdn-windows-x64.zip -Force
+
+      - name: Upload to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          body: The Windows build is an untested beta.
+          files: mhdn-windows-x64.zip

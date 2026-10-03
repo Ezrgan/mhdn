@@ -47,6 +47,19 @@ pub struct StyleConfig {
     pub show_recount: bool,
     #[serde(default = "default_number_px")]
     pub number_px: f32,
+    #[serde(default)]
+    pub anchor: NumberAnchor,
+}
+
+/// Where a hit's number spawns until the exact contact point is known.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum NumberAnchor {
+    /// Between the hunter and the monster, at weapon reach. Always near the middle of the view.
+    #[default]
+    Hunter,
+    /// Above the monster's body, by the species anchor height.
+    Monster,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
@@ -79,6 +92,7 @@ impl Default for StyleConfig {
             show_numbers: true,
             show_recount: true,
             number_px: DEFAULT_NUMBER_PX,
+            anchor: NumberAnchor::default(),
         }
     }
 }

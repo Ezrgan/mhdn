@@ -9,8 +9,14 @@ use mhdn_game::{Anchor, DamageEvent, DamageKind, MonsterState, Scene, HP_FROM_OB
 use mhdn_proj::{project, Camera, EdgeMode, Projected, ScreenRect};
 use mhdn_render::{glyph_quads, premul, Quad};
 
+use crate::config::NumberAnchor;
+
 /// A forward jump larger than this is a save state, not a dropped sample.
 const FRAME_JUMP: u32 = 90;
+/// Game units are centimetres. A melee hit lands about this far in front of the hunter.
+const WEAPON_REACH: f32 = 120.0;
+/// Above the hunter's feet, so the number clears the hunter's own model.
+const HIT_HEIGHT: f32 = 130.0;
 
 pub struct CombatView {
     pool: Pool,
@@ -19,6 +25,8 @@ pub struct CombatView {
     seen: bool,
     last_scene: Scene,
     last_frame: u32,
+    anchor: NumberAnchor,
+    hunter: Option<[f32; 3]>,
 }
 
 impl Default for CombatView {
@@ -36,7 +44,18 @@ impl CombatView {
             seen: false,
             last_scene: Scene::Disconnected,
             last_frame: 0,
+            anchor: NumberAnchor::default(),
+            hunter: None,
         }
+    }
+
+    pub fn set_anchor(&mut self, anchor: NumberAnchor) {
+        self.anchor = anchor;
+    }
+
+    /// The local hunter's feet in the newest snapshot. `None` keeps numbers on the monster.
+    pub fn set_hunter(&mut self, hunter: Option<[f32; 3]>) {
+        self.hunter = hunter.filter(|pos| pos.iter().all(|value| value.is_finite()));
     }
 
     pub fn alive(&self) -> bool {
@@ -82,9 +101,13 @@ impl CombatView {
                 anchors: vec![None; events.len()],
             };
         }
+        let hunter = match self.anchor {
+            NumberAnchor::Hunter => self.hunter,
+            NumberAnchor::Monster => None,
+        };
         let mut anchors = Vec::with_capacity(events.len());
         for event in events {
-            let world = anchor_world(event, monsters, &height);
+            let world = anchor_world(event, monsters, &height, hunter);
             anchors.push(world);
             let Some(world) = world else {
                 continue;
@@ -224,10 +247,13 @@ pub fn reset_reason(prev: Scene, next: Scene, prev_frame: u32, frame: u32) -> Op
     None
 }
 
+/// An exact contact point wins. Otherwise, with a hunter, the number goes between the
+/// hunter and the monster at weapon reach. Without one, it sits above the monster.
 pub fn anchor_world<F>(
     event: &DamageEvent,
     monsters: &[MonsterState],
     height: F,
+    hunter: Option<[f32; 3]>,
 ) -> Option<[f32; 3]>
 where
     F: Fn(u16, bool) -> f32,
@@ -238,8 +264,29 @@ where
         }
     }
     let monster = find_monster(event, monsters)?;
+    let body = [monster.pos.x, monster.pos.y, monster.pos.z];
+    if let Some(hunter) = hunter {
+        return Some(near_hunter(hunter, body));
+    }
     let rise = height(monster.key.species, monster.large);
-    Some([monster.pos.x, monster.pos.y + rise, monster.pos.z])
+    Some([body[0], body[1] + rise, body[2]])
+}
+
+/// On the ground line from the hunter toward the monster, never past halfway.
+fn near_hunter(hunter: [f32; 3], monster: [f32; 3]) -> [f32; 3] {
+    let dx = monster[0] - hunter[0];
+    let dz = monster[2] - hunter[2];
+    let dist = (dx * dx + dz * dz).sqrt();
+    let step = if dist > 1.0 {
+        WEAPON_REACH.min(dist * 0.5) / dist
+    } else {
+        0.0
+    };
+    [
+        hunter[0] + dx * step,
+        hunter[1] + HIT_HEIGHT,
+        hunter[2] + dz * step,
+    ]
 }
 
 fn find_monster<'a>(event: &DamageEvent, monsters: &'a [MonsterState]) -> Option<&'a MonsterState> {
@@ -368,6 +415,7 @@ mod tests {
             ),
             &monsters,
             |_, _| 150.0,
+            Some([500.0, 0.0, 0.0]),
         );
         assert_eq!(bone, Some([1.0, 2.0, 3.0]));
         let body = anchor_world(
@@ -378,8 +426,43 @@ mod tests {
                 assert!(large);
                 150.0
             },
+            None,
         );
         assert_eq!(body, Some([0.0, 151.0, 0.0]));
+    }
+
+    #[test]
+    fn with_a_hunter_the_number_sits_at_weapon_reach_toward_the_monster() {
+        let monsters = [monster(0x1000, true)];
+        let hit = event(12, Anchor::Unknown, DamageKind::Hit);
+        let far = anchor_world(&hit, &monsters, |_, _| 150.0, Some([1000.0, 50.0, 0.0]));
+        assert_eq!(far, Some([1000.0 - WEAPON_REACH, 50.0 + HIT_HEIGHT, 0.0]));
+
+        let close = anchor_world(&hit, &monsters, |_, _| 150.0, Some([0.0, 0.0, 100.0]));
+        assert_eq!(close, Some([0.0, HIT_HEIGHT, 50.0]));
+
+        let on_top = anchor_world(&hit, &monsters, |_, _| 150.0, Some([0.0, 0.0, 0.0]));
+        assert_eq!(on_top, Some([0.0, HIT_HEIGHT, 0.0]));
+    }
+
+    #[test]
+    fn the_monster_mode_ignores_the_hunter() {
+        let monsters = [monster(0x1000, true)];
+        let hit = event(5, Anchor::Unknown, DamageKind::Hit);
+        let mut view = CombatView::new();
+        view.observe(Scene::InQuest, 1);
+        view.set_hunter(Some([1000.0, 0.0, 0.0]));
+        let near = view.ingest(std::slice::from_ref(&hit), &monsters, |_, _| 150.0);
+        assert_eq!(near.anchors, vec![Some([880.0, HIT_HEIGHT, 0.0])]);
+
+        view.set_anchor(NumberAnchor::Monster);
+        let body = view.ingest(std::slice::from_ref(&hit), &monsters, |_, _| 150.0);
+        assert_eq!(body.anchors, vec![Some([0.0, 151.0, 0.0])]);
+
+        view.set_anchor(NumberAnchor::Hunter);
+        view.set_hunter(Some([f32::NAN, 0.0, 0.0]));
+        let fallback = view.ingest(&[hit], &monsters, |_, _| 150.0);
+        assert_eq!(fallback.anchors, vec![Some([0.0, 151.0, 0.0])]);
     }
 
     #[test]

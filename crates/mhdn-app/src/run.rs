@@ -307,6 +307,13 @@ impl OverlayApp {
                 .map(|snapshot| snapshot.monsters.as_slice())
                 .unwrap_or(&[]);
             let profile = self.profile.clone();
+            self.combat.set_anchor(self.config.style.anchor);
+            self.combat.set_hunter(
+                newest
+                    .as_ref()
+                    .and_then(|snapshot| snapshot.hunter_pos)
+                    .map(|pos| [pos.x, pos.y, pos.z]),
+            );
             let ingested = self.combat.ingest(&events, monsters, |species, large| {
                 profile
                     .as_ref()
@@ -693,14 +700,31 @@ fn azahar_config() -> Option<PathBuf> {
     }
 }
 
+const DEFAULT_PROFILE_PATH: &str = "profiles/mhxx-jp-v1.4-es.toml";
+
 fn load_profile() -> Option<Profile> {
-    let path = std::env::var("MHDN_PROFILE")
+    let env_override = std::env::var("MHDN_PROFILE").ok();
+    let path = env_override
+        .as_ref()
         .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("profiles/mhxx-jp-v1.4-es.toml"));
-    match Profile::load(&path) {
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_PROFILE_PATH));
+    if path.is_file() {
+        match Profile::load(&path) {
+            Ok(profile) => return Some(profile),
+            Err(err) => {
+                eprintln!("mhdn: profile {}: {err}", path.display());
+                return None;
+            }
+        }
+    }
+    if env_override.is_some() {
+        eprintln!("mhdn: profile {}: not found", path.display());
+        return None;
+    }
+    match Profile::from_toml_str(include_str!("../../../profiles/mhxx-jp-v1.4-es.toml")) {
         Ok(profile) => Some(profile),
         Err(err) => {
-            eprintln!("mhdn: profile {}: {err}", path.display());
+            eprintln!("mhdn: embedded profile: {err}");
             None
         }
     }

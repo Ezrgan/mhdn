@@ -9,10 +9,15 @@ mod select;
 mod style;
 mod track;
 
+#[cfg(any(windows, test))]
+mod win_geom;
+
 #[cfg(target_os = "macos")]
 mod macos;
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", windows)))]
 mod other;
+#[cfg(windows)]
+mod windows;
 
 pub use error::PlatformError;
 pub use follow::{
@@ -36,8 +41,13 @@ pub use macos::{
     apply_click_through, begin_latency_critical, frontmost_pid, join_active_space,
     overlay_event_loop, raise_thread_qos, tint_spike, LatencyCritical, MenuStatus,
 };
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", windows)))]
 pub use other::{
     apply_click_through, begin_latency_critical, frontmost_pid, join_active_space,
     overlay_event_loop, raise_thread_qos, LatencyCritical, MenuStatus,
+};
+#[cfg(windows)]
+pub use windows::{
+    apply_click_through, begin_latency_critical, frontmost_pid, join_active_space,
+    overlay_event_loop, raise_thread_qos, tint_spike, LatencyCritical, MenuStatus,
 };
