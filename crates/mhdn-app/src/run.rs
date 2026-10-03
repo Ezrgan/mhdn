@@ -10,8 +10,8 @@ use glam::Vec3;
 use mhdn_game::{EventQueue, Latest, Profile, Scene, Snapshot};
 use mhdn_platform::{
     apply_click_through, begin_latency_critical, frontmost_pid, host_in_front, join_active_space,
-    overlay_event_loop, system_tracker, MenuStatus, OverlayHost, SurfaceUpdate, TrackedWindow,
-    WindowTracker,
+    overlay_event_loop, report_startup_failure, system_tracker, MenuStatus, OverlayHost,
+    SurfaceUpdate, TrackedWindow, WindowTracker,
 };
 use mhdn_proj::{
     parse_layout_settings, project, resolve, Camera, EdgeMode, LayoutOption, LayoutSettings,
@@ -548,7 +548,7 @@ impl ApplicationHandler for OverlayApp {
         let window = match event_loop.create_window(attributes) {
             Ok(window) => Arc::new(window),
             Err(err) => {
-                eprintln!("mhdn: {err}");
+                report_startup_failure(&format!("mhdn: {err}"));
                 event_loop.exit();
                 return;
             }
@@ -563,7 +563,7 @@ impl ApplicationHandler for OverlayApp {
         match Renderer::new(Arc::clone(&window)) {
             Ok(renderer) => self.renderer = Some(renderer),
             Err(err) => {
-                eprintln!("mhdn: {err}");
+                report_startup_failure(&format!("mhdn: {err}"));
                 event_loop.exit();
                 return;
             }
