@@ -33,6 +33,8 @@ use crate::trace::Trace;
 
 const POLL: Duration = Duration::from_millis(33);
 const RECOUNT_PT: f32 = 22.0;
+/// The sampler publishes at 4–60 Hz in every scene, including the in-game pause.
+const STALE_AFTER: Duration = Duration::from_secs(2);
 
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let calibrate = std::env::args().any(|arg| arg == "--calibrate");
@@ -70,6 +72,7 @@ struct OverlayApp {
     menu: Option<MenuStatus>,
     status_text: String,
     trace: Option<Trace>,
+    last_snapshot_at: Instant,
     _session: Option<Session>,
 }
 
@@ -138,6 +141,7 @@ impl OverlayApp {
             menu: None,
             status_text: String::new(),
             trace: Trace::from_env(),
+            last_snapshot_at: Instant::now(),
             _session: session,
         }
     }
@@ -179,6 +183,7 @@ impl OverlayApp {
             return;
         };
         self.delay.push(snapshot);
+        self.last_snapshot_at = Instant::now();
         if let Some(trace) = self.trace.as_mut() {
             trace.snapshot();
         }
@@ -233,7 +238,8 @@ impl OverlayApp {
         self.last_tick = now;
         let was_alive = self.combat.alive();
         self.combat.tick(dt);
-        let newest = self.delay.latest().cloned();
+        let fresh = now.saturating_duration_since(self.last_snapshot_at) < STALE_AFTER;
+        let newest = self.delay.latest().filter(|_| fresh).cloned();
         let scene = newest
             .as_ref()
             .map(|snapshot| snapshot.scene)

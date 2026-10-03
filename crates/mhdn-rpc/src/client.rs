@@ -98,23 +98,26 @@ impl RpcClient {
         Ok(())
     }
 
+    /// Replies to requests that already timed out stay queued on the socket. Skip them, or every
+    /// later request would read its predecessor's reply.
     fn recv_response(&mut self, expected_id: u32, expected_type: PacketType) -> Result<Vec<u8>> {
         let mut buf = [0u8; MAX_PACKET_SIZE];
-        let len = match self.socket.recv(&mut buf) {
-            Ok(n) => n,
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                return Err(RpcError::Timeout(self.timeout));
+        for _ in 0..MAX_STALE_REPLIES {
+            let len = match self.socket.recv(&mut buf) {
+                Ok(n) => n,
+                Err(e) if is_timeout(&e) => return Err(RpcError::Timeout(self.timeout)),
+                Err(e) => return Err(e.into()),
+            };
+            if len == 0 {
+                return Err(RpcError::InvalidResponse);
             }
-            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
-                return Err(RpcError::Timeout(self.timeout));
+            match packet::validate_response(&buf[..len], expected_id, expected_type) {
+                Ok(payload) => return Ok(payload.to_vec()),
+                Err(RpcError::IdMismatch { .. }) => continue,
+                Err(err) => return Err(err),
             }
-            Err(e) => return Err(e.into()),
-        };
-        if len == 0 {
-            return Err(RpcError::InvalidResponse);
         }
-        let payload = packet::validate_response(&buf[..len], expected_id, expected_type)?;
-        Ok(payload.to_vec())
+        Err(RpcError::Timeout(self.timeout))
     }
 
     fn exchange(
@@ -271,6 +274,17 @@ impl RpcClient {
             f32::from_le_bytes(buf[8..12].try_into().expect("slice")),
         ])
     }
+}
+
+/// Upper bound on stale datagrams drained while waiting for one reply.
+const MAX_STALE_REPLIES: usize = 256;
+
+/// macOS reports an expired `SO_RCVTIMEO` as `WouldBlock`, Linux and Windows as `TimedOut`.
+pub(crate) fn is_timeout(err: &std::io::Error) -> bool {
+    matches!(
+        err.kind(),
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+    )
 }
 
 fn should_retry(err: &RpcError) -> bool {

@@ -123,6 +123,42 @@ fn live_bss_write_roundtrip() {
 }
 
 #[test]
+fn late_replies_after_a_timeout_do_not_desync_later_reads() {
+    let (server, state) = FakeRpcServer::bind();
+    {
+        let mut st = state.lock().unwrap();
+        st.memory.insert(0x3000, vec![1, 2, 3, 4]);
+        st.latency = Duration::from_millis(80);
+    }
+    let mut client = RpcClient::connect(server.addr(), Duration::from_millis(30)).unwrap();
+    let mut buf = [0u8; 4];
+    assert!(client.read(0x3000, &mut buf).is_err());
+    state.lock().unwrap().latency = Duration::ZERO;
+    std::thread::sleep(Duration::from_millis(250));
+    for _ in 0..3 {
+        client.read(0x3000, &mut buf).unwrap();
+        assert_eq!(buf, [1, 2, 3, 4]);
+    }
+
+    state.lock().unwrap().latency = Duration::from_millis(80);
+    let mut reqs = [ReadReq {
+        addr: 0x3000,
+        buf: &mut buf,
+    }];
+    assert!(client.read_many(&mut reqs).is_err());
+    state.lock().unwrap().latency = Duration::ZERO;
+    std::thread::sleep(Duration::from_millis(250));
+    let mut again = [0u8; 4];
+    let mut reqs = [ReadReq {
+        addr: 0x3000,
+        buf: &mut again,
+    }];
+    client.read_many(&mut reqs).unwrap();
+    assert_eq!(again, [1, 2, 3, 4]);
+    server.shutdown();
+}
+
+#[test]
 fn pipelined_read_many_with_reorder() {
     let (server, state) = FakeRpcServer::bind();
     {
