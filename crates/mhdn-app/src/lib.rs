@@ -4,6 +4,7 @@
 
 mod calibrate;
 mod config;
+mod diag;
 mod hud;
 mod numbers;
 mod run;

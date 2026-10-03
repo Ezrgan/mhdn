@@ -26,6 +26,7 @@ use winit::window::{Window, WindowAttributes, WindowId};
 
 use crate::calibrate::{command_from_key, handles, CalibCommand, Calibrator};
 use crate::config::{config_path, layout_name, OverlayConfig, SnapshotDelay};
+use crate::diag::{self, Diag};
 use crate::hud::{build_hud, scene_label, HudStats};
 use crate::numbers::CombatView;
 use crate::session::{sample_rate, RateWindow, RpcMeter, Session, PHASE_WAITING};
@@ -40,6 +41,7 @@ const POLL: Duration = Duration::from_millis(33);
 const STALE_AFTER: Duration = Duration::from_secs(2);
 
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
+    diag::init();
     let calibrate = std::env::args().any(|arg| arg == "--calibrate");
     let _latency = begin_latency_critical();
     let event_loop = overlay_event_loop()?;
@@ -87,6 +89,8 @@ struct OverlayApp {
     last_snapshot_at: Instant,
     session: Option<Session>,
     settings: Option<SettingsWindow>,
+    diag: Diag,
+    log_path: String,
 }
 
 impl OverlayApp {
@@ -118,6 +122,17 @@ impl OverlayApp {
             .as_ref()
             .map(|profile| profile.meta.version.clone())
             .unwrap_or_else(|| "desconocida".to_string());
+        diag::line(&format!(
+            "start build={} os={} arch={} exe={} profile_version={} profile_loaded={}",
+            diag::BUILD,
+            std::env::consts::OS,
+            std::env::consts::ARCH,
+            std::env::current_exe()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|err| format!("unknown ({err})")),
+            version,
+            profile.is_some(),
+        ));
         let session = profile.clone().map(|profile| {
             Session::start(
                 profile,
@@ -161,6 +176,8 @@ impl OverlayApp {
             last_snapshot_at: Instant::now(),
             session,
             settings: None,
+            diag: Diag::new(),
+            log_path: diag::path_text(),
         }
     }
 
@@ -245,6 +262,7 @@ impl OverlayApp {
             return;
         };
         self.delay.push(snapshot);
+        self.diag.snapshot();
         self.last_snapshot_at = Instant::now();
         if let Some(trace) = self.trace.as_mut() {
             trace.snapshot();
@@ -318,10 +336,20 @@ impl OverlayApp {
             }
         }
         if self.events.supported() == Some(false) {
-            let _ = self.events.drain();
+            let dropped = self.events.drain();
+            self.diag.events(dropped.len());
+            if let Some(first) = dropped.first() {
+                if self.diag.first_event() {
+                    diag::line(&format!(
+                        "first damage event amount={} discarded=unsupported build",
+                        first.amount
+                    ));
+                }
+            }
             self.combat.clear();
         } else {
             let events = self.events.drain();
+            self.diag.events(events.len());
             let monsters = newest
                 .as_ref()
                 .map(|snapshot| snapshot.monsters.as_slice())
@@ -340,6 +368,35 @@ impl OverlayApp {
                     .map(|profile| profile.species.anchor_for(species, large))
                     .unwrap_or(if large { 150.0 } else { 52.0 })
             });
+            if !ingested.gated {
+                self.diag.spawned(ingested.anchors.iter().flatten().count());
+            }
+            if let Some(first) = events.first() {
+                if self.diag.first_event() {
+                    let top = self.calibrated_top(self.window_size());
+                    let camera = newest
+                        .as_ref()
+                        .and_then(|snapshot| snapshot.camera.as_ref())
+                        .and_then(crate::hud::camera_from);
+                    let world = ingested.anchors.first().copied().flatten();
+                    let screen = world
+                        .map(|world| screen_label(world, camera.as_ref(), top))
+                        .unwrap_or_else(|| "-".to_string());
+                    let on_screen = world.zip(camera.as_ref()).is_some_and(|(world, camera)| {
+                        matches!(
+                            project(Vec3::from_array(world), camera, top, EdgeMode::Hide),
+                            Projected::Visible { .. }
+                        )
+                    });
+                    diag::line(&format!(
+                        "first damage event amount={} source={:?} scene={scene:?} gated={} spawned={} on_screen={on_screen} screen={screen}",
+                        first.amount,
+                        first.source,
+                        ingested.gated,
+                        world.is_some(),
+                    ));
+                }
+            }
             if self.trace.is_some() && !events.is_empty() {
                 let top = self.calibrated_top(self.window_size());
                 let camera = newest
@@ -418,6 +475,94 @@ impl OverlayApp {
         )
     }
 
+    /// Logs each fact once, and again only when it changes.
+    fn observe(&mut self) {
+        let azahar = match self.tracked {
+            Some(window) => {
+                let insets = self.config.insets_for(self.layout.show_status_bar);
+                format!(
+                    "found x={:.0} y={:.0} w={:.0} h={:.0} scale={} fullscreen={} onscreen={} insets=title:{} status:{} left:{} right:{}",
+                    window.content_rect.x,
+                    window.content_rect.y,
+                    window.content_rect.width,
+                    window.content_rect.height,
+                    window.scale,
+                    window.is_fullscreen,
+                    window.onscreen,
+                    insets.title_bar,
+                    insets.status_bar,
+                    insets.left,
+                    insets.right,
+                )
+            }
+            None => "lost".to_string(),
+        };
+        self.diag.changed("azahar", azahar);
+        if let Some(window) = &self.window {
+            let size = window.inner_size();
+            let overlay = match window.outer_position() {
+                Ok(pos) => format!(
+                    "x={} y={} w={} h={} scale={}",
+                    pos.x,
+                    pos.y,
+                    size.width,
+                    size.height,
+                    window.scale_factor()
+                ),
+                Err(err) => format!(
+                    "x=? y=? w={} h={} scale={} ({err})",
+                    size.width,
+                    size.height,
+                    window.scale_factor()
+                ),
+            };
+            self.diag.changed("overlay", overlay);
+        }
+        self.diag.changed("parked", self.parked.to_string());
+        self.diag.changed("behind", self.behind.to_string());
+        let settings_focused = self
+            .settings
+            .as_ref()
+            .is_some_and(SettingsWindow::is_focused);
+        self.diag
+            .changed("settings_focused", settings_focused.to_string());
+        let fresh = Instant::now().saturating_duration_since(self.last_snapshot_at) < STALE_AFTER;
+        let scene = self
+            .delay
+            .latest()
+            .filter(|_| fresh)
+            .map(|snapshot| snapshot.scene)
+            .unwrap_or(Scene::Disconnected);
+        self.diag.changed("scene", format!("{scene:?}"));
+        let tap = if self.session.is_none() {
+            "no session"
+        } else if self.events.tap_installed() {
+            "installed"
+        } else if self.events.tap_blocked() {
+            "blocked"
+        } else {
+            "not installed"
+        };
+        self.diag.changed("tap", tap.to_string());
+        self.diag.changed(
+            "fingerprint",
+            match self.events.supported() {
+                Some(true) => "match",
+                Some(false) => "mismatch",
+                None => "unread",
+            }
+            .to_string(),
+        );
+        self.diag.changed(
+            "layout",
+            format!(
+                "{} status_bar={}",
+                self.layout_key, self.layout.show_status_bar
+            ),
+        );
+        self.diag.changed("status", self.status_text.clone());
+    }
+
     fn refresh_status(&mut self) {
         let onscreen = self.tracked.as_ref().is_some_and(|window| window.onscreen);
         let title = if self.session.is_some() {
@@ -481,6 +626,13 @@ impl OverlayApp {
             let camera = snapshot
                 .as_ref()
                 .and_then(|snapshot| snapshot.camera.as_ref().and_then(crate::hud::camera_from));
+            if self.combat.alive() {
+                self.diag.projected(
+                    camera
+                        .as_ref()
+                        .map(|camera| self.combat.draw_stats(camera, top)),
+                );
+            }
             if let Some(trace) = self.trace.as_mut() {
                 if self.combat.alive() {
                     trace.draw(
@@ -525,6 +677,10 @@ impl OverlayApp {
             renderer.resize(size.width, size.height);
             let _ = renderer.draw(&quads);
         }
+        let present = renderer.take_present_stats();
+        self.diag.redraw();
+        self.diag
+            .present(present.errors, present.skipped, present.first_error);
     }
 
     /// Dropping the session joins its thread, which uninstalls the damage tap.
@@ -572,6 +728,7 @@ impl OverlayApp {
             status: &self.status_text,
             running: self.session.is_some(),
             can_start: self.profile.is_some(),
+            log_path: &self.log_path,
         };
         let outcome = settings.draw(&mut self.config.style, dashboard);
         if outcome.changed {
@@ -665,12 +822,14 @@ impl ApplicationHandler<OverlayUserEvent> for OverlayApp {
         let window = match event_loop.create_window(attributes) {
             Ok(window) => Arc::new(window),
             Err(err) => {
+                diag::line(&format!("window error {err}"));
                 report_startup_failure(&format!("mhdn: {err}"));
                 event_loop.exit();
                 return;
             }
         };
         if let Err(err) = apply_click_through(&window, !self.calibrator.active) {
+            diag::line(&format!("click-through error {err}"));
             eprintln!("mhdn: {err}");
         }
         window.set_visible(true);
@@ -678,8 +837,12 @@ impl ApplicationHandler<OverlayUserEvent> for OverlayApp {
             window.focus_window();
         }
         match Renderer::new(Arc::clone(&window)) {
-            Ok(renderer) => self.renderer = Some(renderer),
+            Ok(renderer) => {
+                diag::line(&format!("gpu adapter={}", renderer.adapter_name()));
+                self.renderer = Some(renderer);
+            }
             Err(err) => {
+                diag::line(&format!("gpu error {err}"));
                 report_startup_failure(&format!("mhdn: {err}"));
                 event_loop.exit();
                 return;
@@ -691,6 +854,7 @@ impl ApplicationHandler<OverlayUserEvent> for OverlayApp {
         }) {
             Ok(status) => Some(status),
             Err(err) => {
+                diag::line(&format!("status item error {err}"));
                 eprintln!("mhdn: status item: {err}");
                 None
             }
@@ -699,7 +863,10 @@ impl ApplicationHandler<OverlayUserEvent> for OverlayApp {
         self.clock.request();
         match SettingsWindow::new(event_loop) {
             Ok(settings) => self.settings = Some(settings),
-            Err(err) => eprintln!("mhdn: settings window: {err}"),
+            Err(err) => {
+                diag::line(&format!("settings window error {err}"));
+                eprintln!("mhdn: settings window: {err}");
+            }
         }
     }
 
@@ -772,6 +939,13 @@ impl ApplicationHandler<OverlayUserEvent> for OverlayApp {
         self.take_snapshot();
         self.refresh_combat();
         self.refresh_status();
+        self.observe();
+        self.diag.tick(
+            Instant::now(),
+            &self.meter,
+            self.combat.alive_count(),
+            self.pumped,
+        );
         if self.trace.as_ref().is_some_and(Trace::due) {
             sample_rate(&mut self.rate, &self.meter, Instant::now());
             let context = self.trace_context();
@@ -854,20 +1028,29 @@ fn load_profile() -> Option<Profile> {
         .unwrap_or_else(|| PathBuf::from(DEFAULT_PROFILE_PATH));
     if path.is_file() {
         match Profile::load(&path) {
-            Ok(profile) => return Some(profile),
+            Ok(profile) => {
+                diag::line(&format!("profile loaded from file {}", path.display()));
+                return Some(profile);
+            }
             Err(err) => {
+                diag::line(&format!("profile error {}: {err}", path.display()));
                 eprintln!("mhdn: profile {}: {err}", path.display());
                 return None;
             }
         }
     }
     if env_override.is_some() {
+        diag::line(&format!("profile error {}: not found", path.display()));
         eprintln!("mhdn: profile {}: not found", path.display());
         return None;
     }
     match Profile::from_toml_str(include_str!("../../../profiles/mhxx-jp-v1.4-es.toml")) {
-        Ok(profile) => Some(profile),
+        Ok(profile) => {
+            diag::line("profile loaded from embedded copy");
+            Some(profile)
+        }
         Err(err) => {
+            diag::line(&format!("embedded profile error {err}"));
             eprintln!("mhdn: embedded profile: {err}");
             None
         }

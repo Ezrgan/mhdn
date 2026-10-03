@@ -53,6 +53,8 @@ pub struct Dashboard<'a> {
     pub running: bool,
     /// False when no game profile loaded, so there is nothing to start.
     pub can_start: bool,
+    /// Where the diagnostic log for this run is being written.
+    pub log_path: &'a str,
 }
 
 #[derive(Debug, Default)]
@@ -251,6 +253,8 @@ fn dashboard_section(ui: &mut egui::Ui, dashboard: Dashboard<'_>) -> Option<Acti
             ui.label("No game profile is loaded, so there is nothing to start.");
         }
     }
+    ui.add_space(4.0);
+    ui.label(format!("Log file: {}", dashboard.log_path));
     action
 }
 
