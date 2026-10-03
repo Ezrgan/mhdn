@@ -21,6 +21,13 @@ pub fn join_active_space(_window: &winit::window::Window) -> Result<bool, Platfo
     Ok(false)
 }
 
+pub fn set_overlay_parked(
+    _window: &winit::window::Window,
+    _parked: bool,
+) -> Result<(), PlatformError> {
+    Ok(())
+}
+
 pub struct LatencyCritical;
 
 pub fn begin_latency_critical() -> LatencyCritical {

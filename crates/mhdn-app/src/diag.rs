@@ -17,7 +17,7 @@ use crate::numbers::DrawStats;
 use crate::session::{sample_rate, RateWindow, RpcMeter};
 
 /// Stamped into the start line so a log says which build wrote it.
-pub const BUILD: &str = "v0.3.2-diag";
+pub const BUILD: &str = "v0.3.4";
 const SECOND: Duration = Duration::from_secs(1);
 
 struct Sink {

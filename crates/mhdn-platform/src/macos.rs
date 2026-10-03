@@ -65,6 +65,12 @@ pub fn join_active_space(window: &Window) -> Result<bool, PlatformError> {
     Ok(true)
 }
 
+/// Parking an AppKit overlay is the one-pixel resize the app already does. The window
+/// stays ordered in, so it comes back without being re-added to the active space.
+pub fn set_overlay_parked(_window: &Window, _parked: bool) -> Result<(), PlatformError> {
+    Ok(())
+}
+
 /// Keeps App Nap and timer coalescing off while alive. Without it, an accessory app
 /// under Game Mode sees its 16 ms sampler sleeps stretch to about 120 ms.
 pub struct LatencyCritical {

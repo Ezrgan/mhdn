@@ -10,8 +10,8 @@ use glam::Vec3;
 use mhdn_game::{EventQueue, Latest, Profile, Scene, Snapshot};
 use mhdn_platform::{
     apply_click_through, begin_latency_critical, frontmost_pid, join_active_space,
-    overlay_event_loop, overlay_parked, report_startup_failure, system_tracker, MenuStatus,
-    OverlayHost, OverlayUserEvent, SurfaceUpdate, TrackedWindow, WindowTracker,
+    overlay_event_loop, overlay_parked, report_startup_failure, set_overlay_parked, system_tracker,
+    MenuStatus, OverlayHost, OverlayUserEvent, SurfaceUpdate, TrackedWindow, WindowTracker,
 };
 use mhdn_proj::{
     parse_layout_settings, project, resolve, Camera, EdgeMode, LayoutOption, LayoutSettings,
@@ -212,6 +212,7 @@ impl OverlayApp {
             self.park(&window);
             return;
         }
+        let unparking = self.parked;
         if self.parked {
             self.parked = false;
             self.host = OverlayHost::new();
@@ -223,6 +224,14 @@ impl OverlayApp {
         let update = self
             .host
             .sync(&window, tracked.content_rect, Instant::now());
+        // Back where it belongs before it is shown again, so the one-pixel parked
+        // window never flashes over the game.
+        if unparking {
+            if let Err(err) = set_overlay_parked(&window, false) {
+                eprintln!("mhdn: {err}");
+            }
+            self.clock.request();
+        }
         if !matches!(update, SurfaceUpdate::Idle) {
             self.clock.request();
         }
@@ -252,6 +261,9 @@ impl OverlayApp {
     fn park(&mut self, window: &Window) {
         if self.parked {
             return;
+        }
+        if let Err(err) = set_overlay_parked(window, true) {
+            eprintln!("mhdn: {err}");
         }
         let _ = window.request_inner_size(LogicalSize::new(1.0, 1.0));
         window.set_outer_position(LogicalPosition::new(-8.0, -8.0));
@@ -832,6 +844,15 @@ impl ApplicationHandler<OverlayUserEvent> for OverlayApp {
             .with_transparent(true)
             .with_resizable(false)
             .with_visible(false);
+        // No redirection bitmap: the DirectComposition swapchain is the window's only
+        // content. With the redirection surface in place DWM composites an opaque
+        // black bitmap behind it and the game disappears under a black sheet. The flag
+        // can only be set when the window is created.
+        #[cfg(windows)]
+        let attributes = {
+            use winit::platform::windows::WindowAttributesExtWindows;
+            attributes.with_no_redirection_bitmap(true)
+        };
         let window = match event_loop.create_window(attributes) {
             Ok(window) => Arc::new(window),
             Err(err) => {
@@ -851,7 +872,11 @@ impl ApplicationHandler<OverlayUserEvent> for OverlayApp {
         }
         match Renderer::new(Arc::clone(&window)) {
             Ok(renderer) => {
-                diag::line(&format!("gpu adapter={}", renderer.adapter_name()));
+                diag::line(&format!(
+                    "gpu adapter={} surface={}",
+                    renderer.adapter_name(),
+                    renderer.surface_name()
+                ));
                 self.renderer = Some(renderer);
             }
             Err(err) => {

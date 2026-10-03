@@ -17,6 +17,7 @@ pub const DEFAULT_MENU_BAR_DIP: f32 = 22.0;
 pub const EX_TOPMOST: u32 = 0x0000_0008;
 pub const EX_TRANSPARENT: u32 = 0x0000_0020;
 pub const EX_TOOLWINDOW: u32 = 0x0000_0080;
+pub const EX_NOREDIRECTIONBITMAP: u32 = 0x0020_0000;
 pub const EX_APPWINDOW: u32 = 0x0004_0000;
 pub const EX_LAYERED: u32 = 0x0008_0000;
 pub const EX_NOACTIVATE: u32 = 0x0800_0000;
@@ -140,14 +141,64 @@ pub fn windows_insets(insets: Insets) -> Insets {
 ///
 /// Click-through adds `TRANSPARENT` and `NOACTIVATE`. Calibration drops both so the
 /// window can take the mouse and the keyboard.
+///
+/// `LAYERED` is cleared on purpose. A layered window is composited with one uniform
+/// alpha, which throws away the per-pixel alpha of the swapchain and leaves the clear
+/// colour on screen as a black sheet. Winit adds the bit together with `TRANSPARENT`
+/// whenever `set_cursor_hittest` is used, so the overlay sets `TRANSPARENT` itself and
+/// takes the bit back off here.
 pub fn overlay_ex_style(current: u32, click_through: bool) -> u32 {
-    let mut style = (current | EX_LAYERED | EX_TOPMOST | EX_TOOLWINDOW) & !EX_APPWINDOW;
+    let mut style = (current | EX_TOPMOST | EX_TOOLWINDOW) & !(EX_APPWINDOW | EX_LAYERED);
     if click_through {
         style |= EX_TRANSPARENT | EX_NOACTIVATE;
     } else {
         style &= !(EX_TRANSPARENT | EX_NOACTIVATE);
     }
     style
+}
+
+/// Extended style of a parked overlay. Dropping `TOPMOST` is what lets another app's
+/// window own the space again; a topmost window stays in front of every normal one
+/// however small it has been made.
+pub fn parked_ex_style(current: u32) -> u32 {
+    current & !EX_TOPMOST
+}
+
+/// How Azahar is putting its picture on the screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostDisplay {
+    /// An ordinary window. The overlay follows its client rect.
+    Windowed,
+    /// A window the size of its monitor. A topmost window is still composited over it.
+    Borderless,
+    /// Direct3D owns the display. Nothing another process creates is composited over
+    /// it, so the overlay stays parked instead of sitting on the desktop underneath.
+    Exclusive,
+}
+
+/// `fullscreen` is the bounds match from `geom::is_fullscreen`; `d3d_exclusive` is the
+/// shell reporting a Direct3D exclusive-mode application. Azahar's own "Fullscreen
+/// Mode: Borderless Window" never sets the second one.
+pub fn host_display(fullscreen: bool, d3d_exclusive: bool) -> HostDisplay {
+    match (fullscreen, d3d_exclusive) {
+        (false, _) => HostDisplay::Windowed,
+        (true, false) => HostDisplay::Borderless,
+        (true, true) => HostDisplay::Exclusive,
+    }
+}
+
+/// Whether the overlay has to be put back on top of the host. `z_order` is top to
+/// bottom, the way `EnumWindows` reports it. Going borderless fullscreen pushes the
+/// game to the front of the z-order, and `WS_EX_TOPMOST` alone does not re-sort an
+/// already placed window, so the overlay has to be raised again.
+pub fn needs_raise(z_order: &[usize], overlay: usize, host: usize) -> bool {
+    let Some(host_at) = z_order.iter().position(|hwnd| *hwnd == host) else {
+        return false;
+    };
+    match z_order.iter().position(|hwnd| *hwnd == overlay) {
+        Some(overlay_at) => overlay_at > host_at,
+        None => true,
+    }
 }
 
 #[cfg(test)]
@@ -300,15 +351,9 @@ mod tests {
     }
 
     #[test]
-    fn click_through_adds_the_five_overlay_styles() {
+    fn click_through_adds_the_four_overlay_styles() {
         let style = overlay_ex_style(0, true);
-        for bit in [
-            EX_LAYERED,
-            EX_TRANSPARENT,
-            EX_TOPMOST,
-            EX_NOACTIVATE,
-            EX_TOOLWINDOW,
-        ] {
+        for bit in [EX_TRANSPARENT, EX_TOPMOST, EX_NOACTIVATE, EX_TOOLWINDOW] {
             assert_eq!(style & bit, bit);
         }
     }
@@ -318,9 +363,28 @@ mod tests {
         let style = overlay_ex_style(overlay_ex_style(0, true), false);
         assert_eq!(style & (EX_TRANSPARENT | EX_NOACTIVATE), 0);
         assert_eq!(
-            style & (EX_LAYERED | EX_TOPMOST | EX_TOOLWINDOW),
-            EX_LAYERED | EX_TOPMOST | EX_TOOLWINDOW
+            style & (EX_TOPMOST | EX_TOOLWINDOW),
+            EX_TOPMOST | EX_TOOLWINDOW
         );
+    }
+
+    #[test]
+    fn the_layered_bit_is_taken_back_off_however_it_arrived() {
+        // Winit sets LAYERED with TRANSPARENT behind `set_cursor_hittest`, and a
+        // layered window is composited with one alpha for every pixel: the clear
+        // colour would cover the game instead of the game showing through.
+        for click_through in [true, false] {
+            let style = overlay_ex_style(EX_LAYERED, click_through);
+            assert_eq!(style & EX_LAYERED, 0);
+        }
+    }
+
+    #[test]
+    fn the_no_redirection_bitmap_bit_survives_a_restyle() {
+        // Set at creation and never rewritten: the DirectComposition swapchain is the
+        // only content the window has.
+        let style = overlay_ex_style(EX_NOREDIRECTIONBITMAP, true);
+        assert_eq!(style & EX_NOREDIRECTIONBITMAP, EX_NOREDIRECTIONBITMAP);
     }
 
     #[test]
@@ -330,5 +394,40 @@ mod tests {
         assert_eq!(once & EX_APPWINDOW, 0);
         assert_eq!(once & other, other);
         assert_eq!(overlay_ex_style(once, true), once);
+    }
+
+    #[test]
+    fn a_parked_overlay_leaves_the_topmost_band() {
+        let shown = overlay_ex_style(EX_NOREDIRECTIONBITMAP, true);
+        let parked = parked_ex_style(shown);
+        assert_eq!(parked & EX_TOPMOST, 0);
+        assert_eq!(parked & EX_TRANSPARENT, EX_TRANSPARENT);
+        assert_eq!(parked & EX_NOREDIRECTIONBITMAP, EX_NOREDIRECTIONBITMAP);
+        assert_eq!(parked_ex_style(parked), parked);
+        // Showing it again is the same style it had before.
+        assert_eq!(overlay_ex_style(parked, true), shown);
+    }
+
+    #[test]
+    fn a_monitor_sized_window_is_borderless_unless_direct3d_owns_the_display() {
+        assert_eq!(host_display(false, false), HostDisplay::Windowed);
+        assert_eq!(host_display(true, false), HostDisplay::Borderless);
+        assert_eq!(host_display(true, true), HostDisplay::Exclusive);
+        // A windowed game while some other process is in exclusive mode is still
+        // windowed, and the overlay keeps following it.
+        assert_eq!(host_display(false, true), HostDisplay::Windowed);
+    }
+
+    #[test]
+    fn the_overlay_is_raised_once_the_host_is_above_it() {
+        let overlay = 0x11;
+        let host = 0x22;
+        assert!(!needs_raise(&[overlay, host], overlay, host));
+        assert!(needs_raise(&[host, overlay], overlay, host));
+        // Freshly created and not in the list yet: raise it.
+        assert!(needs_raise(&[host], overlay, host));
+        // No host on screen: there is nothing to be raised above.
+        assert!(!needs_raise(&[overlay], overlay, host));
+        assert!(!needs_raise(&[], overlay, host));
     }
 }

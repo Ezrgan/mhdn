@@ -39,8 +39,17 @@ pub struct PresentStats {
     pub first_error: Option<String>,
 }
 
+/// Everything an instance hands over once it has a device on the overlay window.
+struct Opened {
+    adapter: wgpu::Adapter,
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+    surface: wgpu::Surface<'static>,
+}
+
 pub struct Renderer {
     adapter_name: String,
+    surface_name: String,
     present: PresentStats,
     first_error_seen: bool,
     device: wgpu::Device,
@@ -56,27 +65,12 @@ pub struct Renderer {
 
 impl Renderer {
     pub fn new(window: Arc<Window>) -> Result<Self, RenderError> {
-        let mut desc = wgpu::InstanceDescriptor::new_without_display_handle();
-        desc.backends = wgpu::Backends::all();
-        let instance = wgpu::Instance::new(desc);
-        let surface = instance
-            .create_surface(Arc::clone(&window))
-            .map_err(|err| RenderError::Surface(err.to_string()))?;
-        let adapter_options = wgpu::RequestAdapterOptions {
-            power_preference: POWER_PREFERENCE,
-            compatible_surface: Some(&surface),
-            force_fallback_adapter: false,
-            apply_limit_buckets: true,
-        };
-        let preferred = pollster::block_on(instance.request_adapter(&adapter_options)).ok();
-        let enumerated = pollster::block_on(instance.enumerate_adapters(wgpu::Backends::all()));
-        let adapters = ordered_adapters(preferred, enumerated);
-        if adapters.is_empty() {
-            return Err(RenderError::NoAdapter(
-                "no compatible GPU adapters found".to_string(),
-            ));
-        }
-        let (adapter, device, queue) = open_device(&adapters, &surface)?;
+        let Opened {
+            adapter,
+            device,
+            queue,
+            surface,
+        } = open_window(&window)?;
         let info = adapter.get_info();
         let adapter_name = format!(
             "{} (backend={:?} type={:?} driver={} {})",
@@ -98,6 +92,10 @@ impl Renderer {
             desired_maximum_frame_latency: 2,
         };
         surface.configure(&device, &config);
+        let surface_name = format!(
+            "format={:?} alpha={:?} offered={:?}",
+            config.format, config.alpha_mode, caps.alpha_modes
+        );
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("quads"),
@@ -229,6 +227,7 @@ impl Renderer {
 
         Ok(Self {
             adapter_name,
+            surface_name,
             present: PresentStats::default(),
             first_error_seen: false,
             device,
@@ -246,6 +245,12 @@ impl Renderer {
     /// The adapter that opened the device, for the diagnostic log.
     pub fn adapter_name(&self) -> &str {
         &self.adapter_name
+    }
+
+    /// Surface format and composite alpha, for the diagnostic log. An overlay that
+    /// reports `alpha=Opaque` is the one that covers the game with a black sheet.
+    pub fn surface_name(&self) -> &str {
+        &self.surface_name
     }
 
     pub fn take_present_stats(&mut self) -> PresentStats {
@@ -420,6 +425,70 @@ fn draw_batch(
 /// Limits for [`Adapter::request_device`]: never above what the adapter reports.
 pub fn required_device_limits(adapter: &wgpu::Adapter) -> wgpu::Limits {
     adapter.limits()
+}
+
+fn default_instance() -> wgpu::InstanceDescriptor {
+    let mut desc = wgpu::InstanceDescriptor::new_without_display_handle();
+    desc.backends = wgpu::Backends::all();
+    desc
+}
+
+/// DirectComposition is the only Windows swapchain wgpu composites with per-pixel
+/// alpha. A plain HWND swapchain, DX12 or Vulkan, offers `CompositeAlphaMode::Opaque`
+/// and nothing else, so the transparent clear colour reaches the screen as black.
+#[cfg(windows)]
+fn composited_instance() -> wgpu::InstanceDescriptor {
+    let mut desc = wgpu::InstanceDescriptor::new_without_display_handle();
+    desc.backends = wgpu::Backends::DX12;
+    desc.backend_options.dx12.presentation_system = wgpu::Dx12SwapchainKind::DxgiFromVisual;
+    desc
+}
+
+#[cfg(windows)]
+fn open_window(window: &Arc<Window>) -> Result<Opened, RenderError> {
+    match open_instance(window, composited_instance()) {
+        Ok(opened) => Ok(opened),
+        // A host with no usable DX12 device keeps the overlay running rather than
+        // failing to start. It will not be transparent; the log says which one it is.
+        Err(err) => open_instance(window, default_instance()).map_err(|_| err),
+    }
+}
+
+#[cfg(not(windows))]
+fn open_window(window: &Arc<Window>) -> Result<Opened, RenderError> {
+    open_instance(window, default_instance())
+}
+
+fn open_instance(
+    window: &Arc<Window>,
+    desc: wgpu::InstanceDescriptor,
+) -> Result<Opened, RenderError> {
+    let backends = desc.backends;
+    let instance = wgpu::Instance::new(desc);
+    let surface = instance
+        .create_surface(Arc::clone(window))
+        .map_err(|err| RenderError::Surface(err.to_string()))?;
+    let adapter_options = wgpu::RequestAdapterOptions {
+        power_preference: POWER_PREFERENCE,
+        compatible_surface: Some(&surface),
+        force_fallback_adapter: false,
+        apply_limit_buckets: true,
+    };
+    let preferred = pollster::block_on(instance.request_adapter(&adapter_options)).ok();
+    let enumerated = pollster::block_on(instance.enumerate_adapters(backends));
+    let adapters = ordered_adapters(preferred, enumerated);
+    if adapters.is_empty() {
+        return Err(RenderError::NoAdapter(
+            "no compatible GPU adapters found".to_string(),
+        ));
+    }
+    let (adapter, device, queue) = open_device(&adapters, &surface)?;
+    Ok(Opened {
+        adapter,
+        device,
+        queue,
+        surface,
+    })
 }
 
 fn ordered_adapters(
