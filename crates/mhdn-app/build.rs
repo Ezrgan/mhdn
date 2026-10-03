@@ -7,7 +7,8 @@ fn main() {
 fn embed_windows_icon() {
     use std::path::PathBuf;
 
-    let manifest_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
+    let manifest_dir =
+        PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
     let icon = manifest_dir.join("../../assets/mhdn.ico");
     if !icon.is_file() {
         panic!("missing Windows icon at {}", icon.display());
