@@ -46,6 +46,7 @@ use crate::win_geom::{
     display, host_window, is_azahar_exe, overlay_ex_style, windows_insets, RawMonitor, RawWindow,
     BASE_DPI, EX_APPWINDOW, EX_LAYERED, EX_NOACTIVATE, EX_TOOLWINDOW, EX_TOPMOST, EX_TRANSPARENT,
 };
+use crate::OverlayUserEvent;
 
 // The pure module repeats the style bits so it can be tested off Windows.
 const _: () = assert!(EX_LAYERED == WS_EX_LAYERED);
@@ -71,8 +72,8 @@ pub fn apply_click_through(window: &Window, click_through: bool) -> Result<(), P
     Ok(())
 }
 
-pub fn overlay_event_loop() -> Result<EventLoop<()>, EventLoopError> {
-    EventLoop::new()
+pub fn overlay_event_loop() -> Result<EventLoop<OverlayUserEvent>, EventLoopError> {
+    EventLoop::<OverlayUserEvent>::with_user_event().build()
 }
 
 /// Windows has no spaces. Winit may reset the extended style when the window is shown,
@@ -117,7 +118,7 @@ pub struct MenuStatus {
 }
 
 impl MenuStatus {
-    pub fn install() -> Result<Self, PlatformError> {
+    pub fn install(_on_event: impl Fn(OverlayUserEvent) + 'static) -> Result<Self, PlatformError> {
         Ok(Self {
             title: Mutex::new(String::new()),
         })

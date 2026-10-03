@@ -1,5 +1,12 @@
 //! Platform-specific window tracking and overlay surfaces.
 
+/// User events injected from the menu bar or other platform UI into winit's loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OverlayUserEvent {
+    Quit,
+    ShowSettings,
+}
+
 mod error;
 mod follow;
 mod geom;

@@ -14,6 +14,9 @@ name = "mhdn"
 path = "src/main.rs"
 
 [dependencies]
+egui = "0.36.2"
+egui-wgpu = { version = "0.36.2", features = ["winit"] }
+egui-winit = { version = "0.36.2", default-features = false, features = ["links"] }
 glam = "0.29"
 mhdn-fx = { path = "../mhdn-fx" }
 mhdn-game = { path = "../mhdn-game" }
@@ -21,6 +24,10 @@ mhdn-platform = { path = "../mhdn-platform" }
 mhdn-proj = { path = "../mhdn-proj" }
 mhdn-render = { path = "../mhdn-render" }
 mhdn-rpc = { path = "../mhdn-rpc" }
+pollster = "1.0.1"
 serde.workspace = true
 toml.workspace = true
 winit = "0.30.13"
+
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1.23"
