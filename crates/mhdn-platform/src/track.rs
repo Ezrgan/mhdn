@@ -111,6 +111,25 @@ pub fn host_in_front(host_pid: i32, frontmost: Option<i32>, own_pid: i32) -> boo
     }
 }
 
+/// Whether the overlay must park. It sits at screen-saver level, so no normal window of
+/// ours can be drawn above it. While the settings window is the key window the overlay
+/// steps aside, and it comes back once Azahar owns the keyboard again.
+///
+/// `calibrating` keeps the overlay up while another app is in front, because calibration
+/// needs the overlay itself to take the keyboard. Settings still wins over it.
+pub fn overlay_parked(
+    host_pid: i32,
+    frontmost: Option<i32>,
+    own_pid: i32,
+    settings_focused: bool,
+    calibrating: bool,
+) -> bool {
+    if settings_focused {
+        return true;
+    }
+    !calibrating && !host_in_front(host_pid, frontmost, own_pid)
+}
+
 fn scale_for(bounds: Rect, displays: &[Display]) -> f32 {
     let cx = bounds.x + bounds.width * 0.5;
     let cy = bounds.y + bounds.height * 0.5;
@@ -202,6 +221,21 @@ mod tests {
         assert!(host_in_front(10, Some(99), 99));
         assert!(!host_in_front(10, Some(42), 99));
         assert!(host_in_front(10, None, 99));
+    }
+
+    #[test]
+    fn the_overlay_parks_while_settings_is_focused() {
+        // Settings key: our own pid is frontmost, and the overlay must still park.
+        assert!(overlay_parked(10, Some(99), 99, true, false));
+        assert!(overlay_parked(10, Some(99), 99, true, true));
+        // Back in Azahar, or Settings closed while our pid lingers in front: it shows.
+        assert!(!overlay_parked(10, Some(10), 99, false, false));
+        assert!(!overlay_parked(10, Some(99), 99, false, false));
+        assert!(!overlay_parked(10, None, 99, false, false));
+        // Another app in front parks it, except while calibrating.
+        assert!(overlay_parked(10, Some(42), 99, false, false));
+        assert!(!overlay_parked(10, Some(42), 99, false, true));
+        assert!(overlay_parked(10, Some(42), 99, true, true));
     }
 
     #[test]

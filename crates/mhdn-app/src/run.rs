@@ -9,9 +9,9 @@ use std::time::{Duration, Instant};
 use glam::Vec3;
 use mhdn_game::{EventQueue, Latest, Profile, Scene, Snapshot};
 use mhdn_platform::{
-    apply_click_through, begin_latency_critical, frontmost_pid, host_in_front, join_active_space,
-    overlay_event_loop, report_startup_failure, system_tracker, MenuStatus, OverlayHost,
-    OverlayUserEvent, SurfaceUpdate, TrackedWindow, WindowTracker,
+    apply_click_through, begin_latency_critical, frontmost_pid, join_active_space,
+    overlay_event_loop, overlay_parked, report_startup_failure, system_tracker, MenuStatus,
+    OverlayHost, OverlayUserEvent, SurfaceUpdate, TrackedWindow, WindowTracker,
 };
 use mhdn_proj::{
     parse_layout_settings, project, resolve, Camera, EdgeMode, LayoutOption, LayoutSettings,
@@ -174,8 +174,21 @@ impl OverlayApp {
             return;
         };
         let own_pid = i32::try_from(std::process::id()).unwrap_or(-1);
-        self.behind = !host_in_front(tracked.owner_pid, frontmost_pid(), own_pid);
-        if self.behind && !self.calibrator.active {
+        // Our own pid counts as "in front" for calibration, so it also covers the settings
+        // window. That one is a normal-level window and the overlay is at level 1000, so
+        // the overlay has to step aside while Settings is the key window.
+        let settings_focused = self
+            .settings
+            .as_ref()
+            .is_some_and(SettingsWindow::is_focused);
+        self.behind = overlay_parked(
+            tracked.owner_pid,
+            frontmost_pid(),
+            own_pid,
+            settings_focused,
+            self.calibrator.active,
+        );
+        if self.behind {
             self.park(&window);
             return;
         }
