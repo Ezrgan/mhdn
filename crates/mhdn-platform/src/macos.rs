@@ -5,6 +5,7 @@ use objc2::MainThreadMarker;
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSColor, NSScreenSaverWindowLevel, NSStatusBar,
     NSStatusItem, NSVariableStatusItemLength, NSView, NSWindow, NSWindowCollectionBehavior,
+    NSWorkspace,
 };
 use objc2_foundation::NSString;
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
@@ -36,6 +37,13 @@ pub fn apply_click_through(window: &Window, click_through: bool) -> Result<(), P
     ns_window.setLevel(NSScreenSaverWindowLevel);
     ns_window.setCollectionBehavior(collection_behavior());
     Ok(())
+}
+
+/// Process id of the app that owns the keyboard. `None` when AppKit has no answer.
+pub fn frontmost_pid() -> Option<i32> {
+    NSWorkspace::sharedWorkspace()
+        .frontmostApplication()
+        .map(|app| app.processIdentifier())
 }
 
 /// Translucent red fill used by the spike, so the panel is visible without wgpu.

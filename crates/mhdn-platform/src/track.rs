@@ -102,6 +102,15 @@ pub fn track_windows(
     })
 }
 
+/// The overlay draws at screen-saver level, above every app. It may only show while the
+/// emulator, or the overlay itself during calibration, owns the keyboard.
+pub fn host_in_front(host_pid: i32, frontmost: Option<i32>, own_pid: i32) -> bool {
+    match frontmost {
+        Some(pid) => pid == host_pid || pid == own_pid,
+        None => true,
+    }
+}
+
 fn scale_for(bounds: Rect, displays: &[Display]) -> f32 {
     let cx = bounds.x + bounds.width * 0.5;
     let cy = bounds.y + bounds.height * 0.5;
@@ -176,6 +185,14 @@ mod tests {
             bounds,
             onscreen: true,
         }
+    }
+
+    #[test]
+    fn the_overlay_shows_only_while_the_emulator_or_itself_is_in_front() {
+        assert!(host_in_front(10, Some(10), 99));
+        assert!(host_in_front(10, Some(99), 99));
+        assert!(!host_in_front(10, Some(42), 99));
+        assert!(host_in_front(10, None, 99));
     }
 
     #[test]

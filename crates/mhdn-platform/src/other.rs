@@ -11,6 +11,10 @@ pub fn apply_click_through(
     Ok(())
 }
 
+pub fn frontmost_pid() -> Option<i32> {
+    None
+}
+
 /// Menu-bar status is a macOS item. Other hosts only keep the label API.
 pub struct MenuStatus;
 

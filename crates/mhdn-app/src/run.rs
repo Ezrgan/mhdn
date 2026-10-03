@@ -9,8 +9,8 @@ use std::time::{Duration, Instant};
 use glam::Vec3;
 use mhdn_game::{EventQueue, Latest, Profile, Scene, Snapshot};
 use mhdn_platform::{
-    apply_click_through, system_tracker, MenuStatus, OverlayHost, SurfaceUpdate, TrackedWindow,
-    WindowTracker,
+    apply_click_through, frontmost_pid, host_in_front, system_tracker, MenuStatus, OverlayHost,
+    SurfaceUpdate, TrackedWindow, WindowTracker,
 };
 use mhdn_proj::{
     parse_layout_settings, project, resolve, Camera, EdgeMode, LayoutOption, LayoutSettings,
@@ -64,6 +64,8 @@ struct OverlayApp {
     calibrator: Calibrator,
     cursor: (f32, f32),
     parked: bool,
+    /// Another app owns the keyboard, so the overlay is parked even though Azahar is on screen.
+    behind: bool,
     events: Arc<EventQueue>,
     combat: CombatView,
     profile: Option<Profile>,
@@ -133,6 +135,7 @@ impl OverlayApp {
             calibrator,
             cursor: (0.0, 0.0),
             parked: false,
+            behind: false,
             events,
             combat: CombatView::new(),
             profile,
@@ -155,6 +158,12 @@ impl OverlayApp {
             self.park(&window);
             return;
         };
+        let own_pid = i32::try_from(std::process::id()).unwrap_or(-1);
+        self.behind = !host_in_front(tracked.owner_pid, frontmost_pid(), own_pid);
+        if self.behind && !self.calibrator.active {
+            self.park(&window);
+            return;
+        }
         if self.parked {
             self.parked = false;
             self.host = OverlayHost::new();
@@ -326,8 +335,9 @@ impl OverlayApp {
             })
             .unwrap_or_else(|| "scene=none".to_string());
         format!(
-            "{tracked}\tparked={}\tsize={}x{} scale={scale}\ttop={:.0},{:.0},{:.0}x{:.0}\t{latest}\talive={}\ttotal={}\tphase={}",
+            "{tracked}\tparked={} behind={}\tsize={}x{} scale={scale}\ttop={:.0},{:.0},{:.0}x{:.0}\t{latest}\talive={}\ttotal={}\tphase={}",
             u8::from(self.parked),
+            u8::from(self.behind),
             size.width,
             size.height,
             top.x,
