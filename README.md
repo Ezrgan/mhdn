@@ -89,7 +89,7 @@ The overlay follows the Azahar window. A menu-bar title reports the link:
 
 Hits show as floating numbers on the monster. A bone position from the damage tap is used when the tap is installed; otherwise the number sits above the body by the species anchor height, with a few pixels of scatter. White / yellow / orange is how the hit compares with the last 50 hits. Poison ticks are small and purple. `DMG` / `DPS` in the corner is this hunt only.
 
-The window does not take clicks. Stop it with Ctrl-C in the terminal. Config lives at `~/Library/Application Support/mhdn/config.toml` on macOS (`%APPDATA%\mhdn\config.toml` on Windows). `debug_hud = false` hides the alignment crosses. `show_numbers`, `show_recount`, and `number_px` control the fight text.
+The window does not take clicks. Stop it with Ctrl-C in the terminal. Config lives at `~/Library/Application Support/mhdn/config.toml` on macOS (`%APPDATA%\mhdn\config.toml` on Windows). `debug_hud = true` shows the alignment crosses (blue hunter, orange monsters, green top screen). `MHDN_TRACE=1` writes a diagnostic log under `logs/` next to the config. `show_numbers`, `show_recount`, and `number_px` control the fight text.
 
 **Limits of this build:** hits that land in the same guest frame still merge when the damage tap is not installed. The overlay does not yet know who swung, whether the hit was a crit, or which element it was. Those need another reverse-engineering pass. Team damage percentage is not shown because attacker identity is not in the event yet.
 

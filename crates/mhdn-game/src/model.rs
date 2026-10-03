@@ -6,9 +6,6 @@ use crate::scene::Scene;
 /// A large monster in the live notes starts at 720 HP. Bars under this are small monsters.
 pub const LARGE_MIN_HP: u32 = 400;
 
-/// World position of the struck bone, at `sp[2] + 0x40` on the damage tap.
-pub const BONE_POS_OFFSET: u32 = 0x40;
-
 /// `r12 + 0x360` is the HP word the monster list resolves to.
 pub const HP_FROM_OBJECT: u32 = 0x360;
 

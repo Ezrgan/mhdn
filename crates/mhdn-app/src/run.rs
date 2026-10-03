@@ -6,13 +6,15 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use glam::Vec3;
 use mhdn_game::{EventQueue, Latest, Profile, Scene, Snapshot};
 use mhdn_platform::{
     apply_click_through, system_tracker, MenuStatus, OverlayHost, SurfaceUpdate, TrackedWindow,
     WindowTracker,
 };
 use mhdn_proj::{
-    parse_layout_settings, resolve, LayoutOption, LayoutSettings, LayoutWatcher, ScreenRect,
+    parse_layout_settings, project, resolve, Camera, EdgeMode, LayoutOption, LayoutSettings,
+    LayoutWatcher, Projected, ScreenRect,
 };
 use mhdn_render::{FrameClock, Quad, RenderError, Renderer};
 use winit::application::ApplicationHandler;
@@ -27,8 +29,10 @@ use crate::hud::{build_hud, scene_label, HudStats};
 use crate::numbers::CombatView;
 use crate::session::{sample_rate, RateWindow, RpcMeter, Session};
 use crate::status::{link_state, status_title};
+use crate::trace::Trace;
 
 const POLL: Duration = Duration::from_millis(33);
+const RECOUNT_PT: f32 = 22.0;
 
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let calibrate = std::env::args().any(|arg| arg == "--calibrate");
@@ -65,6 +69,7 @@ struct OverlayApp {
     last_tick: Instant,
     menu: Option<MenuStatus>,
     status_text: String,
+    trace: Option<Trace>,
     _session: Option<Session>,
 }
 
@@ -132,6 +137,7 @@ impl OverlayApp {
             last_tick: Instant::now(),
             menu: None,
             status_text: String::new(),
+            trace: Trace::from_env(),
             _session: session,
         }
     }
@@ -173,6 +179,9 @@ impl OverlayApp {
             return;
         };
         self.delay.push(snapshot);
+        if let Some(trace) = self.trace.as_mut() {
+            trace.snapshot();
+        }
         if self.config.debug_hud || self.calibrator.active {
             self.clock.request();
         }
@@ -233,7 +242,13 @@ impl OverlayApp {
             .as_ref()
             .map(|snapshot| snapshot.guest_frame)
             .unwrap_or(self.last_frame);
-        self.combat.observe(scene, frame);
+        let reset = self.combat.observe(scene, frame);
+        if let Some(reason) = reset {
+            self.clock.request();
+            if let Some(trace) = self.trace.as_mut() {
+                trace.reset(reason, frame);
+            }
+        }
         if self.events.supported() == Some(false) {
             let _ = self.events.drain();
             self.combat.clear();
@@ -244,16 +259,79 @@ impl OverlayApp {
                 .map(|snapshot| snapshot.monsters.as_slice())
                 .unwrap_or(&[]);
             let profile = self.profile.clone();
-            self.combat.ingest(&events, monsters, |species, large| {
+            let ingested = self.combat.ingest(&events, monsters, |species, large| {
                 profile
                     .as_ref()
                     .map(|profile| profile.species.anchor_for(species, large))
                     .unwrap_or(if large { 150.0 } else { 52.0 })
             });
+            if self.trace.is_some() && !events.is_empty() {
+                let top = self.calibrated_top(self.window_size());
+                let camera = newest
+                    .as_ref()
+                    .and_then(|snapshot| snapshot.camera.as_ref())
+                    .and_then(crate::hud::camera_from);
+                if let Some(trace) = self.trace.as_mut() {
+                    trace.ingest(&events, &ingested, |world| {
+                        screen_label(world, camera.as_ref(), top)
+                    });
+                }
+            }
         }
         if was_alive || self.combat.alive() {
             self.clock.request();
         }
+    }
+
+    fn trace_context(&self) -> String {
+        let size = self.window_size();
+        let top = self.calibrated_top(size);
+        let scale = self
+            .window
+            .as_ref()
+            .map(|window| window.scale_factor())
+            .unwrap_or(0.0);
+        let tracked = self
+            .tracked
+            .map(|window| {
+                format!(
+                    "azahar={:.0},{:.0},{:.0}x{:.0} on={} fs={} wscale={}",
+                    window.content_rect.x,
+                    window.content_rect.y,
+                    window.content_rect.width,
+                    window.content_rect.height,
+                    u8::from(window.onscreen),
+                    u8::from(window.is_fullscreen),
+                    window.scale
+                )
+            })
+            .unwrap_or_else(|| "azahar=none".to_string());
+        let latest = self
+            .delay
+            .latest()
+            .map(|snapshot| {
+                format!(
+                    "scene={:?} frame={} cam={} monsters={}",
+                    snapshot.scene,
+                    snapshot.guest_frame,
+                    u8::from(snapshot.camera.is_some()),
+                    snapshot.monsters.len()
+                )
+            })
+            .unwrap_or_else(|| "scene=none".to_string());
+        format!(
+            "{tracked}\tparked={}\tsize={}x{} scale={scale}\ttop={:.0},{:.0},{:.0}x{:.0}\t{latest}\talive={}\ttotal={}\tphase={}",
+            u8::from(self.parked),
+            size.width,
+            size.height,
+            top.x,
+            top.y,
+            top.width,
+            top.height,
+            self.combat.alive_count(),
+            self.combat.recount_total(),
+            self.meter.phase()
+        )
     }
 
     fn refresh_status(&mut self) {
@@ -273,6 +351,13 @@ impl OverlayApp {
 
     fn quads(&mut self, size: PhysicalSize<u32>) -> Vec<Quad> {
         let top = self.calibrated_top(size);
+        // Text sizes are in points. The surface is in physical pixels.
+        let ui = self
+            .window
+            .as_ref()
+            .map(|window| window.scale_factor() as f32)
+            .unwrap_or(1.0)
+            .max(1.0);
         sample_rate(&mut self.rate, &self.meter, Instant::now());
         let snapshot = self.delay.sample(self.config.latency()).cloned();
         let mut quads = if self.config.debug_hud {
@@ -292,23 +377,38 @@ impl OverlayApp {
             if let Some(snapshot) = snapshot.as_ref() {
                 self.last_frame = snapshot.guest_frame;
             }
-            build_hud(snapshot.as_ref(), top, &stats, self.config.style.text_scale)
+            build_hud(
+                snapshot.as_ref(),
+                top,
+                &stats,
+                self.config.style.text_scale * ui,
+            )
         } else {
             Vec::new()
         };
         if self.config.style.show_numbers {
-            if let Some(camera) = snapshot
+            let camera = snapshot
                 .as_ref()
-                .and_then(|snapshot| snapshot.camera.as_ref().and_then(crate::hud::camera_from))
-            {
-                quads.extend(
-                    self.combat
-                        .number_quads(&camera, top, self.config.style.number_px),
-                );
+                .and_then(|snapshot| snapshot.camera.as_ref().and_then(crate::hud::camera_from));
+            if let Some(trace) = self.trace.as_mut() {
+                if self.combat.alive() {
+                    trace.draw(
+                        camera
+                            .as_ref()
+                            .map(|camera| self.combat.draw_stats(camera, top)),
+                    );
+                }
+            }
+            if let Some(camera) = camera {
+                quads.extend(self.combat.number_quads(
+                    &camera,
+                    top,
+                    self.config.style.number_px * ui,
+                ));
             }
         }
         if self.config.style.show_recount {
-            quads.extend(self.combat.recount_quads(top));
+            quads.extend(self.combat.recount_quads(top, RECOUNT_PT * ui));
         }
         if self.calibrator.active {
             quads.extend(handles(top));
@@ -458,6 +558,12 @@ impl ApplicationHandler for OverlayApp {
         self.take_snapshot();
         self.refresh_combat();
         self.refresh_status();
+        if self.trace.as_ref().is_some_and(Trace::due) {
+            let context = self.trace_context();
+            if let Some(trace) = self.trace.as_mut() {
+                trace.summary(&context);
+            }
+        }
         if self.clock.take() {
             if let Some(window) = &self.window {
                 window.request_redraw();
@@ -469,6 +575,17 @@ impl ApplicationHandler for OverlayApp {
             POLL
         };
         event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + wait));
+    }
+}
+
+fn screen_label(world: [f32; 3], camera: Option<&Camera>, top: ScreenRect) -> String {
+    let Some(camera) = camera else {
+        return "nocam".to_string();
+    };
+    match project(Vec3::from_array(world), camera, top, EdgeMode::Hide) {
+        Projected::Visible { x, y } => format!("{x:.0},{y:.0}"),
+        Projected::OffScreen { x, y } => format!("off({x:.0},{y:.0})"),
+        Projected::Behind => "behind".to_string(),
     }
 }
 

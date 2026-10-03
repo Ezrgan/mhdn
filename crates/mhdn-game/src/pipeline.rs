@@ -3,9 +3,8 @@
 use mhdn_rpc::MemorySource;
 use xxhash_rust::xxh3::xxh3_64;
 
-use crate::chain::is_guest_heap;
 use crate::damage::{compose_sources, PluginHit, ResolvedTap};
-use crate::model::{Anchor, MonsterState, Snapshot, Vec3, BONE_POS_OFFSET};
+use crate::model::{Anchor, MonsterState, Snapshot};
 use crate::profile::Profile;
 use crate::scene::{Scene, SceneMachine};
 use crate::snapshot::{capture, CaptureCache, SnapshotError};
@@ -99,7 +98,9 @@ impl Pipeline {
             }
         };
         self.failures = 0;
-        let change = self.scene.observe(raw.in_quest, raw.loading);
+        // The profile's in-quest word reads 0 for most of a live hunt. A resolved monster list is the hunt.
+        let hunting = !raw.monsters.is_empty();
+        let change = self.scene.observe(hunting, raw.loading && !hunting);
         if change.left_quest {
             self.track.clear();
             self.cache.clear();
@@ -109,8 +110,9 @@ impl Pipeline {
         } else {
             Vec::new()
         };
+        let taps = self.poll_taps(mem);
         let events = if change.scene == Scene::InQuest {
-            self.events(mem, profile, raw.guest_frame, &live)
+            self.events(mem, raw.guest_frame, &live, taps, profile)
         } else {
             Vec::new()
         };
@@ -157,7 +159,7 @@ impl Pipeline {
         }
         let hook = read_patch_u32(mem, HOOK_ADDR)?;
         if hook == hook_branch() {
-            self.tap_installed = true;
+            self.adopt_tap(mem);
             return Ok(());
         }
         if self.scene.committed() != Scene::InQuest {
@@ -165,7 +167,7 @@ impl Pipeline {
         }
         match install(mem) {
             Ok(InstallOutcome::Installed | InstallOutcome::AlreadyInstalled) => {
-                self.tap_installed = true;
+                self.adopt_tap(mem);
                 Ok(())
             }
             Err(
@@ -189,6 +191,29 @@ impl Pipeline {
         }
     }
 
+    /// Start reading after whatever the ring already holds, so an old hunt is never replayed.
+    fn adopt_tap(&mut self, mem: &mut dyn PatchMemory) {
+        if self.tap_installed {
+            return;
+        }
+        if let Ok(seq) = read_patch_u32(mem, WRITE_SEQ_ADDR) {
+            self.last_tap_seq = seq;
+            self.tap_installed = true;
+        }
+    }
+
+    /// Consume the ring on every sample, in or out of a hunt. `None` while the hook is not ours.
+    fn poll_taps(&mut self, mem: &mut dyn MemorySource) -> Option<Vec<TapEvent>> {
+        if !self.tap_installed {
+            return None;
+        }
+        if mem.read_u32(HOOK_ADDR).ok() != Some(hook_branch()) {
+            self.tap_installed = false;
+            return None;
+        }
+        Some(self.read_new_taps(mem))
+    }
+
     fn note_failure(&mut self) {
         self.failures = self.failures.saturating_add(1);
         if self.failures >= DISCONNECT_AFTER {
@@ -203,25 +228,22 @@ impl Pipeline {
     fn events(
         &mut self,
         mem: &mut dyn MemorySource,
-        profile: &Profile,
         frame: u32,
         live: &[crate::track::LiveMonster],
+        taps: Option<Vec<TapEvent>>,
+        profile: &Profile,
     ) -> Vec<crate::DamageEvent> {
-        let hook = mem.read_u32(HOOK_ADDR).unwrap_or(0);
-        let tap_active = hook == hook_branch();
+        let tap_active = taps.is_some();
         let plugin = self.plugin_hits(mem);
-        let taps = if tap_active {
-            self.read_new_taps(mem)
-        } else {
-            Vec::new()
-        };
+        // `sp[2]` is the monster-list slot, not the struck bone, so the anchor comes from the monster.
         let resolved: Vec<ResolvedTap> = if plugin.is_some() {
             Vec::new()
         } else {
-            taps.iter()
+            taps.unwrap_or_default()
+                .into_iter()
                 .map(|event| ResolvedTap {
-                    event: *event,
-                    anchor: bone_anchor(mem, event),
+                    event,
+                    anchor: Anchor::Unknown,
                 })
                 .collect()
         };
@@ -278,20 +300,6 @@ impl Pipeline {
             self.plugin_present = Some(true);
         }
         hits
-    }
-}
-
-fn bone_anchor(mem: &mut dyn MemorySource, event: &TapEvent) -> Anchor {
-    let ptr = event.stack[2];
-    if !is_guest_heap(ptr) {
-        return Anchor::Unknown;
-    }
-    let addr = ptr.wrapping_add(BONE_POS_OFFSET);
-    match mem.read_f32x3(addr) {
-        Ok([x, y, z]) if x.is_finite() && y.is_finite() && z.is_finite() => {
-            Anchor::World(Vec3::new(x, y, z))
-        }
-        _ => Anchor::Unknown,
     }
 }
 
@@ -432,15 +440,13 @@ mod tests {
     }
 
     #[test]
-    fn tap_hits_replace_the_hp_delta_and_keep_the_bone() {
+    fn tap_hits_replace_the_hp_delta_and_anchor_on_the_monster() {
         let (mut pipeline, mut mem, profile) = prepared();
         warm(&mut pipeline, &mut mem, &profile);
         pipeline.maintain_tap(&mut mem, &profile).unwrap();
         assert_eq!(mem_word(&mut mem, HOOK_ADDR), hook_branch());
         let object = hp_addr(0) - HP_FROM_OBJECT;
-        let bone = 0x300A_0000;
-        mem.write_vec3(bone + BONE_POS_OFFSET, [9.0, 8.0, 7.0]);
-        write_tap(&mut mem, 1, -14, object, bone, 90);
+        write_tap(&mut mem, 1, -14, object, 0x300A_0000, 90);
         mem.write_u32(profile.frame_counter.addr.unwrap(), 4);
         place_monster(&mut mem, 0, 760, 774, 1, [10.0, 20.0, 30.0], 0);
         let sample = pipeline.poll(&mut mem, &profile, 70_000).unwrap();
@@ -449,12 +455,81 @@ mod tests {
         assert_eq!(sample.events[0].confidence, DamageConfidence::Exact);
         assert_eq!(sample.events[0].amount, 14);
         assert_eq!(sample.events[0].part_hp, Some(90));
+        assert_eq!(sample.events[0].anchor, Anchor::Unknown);
         assert_eq!(
-            sample.events[0].anchor,
-            Anchor::World(crate::model::Vec3::new(9.0, 8.0, 7.0))
+            sample.events[0].key.map(|key| key.struct_addr),
+            Some(hp_addr(0))
         );
         pipeline.shutdown_tap(&mut mem);
         assert_eq!(mem_word(&mut mem, HOOK_ADDR), EXPECTED_HOOK);
+    }
+
+    #[test]
+    fn an_adopted_tap_does_not_replay_old_hits_and_drains_outside_the_hunt() {
+        let (mut pipeline, mut mem, profile) = prepared();
+        warm(&mut pipeline, &mut mem, &profile);
+        pipeline.maintain_tap(&mut mem, &profile).unwrap();
+        let object = hp_addr(0) - HP_FROM_OBJECT;
+        for seq in 1..=40 {
+            write_tap(&mut mem, seq, -5, object, 0, 90);
+        }
+        let mut fresh = Pipeline::new();
+        warm(&mut fresh, &mut mem, &profile);
+        fresh.maintain_tap(&mut mem, &profile).unwrap();
+        mem.write_u32(profile.frame_counter.addr.unwrap(), 4);
+        assert!(fresh
+            .poll(&mut mem, &profile, 64_000)
+            .unwrap()
+            .events
+            .is_empty());
+
+        mem.write_u32(0x082C_E730 + 0x14, 0);
+        for frame in 5..(5 + u32::from(crate::scene::LEAVE_HUNT)) {
+            mem.write_u32(profile.frame_counter.addr.unwrap(), frame);
+            fresh
+                .poll(&mut mem, &profile, u64::from(frame) * 16_000)
+                .unwrap();
+        }
+        assert_ne!(fresh.scene(), Scene::InQuest);
+        write_tap(&mut mem, 41, -7, object, 0, 90);
+        mem.write_u32(profile.frame_counter.addr.unwrap(), 100);
+        assert!(fresh
+            .poll(&mut mem, &profile, 1_600_000)
+            .unwrap()
+            .events
+            .is_empty());
+
+        place_monster(&mut mem, 0, 774, 774, 1, [10.0, 20.0, 30.0], 0);
+        for frame in 101..=103 {
+            mem.write_u32(profile.frame_counter.addr.unwrap(), frame);
+            fresh
+                .poll(&mut mem, &profile, u64::from(frame) * 16_000)
+                .unwrap();
+        }
+        assert_eq!(fresh.scene(), Scene::InQuest);
+        write_tap(&mut mem, 42, -9, object, 0, 90);
+        mem.write_u32(profile.frame_counter.addr.unwrap(), 104);
+        let events = fresh.poll(&mut mem, &profile, 1_700_000).unwrap().events;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].amount, 9);
+    }
+
+    #[test]
+    fn the_hunt_follows_the_monster_list_not_the_quest_word() {
+        let mut profile = live_profile();
+        profile.meta.fingerprint.clear();
+        let mut mem = SparseMemory::new();
+        stage_hunt(&mut mem, &profile, 1, false, true);
+        place_monster(&mut mem, 0, 500, 774, 1, [1.0, 2.0, 3.0], 0);
+        let mut pipeline = Pipeline::new();
+        warm(&mut pipeline, &mut mem, &profile);
+        assert_eq!(pipeline.scene(), Scene::InQuest);
+
+        let mut village = SparseMemory::new();
+        stage_hunt(&mut village, &profile, 1, true, false);
+        let mut pipeline = Pipeline::new();
+        warm(&mut pipeline, &mut village, &profile);
+        assert_eq!(pipeline.scene(), Scene::Village);
     }
 
     #[test]

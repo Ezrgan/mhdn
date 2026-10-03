@@ -54,7 +54,6 @@ impl CaptureCache {
 #[derive(Debug, Clone)]
 pub(crate) struct RawSnapshot {
     pub guest_frame: u32,
-    pub in_quest: bool,
     pub loading: bool,
     pub camera: Option<CameraState>,
     pub hunter_pos: Option<Vec3>,
@@ -86,17 +85,12 @@ fn read_body(
     cache: &mut CaptureCache,
     guest_frame: u32,
 ) -> Result<RawSnapshot, SnapshotError> {
-    let in_quest = match &profile.scene.in_quest {
-        Some(flag) => read_flag(mem, flag.addr, flag.ty)? == flag.value,
-        None => false,
-    };
     let loading = match &profile.scene.loading {
         Some(flag) => read_flag(mem, flag.addr, flag.ty)? == flag.value,
         None => false,
     };
     Ok(RawSnapshot {
         guest_frame,
-        in_quest,
         loading,
         camera: read_camera(mem, profile)?,
         hunter_pos: read_hunter(mem, profile)?,

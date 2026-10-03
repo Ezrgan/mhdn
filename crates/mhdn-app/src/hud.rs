@@ -78,7 +78,11 @@ pub fn build_hud(
 
     if let Some(snapshot) = snapshot {
         if let Some(camera) = snapshot.camera.as_ref().and_then(camera_from) {
-            for monster in snapshot.monsters.iter().filter(|monster| monster.visible) {
+            for monster in snapshot
+                .monsters
+                .iter()
+                .filter(|monster| monster.visible && monster.hp > 0)
+            {
                 push_anchor(
                     &mut quads,
                     monster_world(monster),
@@ -183,6 +187,16 @@ mod tests {
             .iter()
             .any(|quad| quad.color == hunter && top.contains(quad.x, quad.y)));
         assert!(quads.len() > 8);
+    }
+
+    #[test]
+    fn a_dead_monster_gets_no_cross() {
+        let mut snapshot = hunt();
+        snapshot.monsters[0].hp = 0;
+        let top = ScreenRect::new(0.0, 0.0, 400.0, 240.0);
+        let quads = build_hud(Some(&snapshot), top, &HudStats::default(), 2.0);
+        let monster = premul([1.0, 0.45, 0.12], 0.95);
+        assert!(!quads.iter().any(|quad| quad.color == monster));
     }
 
     #[test]

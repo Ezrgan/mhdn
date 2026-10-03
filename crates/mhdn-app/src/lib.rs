@@ -9,6 +9,7 @@ mod numbers;
 mod run;
 mod session;
 mod status;
+mod trace;
 
 pub use hud::{build_hud, camera_from, scene_label, HudStats};
 pub use run::run;

@@ -2,6 +2,8 @@
 
 /// How many identical raw samples a new scene must hold before it commits.
 pub const HYSTERESIS: u8 = 3;
+/// Leaving a hunt needs about half a second at the 16 ms hunt period. The monster list can blink empty.
+pub const LEAVE_HUNT: u8 = 30;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Scene {
@@ -61,7 +63,12 @@ impl SceneMachine {
             match self.pending {
                 Some((scene, seen)) if scene == raw => {
                     let seen = seen.saturating_add(1);
-                    if seen >= HYSTERESIS {
+                    let needed = if self.committed == Scene::InQuest && raw != Scene::Disconnected {
+                        LEAVE_HUNT
+                    } else {
+                        HYSTERESIS
+                    };
+                    if seen >= needed {
                         self.committed = raw;
                         self.pending = None;
                     } else {
@@ -119,10 +126,23 @@ mod tests {
     fn reward_screen_after_a_hunt_is_quest_end() {
         let mut machine = SceneMachine::new();
         hold(&mut machine, true, false, 3);
-        let end = hold(&mut machine, false, true, 3);
+        let end = hold(&mut machine, false, true, LEAVE_HUNT);
         assert_eq!(end.scene, Scene::QuestEnd);
         assert!(end.left_quest);
         assert_eq!(hold(&mut machine, false, false, 3).scene, Scene::Village);
+    }
+
+    #[test]
+    fn a_hunt_survives_a_short_gap_in_the_monster_list() {
+        let mut machine = SceneMachine::new();
+        hold(&mut machine, true, false, 3);
+        let gap = hold(&mut machine, false, false, LEAVE_HUNT - 1);
+        assert_eq!(gap.scene, Scene::InQuest);
+        assert!(!gap.left_quest);
+        assert_eq!(machine.observe(true, false).scene, Scene::InQuest);
+        let left = hold(&mut machine, false, false, LEAVE_HUNT);
+        assert_eq!(left.scene, Scene::Village);
+        assert!(left.left_quest);
     }
 
     #[test]
