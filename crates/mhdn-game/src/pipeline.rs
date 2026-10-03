@@ -73,6 +73,14 @@ impl Pipeline {
         self.failures
     }
 
+    pub fn tap_installed(&self) -> bool {
+        self.tap_installed
+    }
+
+    pub fn tap_blocked(&self) -> bool {
+        self.tap_blocked
+    }
+
     pub fn lost_tap(&self) -> u64 {
         self.lost_tap
     }

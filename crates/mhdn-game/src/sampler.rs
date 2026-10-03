@@ -34,6 +34,8 @@ pub struct EventQueue {
     dropped: AtomicU64,
     /// 0 unknown, 1 fingerprint matched, 2 this build is not the profile.
     supported: AtomicU8,
+    /// 0 not installed, 1 installed, 2 blocked by a foreign hook or an occupied cave.
+    tap: AtomicU8,
 }
 
 impl EventQueue {
@@ -43,6 +45,7 @@ impl EventQueue {
             capacity: capacity.max(1),
             dropped: AtomicU64::new(0),
             supported: AtomicU8::new(0),
+            tap: AtomicU8::new(0),
         }
     }
 
@@ -74,6 +77,25 @@ impl EventQueue {
             2 => Some(false),
             _ => None,
         }
+    }
+
+    pub fn set_tap(&self, installed: bool, blocked: bool) {
+        let state = if installed {
+            1
+        } else if blocked {
+            2
+        } else {
+            0
+        };
+        self.tap.store(state, Ordering::Relaxed);
+    }
+
+    pub fn tap_installed(&self) -> bool {
+        self.tap.load(Ordering::Relaxed) == 1
+    }
+
+    pub fn tap_blocked(&self) -> bool {
+        self.tap.load(Ordering::Relaxed) == 2
     }
 }
 
@@ -178,6 +200,8 @@ impl<M: MemorySource + PatchMemory> Sampler<M> {
         if let Some(ok) = self.pipeline.supported() {
             self.events.set_supported(ok);
         }
+        self.events
+            .set_tap(self.pipeline.tap_installed(), self.pipeline.tap_blocked());
     }
 
     /// A healthy hunt, the only state where a caller outside the sampler thread may sample.

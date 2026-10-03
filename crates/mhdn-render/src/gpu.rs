@@ -28,7 +28,21 @@ struct GpuScreen {
     pad: [f32; 2],
 }
 
+/// What the surface did since the last [`Renderer::take_present_stats`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PresentStats {
+    /// Frames the surface refused with Outdated, Lost or Validation.
+    pub errors: u32,
+    /// Frames skipped silently because the surface timed out or was occluded.
+    pub skipped: u32,
+    /// The first refusal this renderer ever saw. Reported once.
+    pub first_error: Option<String>,
+}
+
 pub struct Renderer {
+    adapter_name: String,
+    present: PresentStats,
+    first_error_seen: bool,
     device: wgpu::Device,
     queue: wgpu::Queue,
     surface: wgpu::Surface<'static>,
@@ -63,6 +77,11 @@ impl Renderer {
             ));
         }
         let (adapter, device, queue) = open_device(&adapters, &surface)?;
+        let info = adapter.get_info();
+        let adapter_name = format!(
+            "{} (backend={:?} type={:?} driver={} {})",
+            info.name, info.backend, info.device_type, info.driver, info.driver_info
+        );
 
         let caps = surface.get_capabilities(&adapter);
         let format = pick_format(&caps.formats).unwrap_or(wgpu::TextureFormat::Bgra8Unorm);
@@ -209,6 +228,9 @@ impl Renderer {
         });
 
         Ok(Self {
+            adapter_name,
+            present: PresentStats::default(),
+            first_error_seen: false,
             device,
             queue,
             surface,
@@ -219,6 +241,34 @@ impl Renderer {
             instances,
             scratch: Vec::with_capacity(INSTANCE_LIMIT),
         })
+    }
+
+    /// The adapter that opened the device, for the diagnostic log.
+    pub fn adapter_name(&self) -> &str {
+        &self.adapter_name
+    }
+
+    pub fn take_present_stats(&mut self) -> PresentStats {
+        std::mem::take(&mut self.present)
+    }
+
+    fn note_refusal(&mut self, what: &str, error: bool) {
+        if error {
+            self.present.errors += 1;
+            if !self.first_error_seen {
+                self.first_error_seen = true;
+                self.present.first_error = Some(format!(
+                    "get_current_texture returned {what} (surface {}x{} format={:?} present_mode={:?} alpha_mode={:?})",
+                    self.config.width,
+                    self.config.height,
+                    self.config.format,
+                    self.config.present_mode,
+                    self.config.alpha_mode
+                ));
+            }
+        } else {
+            self.present.skipped += 1;
+        }
     }
 
     pub fn resize(&mut self, width: u32, height: u32) {
@@ -234,12 +284,26 @@ impl Renderer {
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(frame)
             | wgpu::CurrentSurfaceTexture::Suboptimal(frame) => frame,
-            wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
-                return Ok(())
+            wgpu::CurrentSurfaceTexture::Timeout => {
+                self.note_refusal("Timeout", false);
+                return Ok(());
             }
-            wgpu::CurrentSurfaceTexture::Outdated
-            | wgpu::CurrentSurfaceTexture::Lost
-            | wgpu::CurrentSurfaceTexture::Validation => return Err(RenderError::Outdated),
+            wgpu::CurrentSurfaceTexture::Occluded => {
+                self.note_refusal("Occluded", false);
+                return Ok(());
+            }
+            wgpu::CurrentSurfaceTexture::Outdated => {
+                self.note_refusal("Outdated", true);
+                return Err(RenderError::Outdated);
+            }
+            wgpu::CurrentSurfaceTexture::Lost => {
+                self.note_refusal("Lost", true);
+                return Err(RenderError::Outdated);
+            }
+            wgpu::CurrentSurfaceTexture::Validation => {
+                self.note_refusal("Validation", true);
+                return Err(RenderError::Outdated);
+            }
         };
         let view = frame
             .texture

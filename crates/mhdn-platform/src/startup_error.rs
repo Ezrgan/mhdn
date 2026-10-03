@@ -1,4 +1,30 @@
-//! Fatal startup errors on Windows (no console subsystem).
+//! Fatal startup errors on Windows (no console subsystem), and where logs live.
+
+use std::path::PathBuf;
+
+/// `%APPDATA%\mhdn\logs` on Windows, `~/Library/Application Support/mhdn/logs` on macOS.
+/// The directory is not created here.
+pub fn log_dir() -> Option<PathBuf> {
+    #[cfg(windows)]
+    {
+        let root = std::env::var_os("APPDATA")?;
+        Some(PathBuf::from(root).join("mhdn").join("logs"))
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let home = std::env::var_os("HOME")?;
+        Some(
+            PathBuf::from(home)
+                .join("Library/Application Support/mhdn")
+                .join("logs"),
+        )
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        let home = std::env::var_os("HOME")?;
+        Some(PathBuf::from(home).join(".config/mhdn").join("logs"))
+    }
+}
 
 #[cfg(windows)]
 pub fn report_startup_failure(message: &str) {
@@ -14,13 +40,11 @@ pub fn report_startup_failure(message: &str) {
 #[cfg(windows)]
 fn write_log(message: &str) {
     use std::fs;
-    use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    let Some(root) = std::env::var_os("APPDATA") else {
+    let Some(dir) = log_dir() else {
         return;
     };
-    let dir = PathBuf::from(root).join("mhdn").join("logs");
     if fs::create_dir_all(&dir).is_err() {
         return;
     }

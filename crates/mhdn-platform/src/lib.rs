@@ -35,7 +35,7 @@ pub use geom::{
     content_rect, is_fullscreen, Insets, Rect, DEFAULT_STATUS_BAR_PT, DEFAULT_TITLE_BAR_PT,
 };
 pub use select::{select_window, HostWindow, TrackQuery, TOP_ASPECT};
-pub use startup_error::report_startup_failure;
+pub use startup_error::{log_dir, report_startup_failure};
 pub use style::{
     overlay_collection_behavior, CAN_JOIN_ALL_SPACES, FULL_SCREEN_AUXILIARY, IGNORES_CYCLE,
     SCREEN_SAVER_LEVEL, STATIONARY,
