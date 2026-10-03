@@ -160,7 +160,16 @@ mod system {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(windows)]
+mod system {
+    use super::*;
+
+    pub fn system_tracker(insets: Insets) -> Box<dyn WindowTracker> {
+        Box::new(crate::windows::WinTracker::new(insets))
+    }
+}
+
+#[cfg(not(any(target_os = "macos", windows)))]
 mod system {
     use super::*;
 

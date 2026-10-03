@@ -1024,6 +1024,7 @@ dependencies = [
  "objc2-foundation 0.3.2",
  "raw-window-handle",
  "thiserror 2.0.21",
+ "windows-sys 0.61.2",
  "winit",
 ]
 
