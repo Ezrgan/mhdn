@@ -17,7 +17,7 @@ use mhdn_proj::{
     parse_layout_settings, project, resolve, Camera, EdgeMode, LayoutOption, LayoutSettings,
     LayoutWatcher, Projected, ScreenRect,
 };
-use mhdn_render::{FrameClock, Quad, RenderError, Renderer};
+use mhdn_render::{FrameClock, Paint, PaintWatch, Quad, RenderError, Renderer};
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalPosition, LogicalSize, PhysicalSize};
 use winit::event::{ElementState, MouseButton, WindowEvent};
@@ -77,6 +77,8 @@ struct OverlayApp {
     rejoins: u32,
     /// Samples taken on this thread rather than the sampler thread.
     pumped: u64,
+    /// Falls back to drawing inline when the window never gets a redraw event.
+    paint: PaintWatch,
     events: Arc<EventQueue>,
     combat: CombatView,
     profile: Option<Profile>,
@@ -164,6 +166,7 @@ impl OverlayApp {
             behind: false,
             rejoins: 0,
             pumped: 0,
+            paint: PaintWatch::new(cfg!(windows)),
             events,
             combat: CombatView::new(),
             profile,
@@ -561,6 +564,15 @@ impl OverlayApp {
             ),
         );
         self.diag.changed("status", self.status_text.clone());
+        self.diag.changed(
+            "paint",
+            if self.paint.stalled() {
+                "inline (no redraw event arrived)"
+            } else {
+                "event"
+            }
+            .to_string(),
+        );
     }
 
     fn refresh_status(&mut self) {
@@ -678,6 +690,7 @@ impl OverlayApp {
             let _ = renderer.draw(&quads);
         }
         let present = renderer.take_present_stats();
+        self.paint.drawn();
         self.diag.redraw();
         self.diag
             .present(present.errors, present.skipped, present.first_error);
@@ -954,8 +967,13 @@ impl ApplicationHandler<OverlayUserEvent> for OverlayApp {
             }
         }
         if self.clock.take() || pumping {
-            if let Some(window) = &self.window {
-                window.request_redraw();
+            match self.paint.frame() {
+                Paint::Request => {
+                    if let Some(window) = &self.window {
+                        window.request_redraw();
+                    }
+                }
+                Paint::Now => self.draw(),
             }
         }
         let wait = if self.combat.alive() || pumping {
