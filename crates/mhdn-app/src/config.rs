@@ -64,7 +64,7 @@ impl Default for OverlayConfig {
         Self {
             display_latency_ms: DEFAULT_LATENCY_MS,
             layout_override: None,
-            debug_hud: true,
+            debug_hud: false,
             insets: InsetConfig::default(),
             style: StyleConfig::default(),
             calibration: BTreeMap::new(),
@@ -90,7 +90,7 @@ fn default_latency() -> u64 {
 }
 
 fn default_debug_hud() -> bool {
-    true
+    false
 }
 
 fn default_text_scale() -> f32 {

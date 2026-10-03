@@ -150,4 +150,20 @@ Validated in a live 31-hit combat session:
   - `+0x70`: Bone rotation quaternion.
 - **`sp[3]` — Raw Damage:** Exact positive damage value matching `damage` 1:1.
 
+> **Correction (2026-10-02, 166-hit live session, `mhdn-probe diag`):** `sp[2]` is *not* the struck bone.
+> Its values match entries of the monster-list slot table (`0x082CE730 + 0x14`), and the same `sp[2]`
+> appears for hits on different monsters. `sp[2] + 0x40` read `(120.3, 0, -0.1)` for three different
+> targets in one area. The overlay now anchors tap hits on the monster position (`HP − 0x320`) plus the
+> species height and ignores `sp[2]`.
+
+## 8. Scene Detection (correction)
+
+Same session, 5 minutes of continuous hunting with the hunter moving every sample:
+- `in_quest` (`0x08142FE0 == 7`) was true only in short bursts. Most of the hunt read 0.
+- `loading` (`0x00DC5814 == 1`) was 1 for stretches of up to 11 s mid-hunt.
+- The monster-list slot table is empty in the village and populated during the hunt.
+
+The pipeline treats a resolved, non-empty monster list as the hunt. Leaving needs 30 consecutive
+empty samples (about 0.5 s at 60 Hz). The two flags stay in the profile for `record` and further RE.
+
 

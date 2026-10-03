@@ -27,10 +27,17 @@ pub use style::{
     SCREEN_SAVER_LEVEL, STATIONARY,
 };
 pub use track::{
-    system_tracker, track_windows, Display, ListTracker, NullTracker, TrackedWindow, WindowTracker,
+    host_in_front, system_tracker, track_windows, Display, ListTracker, NullTracker, TrackedWindow,
+    WindowTracker,
 };
 
 #[cfg(target_os = "macos")]
-pub use macos::{apply_click_through, tint_spike, MenuStatus};
+pub use macos::{
+    apply_click_through, begin_latency_critical, frontmost_pid, join_active_space,
+    overlay_event_loop, raise_thread_qos, tint_spike, LatencyCritical, MenuStatus,
+};
 #[cfg(not(target_os = "macos"))]
-pub use other::{apply_click_through, MenuStatus};
+pub use other::{
+    apply_click_through, begin_latency_critical, frontmost_pid, join_active_space,
+    overlay_event_loop, raise_thread_qos, LatencyCritical, MenuStatus,
+};

@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use mhdn_fx::{HitKind, MagnitudeWindow, Pool, Spawn};
 use mhdn_game::{Anchor, DamageEvent, DamageKind, MonsterState, Scene, HP_FROM_OBJECT};
-use mhdn_proj::{project, Camera, EdgeMode, ScreenRect};
+use mhdn_proj::{project, Camera, EdgeMode, Projected, ScreenRect};
 use mhdn_render::{glyph_quads, premul, Quad};
 
 /// A forward jump larger than this is a save state, not a dropped sample.
@@ -50,29 +50,43 @@ impl CombatView {
     }
 
     /// Drop numbers when the hunt ends, the frame rewinds, or a save state jumps ahead.
-    pub fn observe(&mut self, scene: Scene, frame: u32) {
+    pub fn observe(&mut self, scene: Scene, frame: u32) -> Option<ResetReason> {
         if !self.seen {
             self.seen = true;
             self.last_scene = scene;
             self.last_frame = frame;
-            return;
+            return None;
         }
-        if should_reset(self.last_scene, scene, self.last_frame, frame) {
+        let reason = reset_reason(self.last_scene, scene, self.last_frame, frame);
+        if reason.is_some() {
             self.clear();
         }
         self.last_scene = scene;
         self.last_frame = frame;
+        reason
     }
 
-    pub fn ingest<F>(&mut self, events: &[DamageEvent], monsters: &[MonsterState], height: F)
+    /// One entry per event: the world anchor it spawned at, or `None` when it was dropped.
+    pub fn ingest<F>(
+        &mut self,
+        events: &[DamageEvent],
+        monsters: &[MonsterState],
+        height: F,
+    ) -> Ingested
     where
         F: Fn(u16, bool) -> f32,
     {
         if self.last_scene != Scene::InQuest {
-            return;
+            return Ingested {
+                gated: true,
+                anchors: vec![None; events.len()],
+            };
         }
+        let mut anchors = Vec::with_capacity(events.len());
         for event in events {
-            let Some(world) = anchor_world(event, monsters, &height) else {
+            let world = anchor_world(event, monsters, &height);
+            anchors.push(world);
+            let Some(world) = world else {
                 continue;
             };
             let style = self.magnitude.style(event.amount, hit_kind(event.kind));
@@ -85,6 +99,35 @@ impl CombatView {
                 seed: event_seed(event),
             });
         }
+        Ingested {
+            gated: false,
+            anchors,
+        }
+    }
+
+    pub fn alive_count(&self) -> usize {
+        self.pool.alive_count()
+    }
+
+    pub fn recount_total(&self) -> u32 {
+        self.recount.total
+    }
+
+    /// Where the live numbers project right now. Same test as `number_quads`.
+    pub fn draw_stats(&self, camera: &Camera, top: ScreenRect) -> DrawStats {
+        let mut stats = DrawStats::default();
+        for live in self.pool.live() {
+            if live.pose.alpha <= 0.0 {
+                continue;
+            }
+            let world = glam::Vec3::new(live.world[0], live.world[1], live.world[2]);
+            match project(world, camera, top, EdgeMode::Hide) {
+                Projected::Visible { .. } => stats.drawn += 1,
+                Projected::OffScreen { .. } => stats.offscreen += 1,
+                Projected::Behind => stats.behind += 1,
+            }
+        }
+        stats
     }
 
     pub fn tick(&mut self, dt: Duration) {
@@ -127,32 +170,58 @@ impl CombatView {
         quads
     }
 
-    pub fn recount_quads(&self, top: ScreenRect) -> Vec<Quad> {
+    /// `px` is the glyph height in physical pixels.
+    pub fn recount_quads(&self, top: ScreenRect, px: f32) -> Vec<Quad> {
         if self.recount.total == 0 {
             return Vec::new();
         }
         let line = format!("DMG {}  DPS {:.0}", self.recount.total, self.recount.dps());
+        let margin = px * 0.5;
         glyph_quads(
             &line,
-            top.x + 8.0,
-            top.y + top.height - 28.0,
-            18.0,
+            top.x + margin,
+            top.y + top.height - px - margin,
+            px,
             premul([1.0, 1.0, 1.0], 0.9),
         )
     }
 }
 
-pub fn should_reset(prev: Scene, next: Scene, prev_frame: u32, frame: u32) -> bool {
+#[derive(Debug, Clone, PartialEq)]
+pub struct Ingested {
+    /// The view was not in a hunt, so nothing spawned.
+    pub gated: bool,
+    pub anchors: Vec<Option<[f32; 3]>>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DrawStats {
+    pub drawn: u32,
+    pub offscreen: u32,
+    pub behind: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResetReason {
+    LeftQuest,
+    Rewind,
+    Jump(u32),
+}
+
+pub fn reset_reason(prev: Scene, next: Scene, prev_frame: u32, frame: u32) -> Option<ResetReason> {
     if prev == Scene::InQuest && next != Scene::InQuest {
-        return true;
+        return Some(ResetReason::LeftQuest);
     }
     if prev == Scene::InQuest && next == Scene::InQuest {
         if frame < prev_frame {
-            return true;
+            return Some(ResetReason::Rewind);
         }
-        return frame.wrapping_sub(prev_frame) > FRAME_JUMP;
+        let jump = frame.wrapping_sub(prev_frame);
+        if jump > FRAME_JUMP {
+            return Some(ResetReason::Jump(jump));
+        }
     }
-    false
+    None
 }
 
 pub fn anchor_world<F>(
@@ -332,7 +401,9 @@ mod tests {
         let quads = view.number_quads(&hunt_camera(), top, 36.0);
         assert!(!quads.is_empty());
         assert!(quads.iter().all(|quad| top.contains(quad.x, quad.y)));
-        assert!(view.recount_quads(top).len() > 4);
+        let recount = view.recount_quads(top, 44.0);
+        assert!(recount.len() > 4);
+        assert!(recount.iter().all(|quad| top.contains(quad.x, quad.y)));
     }
 
     #[test]
@@ -382,6 +453,33 @@ mod tests {
         );
         view.observe(Scene::InQuest, 50);
         assert!(!view.alive());
+    }
+
+    #[test]
+    fn resets_name_their_reason_and_gated_events_report_no_anchor() {
+        let mut view = CombatView::new();
+        assert_eq!(view.observe(Scene::Village, 1), None);
+        let hit = event(5, Anchor::Unknown, DamageKind::Hit);
+        let gated = view.ingest(
+            std::slice::from_ref(&hit),
+            &[monster(0x1000, true)],
+            |_, _| 1.0,
+        );
+        assert!(gated.gated);
+        assert_eq!(gated.anchors, vec![None]);
+
+        assert_eq!(view.observe(Scene::InQuest, 10), None);
+        let spawned = view.ingest(&[hit], &[monster(0x1000, true)], |_, _| 1.0);
+        assert_eq!(spawned.anchors, vec![Some([0.0, 2.0, 0.0])]);
+        assert_eq!(
+            view.observe(Scene::InQuest, 200),
+            Some(ResetReason::Jump(190))
+        );
+        assert_eq!(view.observe(Scene::InQuest, 100), Some(ResetReason::Rewind));
+        assert_eq!(
+            view.observe(Scene::Loading, 101),
+            Some(ResetReason::LeftQuest)
+        );
     }
 
     #[test]

@@ -55,7 +55,7 @@ impl RpcClient {
             let mut buf = [0u8; MAX_PACKET_SIZE];
             let len = match self.recv_datagram(&mut buf) {
                 Ok(n) => n,
-                Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+                Err(e) if crate::client::is_timeout(&e) => {
                     return Err(RpcError::Timeout(self.request_timeout()));
                 }
                 Err(e) => return Err(e.into()),
@@ -76,10 +76,10 @@ impl RpcClient {
                     got: header.packet_type,
                 });
             }
-            let pos = pending
-                .iter()
-                .position(|p| p.id == header.id)
-                .ok_or(RpcError::MissingPipelinedResponse(header.id))?;
+            let Some(pos) = pending.iter().position(|p| p.id == header.id) else {
+                // A reply to an earlier, timed-out request.
+                continue;
+            };
             let p = pending.remove(pos);
             if payload.len() != p.len {
                 return Err(RpcError::ReadFailed { addr: p.addr });

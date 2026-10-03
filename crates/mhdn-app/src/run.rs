@@ -6,19 +6,22 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use glam::Vec3;
 use mhdn_game::{EventQueue, Latest, Profile, Scene, Snapshot};
 use mhdn_platform::{
-    apply_click_through, system_tracker, MenuStatus, OverlayHost, SurfaceUpdate, TrackedWindow,
+    apply_click_through, begin_latency_critical, frontmost_pid, host_in_front, join_active_space,
+    overlay_event_loop, system_tracker, MenuStatus, OverlayHost, SurfaceUpdate, TrackedWindow,
     WindowTracker,
 };
 use mhdn_proj::{
-    parse_layout_settings, resolve, LayoutOption, LayoutSettings, LayoutWatcher, ScreenRect,
+    parse_layout_settings, project, resolve, Camera, EdgeMode, LayoutOption, LayoutSettings,
+    LayoutWatcher, Projected, ScreenRect,
 };
 use mhdn_render::{FrameClock, Quad, RenderError, Renderer};
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalPosition, LogicalSize, PhysicalSize};
 use winit::event::{ElementState, MouseButton, WindowEvent};
-use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+use winit::event_loop::{ActiveEventLoop, ControlFlow};
 use winit::window::{Window, WindowAttributes, WindowId};
 
 use crate::calibrate::{command_from_key, handles, CalibCommand, Calibrator};
@@ -27,12 +30,17 @@ use crate::hud::{build_hud, scene_label, HudStats};
 use crate::numbers::CombatView;
 use crate::session::{sample_rate, RateWindow, RpcMeter, Session};
 use crate::status::{link_state, status_title};
+use crate::trace::Trace;
 
 const POLL: Duration = Duration::from_millis(33);
+const RECOUNT_PT: f32 = 22.0;
+/// The sampler publishes at 4–60 Hz in every scene, including the in-game pause.
+const STALE_AFTER: Duration = Duration::from_secs(2);
 
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let calibrate = std::env::args().any(|arg| arg == "--calibrate");
-    let event_loop = EventLoop::new()?;
+    let _latency = begin_latency_critical();
+    let event_loop = overlay_event_loop()?;
     let mut app = OverlayApp::new(calibrate);
     event_loop.run_app(&mut app)?;
     Ok(())
@@ -58,6 +66,12 @@ struct OverlayApp {
     calibrator: Calibrator,
     cursor: (f32, f32),
     parked: bool,
+    /// Another app owns the keyboard, so the overlay is parked even though Azahar is on screen.
+    behind: bool,
+    /// Times the overlay was reordered onto the active space, e.g. a native fullscreen one.
+    rejoins: u32,
+    /// Samples taken on this thread rather than the sampler thread.
+    pumped: u64,
     events: Arc<EventQueue>,
     combat: CombatView,
     profile: Option<Profile>,
@@ -65,7 +79,9 @@ struct OverlayApp {
     last_tick: Instant,
     menu: Option<MenuStatus>,
     status_text: String,
-    _session: Option<Session>,
+    trace: Option<Trace>,
+    last_snapshot_at: Instant,
+    session: Option<Session>,
 }
 
 impl OverlayApp {
@@ -125,6 +141,9 @@ impl OverlayApp {
             calibrator,
             cursor: (0.0, 0.0),
             parked: false,
+            behind: false,
+            rejoins: 0,
+            pumped: 0,
             events,
             combat: CombatView::new(),
             profile,
@@ -132,7 +151,9 @@ impl OverlayApp {
             last_tick: Instant::now(),
             menu: None,
             status_text: String::new(),
-            _session: session,
+            trace: Trace::from_env(),
+            last_snapshot_at: Instant::now(),
+            session,
         }
     }
 
@@ -145,15 +166,46 @@ impl OverlayApp {
             self.park(&window);
             return;
         };
+        let own_pid = i32::try_from(std::process::id()).unwrap_or(-1);
+        self.behind = !host_in_front(tracked.owner_pid, frontmost_pid(), own_pid);
+        if self.behind && !self.calibrator.active {
+            self.park(&window);
+            return;
+        }
         if self.parked {
             self.parked = false;
             self.host = OverlayHost::new();
+        }
+        if let Ok(true) = join_active_space(&window) {
+            self.rejoins += 1;
+            self.clock.request();
         }
         let update = self
             .host
             .sync(&window, tracked.content_rect, Instant::now());
         if !matches!(update, SurfaceUpdate::Idle) {
             self.clock.request();
+        }
+    }
+
+    /// Game Mode wakes every thread of a background process about 116 ms late, while
+    /// the thread presenting frames keeps vsync. In a fullscreen hunt that thread
+    /// samples, and keeps presenting so it stays on schedule.
+    fn pumping(&self) -> bool {
+        !self.parked
+            && self.tracked.is_some_and(|window| window.is_fullscreen)
+            && self
+                .delay
+                .latest()
+                .is_some_and(|snapshot| snapshot.scene == Scene::InQuest)
+    }
+
+    fn pump(&mut self) {
+        let Some(pump) = self.session.as_ref().and_then(Session::pump) else {
+            return;
+        };
+        if pump.pump() {
+            self.pumped += 1;
         }
     }
 
@@ -173,6 +225,10 @@ impl OverlayApp {
             return;
         };
         self.delay.push(snapshot);
+        self.last_snapshot_at = Instant::now();
+        if let Some(trace) = self.trace.as_mut() {
+            trace.snapshot();
+        }
         if self.config.debug_hud || self.calibrator.active {
             self.clock.request();
         }
@@ -224,7 +280,8 @@ impl OverlayApp {
         self.last_tick = now;
         let was_alive = self.combat.alive();
         self.combat.tick(dt);
-        let newest = self.delay.latest().cloned();
+        let fresh = now.saturating_duration_since(self.last_snapshot_at) < STALE_AFTER;
+        let newest = self.delay.latest().filter(|_| fresh).cloned();
         let scene = newest
             .as_ref()
             .map(|snapshot| snapshot.scene)
@@ -233,7 +290,13 @@ impl OverlayApp {
             .as_ref()
             .map(|snapshot| snapshot.guest_frame)
             .unwrap_or(self.last_frame);
-        self.combat.observe(scene, frame);
+        let reset = self.combat.observe(scene, frame);
+        if let Some(reason) = reset {
+            self.clock.request();
+            if let Some(trace) = self.trace.as_mut() {
+                trace.reset(reason, frame);
+            }
+        }
         if self.events.supported() == Some(false) {
             let _ = self.events.drain();
             self.combat.clear();
@@ -244,16 +307,88 @@ impl OverlayApp {
                 .map(|snapshot| snapshot.monsters.as_slice())
                 .unwrap_or(&[]);
             let profile = self.profile.clone();
-            self.combat.ingest(&events, monsters, |species, large| {
+            let ingested = self.combat.ingest(&events, monsters, |species, large| {
                 profile
                     .as_ref()
                     .map(|profile| profile.species.anchor_for(species, large))
                     .unwrap_or(if large { 150.0 } else { 52.0 })
             });
+            if self.trace.is_some() && !events.is_empty() {
+                let top = self.calibrated_top(self.window_size());
+                let camera = newest
+                    .as_ref()
+                    .and_then(|snapshot| snapshot.camera.as_ref())
+                    .and_then(crate::hud::camera_from);
+                if let Some(trace) = self.trace.as_mut() {
+                    trace.ingest(&events, &ingested, |world| {
+                        screen_label(world, camera.as_ref(), top)
+                    });
+                }
+            }
         }
         if was_alive || self.combat.alive() {
             self.clock.request();
         }
+    }
+
+    fn trace_context(&self) -> String {
+        let size = self.window_size();
+        let top = self.calibrated_top(size);
+        let scale = self
+            .window
+            .as_ref()
+            .map(|window| window.scale_factor())
+            .unwrap_or(0.0);
+        let tracked = self
+            .tracked
+            .map(|window| {
+                format!(
+                    "azahar={:.0},{:.0},{:.0}x{:.0} on={} fs={} wscale={}",
+                    window.content_rect.x,
+                    window.content_rect.y,
+                    window.content_rect.width,
+                    window.content_rect.height,
+                    u8::from(window.onscreen),
+                    u8::from(window.is_fullscreen),
+                    window.scale
+                )
+            })
+            .unwrap_or_else(|| "azahar=none".to_string());
+        let latest = self
+            .delay
+            .latest()
+            .map(|snapshot| {
+                format!(
+                    "scene={:?} frame={} cam={} monsters={}",
+                    snapshot.scene,
+                    snapshot.guest_frame,
+                    u8::from(snapshot.camera.is_some()),
+                    snapshot.monsters.len()
+                )
+            })
+            .unwrap_or_else(|| "scene=none".to_string());
+        format!(
+            "{tracked}\tparked={} behind={} rejoins={}\tsize={}x{} scale={scale}\ttop={:.0},{:.0},{:.0}x{:.0}\t{latest}\talive={}\ttotal={}\tphase={}\trpc={:.0}/s lat={:.2}ms\tticks={} pumped={}",
+            u8::from(self.parked),
+            u8::from(self.behind),
+            self.rejoins,
+            size.width,
+            size.height,
+            top.x,
+            top.y,
+            top.width,
+            top.height,
+            self.combat.alive_count(),
+            self.combat.recount_total(),
+            self.meter.phase(),
+            self.rate.requests_per_sec,
+            self.rate.latency_ms,
+            self.session
+                .as_ref()
+                .and_then(Session::pump)
+                .map_or(0, |pump| pump.ticks()),
+            self.pumped
+        )
     }
 
     fn refresh_status(&mut self) {
@@ -273,6 +408,13 @@ impl OverlayApp {
 
     fn quads(&mut self, size: PhysicalSize<u32>) -> Vec<Quad> {
         let top = self.calibrated_top(size);
+        // Text sizes are in points. The surface is in physical pixels.
+        let ui = self
+            .window
+            .as_ref()
+            .map(|window| window.scale_factor() as f32)
+            .unwrap_or(1.0)
+            .max(1.0);
         sample_rate(&mut self.rate, &self.meter, Instant::now());
         let snapshot = self.delay.sample(self.config.latency()).cloned();
         let mut quads = if self.config.debug_hud {
@@ -292,23 +434,38 @@ impl OverlayApp {
             if let Some(snapshot) = snapshot.as_ref() {
                 self.last_frame = snapshot.guest_frame;
             }
-            build_hud(snapshot.as_ref(), top, &stats, self.config.style.text_scale)
+            build_hud(
+                snapshot.as_ref(),
+                top,
+                &stats,
+                self.config.style.text_scale * ui,
+            )
         } else {
             Vec::new()
         };
         if self.config.style.show_numbers {
-            if let Some(camera) = snapshot
+            let camera = snapshot
                 .as_ref()
-                .and_then(|snapshot| snapshot.camera.as_ref().and_then(crate::hud::camera_from))
-            {
-                quads.extend(
-                    self.combat
-                        .number_quads(&camera, top, self.config.style.number_px),
-                );
+                .and_then(|snapshot| snapshot.camera.as_ref().and_then(crate::hud::camera_from));
+            if let Some(trace) = self.trace.as_mut() {
+                if self.combat.alive() {
+                    trace.draw(
+                        camera
+                            .as_ref()
+                            .map(|camera| self.combat.draw_stats(camera, top)),
+                    );
+                }
+            }
+            if let Some(camera) = camera {
+                quads.extend(self.combat.number_quads(
+                    &camera,
+                    top,
+                    self.config.style.number_px * ui,
+                ));
             }
         }
         if self.config.style.show_recount {
-            quads.extend(self.combat.recount_quads(top));
+            quads.extend(self.combat.recount_quads(top, RECOUNT_PT * ui));
         }
         if self.calibrator.active {
             quads.extend(handles(top));
@@ -379,7 +536,8 @@ impl ApplicationHandler for OverlayApp {
             .with_title("mhdn")
             .with_decorations(false)
             .with_transparent(true)
-            .with_resizable(false);
+            .with_resizable(false)
+            .with_visible(false);
         let window = match event_loop.create_window(attributes) {
             Ok(window) => Arc::new(window),
             Err(err) => {
@@ -391,6 +549,7 @@ impl ApplicationHandler for OverlayApp {
         if let Err(err) = apply_click_through(&window, !self.calibrator.active) {
             eprintln!("mhdn: {err}");
         }
+        window.set_visible(true);
         if self.calibrator.active {
             window.focus_window();
         }
@@ -455,20 +614,42 @@ impl ApplicationHandler for OverlayApp {
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         self.reload_layout();
         self.follow();
+        let pumping = self.pumping();
+        if pumping {
+            self.pump();
+        }
         self.take_snapshot();
         self.refresh_combat();
         self.refresh_status();
-        if self.clock.take() {
+        if self.trace.as_ref().is_some_and(Trace::due) {
+            sample_rate(&mut self.rate, &self.meter, Instant::now());
+            let context = self.trace_context();
+            if let Some(trace) = self.trace.as_mut() {
+                trace.summary(&context);
+            }
+        }
+        if self.clock.take() || pumping {
             if let Some(window) = &self.window {
                 window.request_redraw();
             }
         }
-        let wait = if self.combat.alive() {
+        let wait = if self.combat.alive() || pumping {
             Duration::from_millis(16)
         } else {
             POLL
         };
         event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + wait));
+    }
+}
+
+fn screen_label(world: [f32; 3], camera: Option<&Camera>, top: ScreenRect) -> String {
+    let Some(camera) = camera else {
+        return "nocam".to_string();
+    };
+    match project(Vec3::from_array(world), camera, top, EdgeMode::Hide) {
+        Projected::Visible { x, y } => format!("{x:.0},{y:.0}"),
+        Projected::OffScreen { x, y } => format!("off({x:.0},{y:.0})"),
+        Projected::Behind => "behind".to_string(),
     }
 }
 

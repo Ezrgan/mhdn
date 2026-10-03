@@ -1,4 +1,5 @@
 mod attach;
+mod diag;
 mod dump;
 mod error;
 mod events_cmd;
@@ -178,6 +179,18 @@ enum Commands {
         #[arg(long, default_value_t = 30)]
         seconds: u64,
     },
+    /// Read-only hunt trace plus monster object dumps. Leaves the tap as it is.
+    Diag {
+        #[command(flatten)]
+        conn: ConnArgs,
+        #[arg(long)]
+        profile: PathBuf,
+        #[arg(long, default_value_t = 180)]
+        seconds: u64,
+        /// Output directory for `trace.tsv` and `objs/`.
+        #[arg(long)]
+        out: PathBuf,
+    },
     /// Measure Azahar RPC latency and throughput on localhost.
     BenchRpc {
         /// RPC server address (Azahar default: 127.0.0.1:45987).
@@ -337,6 +350,19 @@ fn run() -> Result<()> {
             profile,
             seconds,
         } => events_cmd::follow(conn.addr, conn.title_id, conn.timeout(), &profile, seconds),
+        Commands::Diag {
+            conn,
+            profile,
+            seconds,
+            out,
+        } => diag::run(
+            conn.addr,
+            conn.title_id,
+            conn.timeout(),
+            &profile,
+            seconds,
+            &out,
+        ),
         Commands::Tap { action } => match action {
             TapCmd::Install { conn } => tap_cmd::install(conn.addr, conn.title_id, conn.timeout()),
             TapCmd::Uninstall { conn } => {

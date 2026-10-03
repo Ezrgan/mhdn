@@ -4,7 +4,7 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use mhdn_rpc::MemorySource;
 
@@ -104,14 +104,146 @@ impl<T> Latest<T> {
     }
 }
 
+/// Pipeline, memory and outputs of one session. The sampler thread and any [`Pump`]
+/// share it, and whichever comes first once the period has elapsed takes the sample.
+pub struct Sampler<M> {
+    mem: M,
+    profile: Profile,
+    pipeline: Pipeline,
+    snapshots: Arc<Latest<Snapshot>>,
+    events: Arc<EventQueue>,
+    started: Instant,
+    last_tick: Option<Instant>,
+    closed: bool,
+    ticks: u64,
+}
+
+impl<M: MemorySource + PatchMemory> Sampler<M> {
+    pub fn new(
+        mem: M,
+        profile: Profile,
+        snapshots: Arc<Latest<Snapshot>>,
+        events: Arc<EventQueue>,
+    ) -> Self {
+        Self {
+            mem,
+            profile,
+            pipeline: Pipeline::new(),
+            snapshots,
+            events,
+            started: Instant::now(),
+            last_tick: None,
+            closed: false,
+            ticks: 0,
+        }
+    }
+
+    pub fn period(&self) -> Duration {
+        sample_period(self.pipeline.scene(), self.pipeline.failures())
+    }
+
+    /// Time left until the next sample is due. Zero when it is due now.
+    pub fn wait(&self, now: Instant) -> Duration {
+        match self.last_tick {
+            Some(last) => self
+                .period()
+                .saturating_sub(now.saturating_duration_since(last)),
+            None => Duration::ZERO,
+        }
+    }
+
+    /// Samples once if the period has elapsed. Returns true when it sampled.
+    pub fn tick_if_due(&mut self, now: Instant) -> bool {
+        if self.closed || !self.wait(now).is_zero() {
+            return false;
+        }
+        self.tick(now);
+        true
+    }
+
+    fn tick(&mut self, now: Instant) {
+        self.last_tick = Some(now);
+        self.ticks += 1;
+        let host_us =
+            u64::try_from(now.saturating_duration_since(self.started).as_micros()).unwrap_or(0);
+        if let Ok(sample) = self.pipeline.poll(&mut self.mem, &self.profile, host_us) {
+            if let Some(snapshot) = sample.snapshot {
+                self.snapshots.publish(snapshot);
+            }
+            for event in sample.events {
+                self.events.push(event);
+            }
+        }
+        let _ = self.pipeline.maintain_tap(&mut self.mem, &self.profile);
+        if let Some(ok) = self.pipeline.supported() {
+            self.events.set_supported(ok);
+        }
+    }
+
+    /// A healthy hunt, the only state where a caller outside the sampler thread may sample.
+    fn pumpable(&self) -> bool {
+        !self.closed && self.pipeline.failures() == 0 && self.pipeline.scene() == Scene::InQuest
+    }
+
+    /// Removes the tap. Later ticks, from any caller, do nothing.
+    pub fn close(&mut self) {
+        if !self.closed {
+            self.closed = true;
+            self.pipeline.shutdown_tap(&mut self.mem);
+        }
+    }
+}
+
+trait Step: Send {
+    fn pump(&mut self, now: Instant) -> bool;
+    fn ticks(&self) -> u64;
+}
+
+impl<M: MemorySource + PatchMemory + Send> Step for Sampler<M> {
+    fn pump(&mut self, now: Instant) -> bool {
+        self.pumpable() && self.tick_if_due(now)
+    }
+
+    fn ticks(&self) -> u64 {
+        self.ticks
+    }
+}
+
+/// Lets a thread the OS keeps on schedule, such as the one presenting frames,
+/// take samples when the sampler thread is being woken late.
+#[derive(Clone)]
+pub struct Pump {
+    step: Arc<Mutex<dyn Step>>,
+}
+
+impl Pump {
+    /// Samples if a hunt is running and the period has elapsed. Never waits for the lock.
+    pub fn pump(&self) -> bool {
+        match self.step.try_lock() {
+            Ok(mut step) => step.pump(Instant::now()),
+            Err(_) => false,
+        }
+    }
+
+    /// Samples taken so far, by any caller.
+    pub fn ticks(&self) -> u64 {
+        self.step.lock().map(|step| step.ticks()).unwrap_or(0)
+    }
+}
+
 pub struct SamplerJoin {
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
+    pump: Pump,
 }
 
 impl SamplerJoin {
     pub fn stop(&self) {
         self.stop.store(true, Ordering::Relaxed);
+    }
+
+    pub fn pump(&self) -> Pump {
+        self.pump.clone()
     }
 }
 
@@ -137,48 +269,38 @@ where
 {
     let stop = Arc::new(AtomicBool::new(false));
     let flag = Arc::clone(&stop);
-    let thread = thread::spawn(move || run_session(mem, profile, flag, snapshots, events, sleep));
+    let shared = Arc::new(Mutex::new(Sampler::new(mem, profile, snapshots, events)));
+    let step: Arc<Mutex<dyn Step>> = shared.clone();
+    let thread = thread::spawn(move || run_session(&shared, &flag, sleep));
     SamplerJoin {
         stop,
         thread: Some(thread),
+        pump: Pump { step },
     }
 }
 
-pub fn run_session<M, S>(
-    mut mem: M,
-    profile: Profile,
-    stop: Arc<AtomicBool>,
-    snapshots: Arc<Latest<Snapshot>>,
-    events: Arc<EventQueue>,
-    mut sleep: S,
-) where
+pub fn run_session<M, S>(sampler: &Mutex<Sampler<M>>, stop: &AtomicBool, mut sleep: S)
+where
     M: MemorySource + PatchMemory,
     S: FnMut(Duration),
 {
-    let mut pipeline = Pipeline::new();
-    let mut host_us = 0u64;
     while !stop.load(Ordering::Relaxed) {
-        let period = sample_period(pipeline.scene(), pipeline.failures());
-        if let Ok(sample) = pipeline.poll(&mut mem, &profile, host_us) {
-            if let Some(snapshot) = sample.snapshot {
-                snapshots.publish(snapshot);
-            }
-            for event in sample.events {
-                events.push(event);
-            }
-        }
-        let _ = pipeline.maintain_tap(&mut mem, &profile);
-        if let Some(ok) = pipeline.supported() {
-            events.set_supported(ok);
-        }
+        let wait = {
+            let mut sampler = sampler.lock().expect("sampler");
+            let now = Instant::now();
+            sampler.tick_if_due(now);
+            sampler.wait(Instant::now()).max(MIN_SLEEP)
+        };
         if stop.load(Ordering::Relaxed) {
             break;
         }
-        sleep(period);
-        host_us = host_us.saturating_add(u64::try_from(period.as_micros()).unwrap_or(u64::MAX));
+        sleep(wait);
     }
-    pipeline.shutdown_tap(&mut mem);
+    sampler.lock().expect("sampler").close();
 }
+
+/// Keeps the thread from spinning when another caller has just sampled.
+const MIN_SLEEP: Duration = Duration::from_millis(1);
 
 #[cfg(test)]
 mod tests {
@@ -260,7 +382,9 @@ mod tests {
         let sleep_count = Arc::clone(&sleeps);
         let image_for_sleep = Arc::clone(&shared);
         let thread = thread::spawn(move || {
-            run_session(mem, profile, flag, snapshots, events, move |_| {
+            let sampler = StdMutex::new(Sampler::new(mem, profile, snapshots, events));
+            run_session(&sampler, &flag, move |wait| {
+                thread::sleep(wait);
                 let n = sleep_count.fetch_add(1, Ordering::Relaxed);
                 if n == 3 {
                     let hook = image_for_sleep
@@ -279,6 +403,53 @@ mod tests {
         assert!(saw.load(Ordering::Relaxed), "tap branch was not installed");
         let restored = shared_hook(&shared);
         assert_eq!(restored, EXPECTED_HOOK);
+    }
+
+    fn sampler_for(hunting: bool) -> Sampler<crate::sparse::SparseMemory> {
+        use crate::sparse::SparseMemory;
+        use crate::support::{live_profile, place_monster, stage_hunt};
+
+        let mut profile = live_profile();
+        profile.meta.fingerprint.clear();
+        let mut image = SparseMemory::new();
+        stage_hunt(&mut image, &profile, 1, false, false);
+        if hunting {
+            place_monster(&mut image, 0, 500, 500, 1, [0.0, 0.0, 0.0], 0);
+        }
+        Sampler::new(
+            image,
+            profile,
+            Arc::new(Latest::new()),
+            Arc::new(EventQueue::new(8)),
+        )
+    }
+
+    #[test]
+    fn a_sample_is_taken_once_per_period_and_never_after_close() {
+        let mut sampler = sampler_for(true);
+        let t0 = Instant::now();
+        assert!(sampler.tick_if_due(t0));
+        assert!(!sampler.tick_if_due(t0 + Duration::from_millis(1)));
+        assert!(sampler.tick_if_due(t0 + Duration::from_secs(1)));
+        sampler.close();
+        assert!(!sampler.tick_if_due(t0 + Duration::from_secs(5)));
+        assert_eq!(sampler.ticks, 2);
+    }
+
+    #[test]
+    fn the_pump_samples_only_in_a_hunt() {
+        let mut village = sampler_for(false);
+        let mut hunt = sampler_for(true);
+        let mut now = Instant::now();
+        for _ in 0..8 {
+            village.tick_if_due(now);
+            hunt.tick_if_due(now);
+            now += Duration::from_secs(1);
+        }
+        assert!(!Step::pump(&mut village, now));
+        assert!(Step::pump(&mut hunt, now));
+        hunt.close();
+        assert!(!Step::pump(&mut hunt, now + Duration::from_secs(1)));
     }
 
     fn shared_hook(mem: &Arc<std::sync::Mutex<crate::sparse::SparseMemory>>) -> u32 {

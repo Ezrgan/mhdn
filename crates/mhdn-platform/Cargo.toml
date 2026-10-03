@@ -18,6 +18,7 @@ core-foundation = "0.10.1"
 objc2 = "0.6.4"
 objc2-app-kit = { version = "0.3.2", default-features = false, features = [
     "std",
+    "libc",
     "objc2-core-foundation",
     "NSApplication",
     "NSColor",
@@ -31,5 +32,6 @@ objc2-app-kit = { version = "0.3.2", default-features = false, features = [
     "NSStatusItem",
     "NSView",
     "NSWindow",
+    "NSWorkspace",
 ] }
 objc2-foundation = "0.3.2"
