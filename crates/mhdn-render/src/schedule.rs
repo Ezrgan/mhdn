@@ -55,9 +55,96 @@ impl FrameClock {
     }
 }
 
+/// How the next frame should be produced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Paint {
+    /// Ask the window system for a redraw and draw when it arrives.
+    Request,
+    /// The window system never answered, so draw right now.
+    Now,
+}
+
+/// Frames asked for with no redraw delivered before the window system is given up on.
+const STALLED_AFTER: u32 = 20;
+
+/// Notices a window that never receives its redraw event. On Windows a layered
+/// click-through window can sit without `WM_PAINT` forever, so `request_redraw` is a
+/// no-op and nothing is ever drawn. Once that is seen, frames are drawn inline for the
+/// rest of the run. A disabled watch always asks for a redraw.
+#[derive(Debug)]
+pub struct PaintWatch {
+    enabled: bool,
+    pending: u32,
+    stalled: bool,
+}
+
+impl PaintWatch {
+    pub fn new(enabled: bool) -> Self {
+        Self {
+            enabled,
+            pending: 0,
+            stalled: false,
+        }
+    }
+
+    /// Call each time a frame is due.
+    pub fn frame(&mut self) -> Paint {
+        if !self.enabled {
+            return Paint::Request;
+        }
+        if self.stalled || self.pending >= STALLED_AFTER {
+            self.stalled = true;
+            return Paint::Now;
+        }
+        self.pending += 1;
+        Paint::Request
+    }
+
+    /// Call whenever a frame is drawn.
+    pub fn drawn(&mut self) {
+        self.pending = 0;
+    }
+
+    pub fn stalled(&self) -> bool {
+        self.stalled
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_watch_that_is_answered_never_draws_inline() {
+        let mut watch = PaintWatch::new(true);
+        for _ in 0..200 {
+            assert_eq!(watch.frame(), Paint::Request);
+            watch.drawn();
+        }
+        assert!(!watch.stalled());
+    }
+
+    #[test]
+    fn unanswered_requests_switch_to_inline_drawing_for_good() {
+        let mut watch = PaintWatch::new(true);
+        for _ in 0..STALLED_AFTER {
+            assert_eq!(watch.frame(), Paint::Request);
+        }
+        assert_eq!(watch.frame(), Paint::Now);
+        assert!(watch.stalled());
+        // Drawing inline resets the count but does not hand control back.
+        watch.drawn();
+        assert_eq!(watch.frame(), Paint::Now);
+    }
+
+    #[test]
+    fn a_disabled_watch_always_requests() {
+        let mut watch = PaintWatch::new(false);
+        for _ in 0..200 {
+            assert_eq!(watch.frame(), Paint::Request);
+        }
+        assert!(!watch.stalled());
+    }
 
     #[test]
     fn alpha_mode_prefers_premultiplied() {

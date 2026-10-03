@@ -30,9 +30,10 @@ use windows_sys::Win32::UI::HiDpi::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GetClientRect, GetForegroundWindow, GetWindowLongPtrW, GetWindowThreadProcessId,
-    IsIconic, IsWindowVisible, SetWindowLongPtrW, SetWindowPos, GWL_EXSTYLE, HWND_TOPMOST,
-    SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, WS_EX_APPWINDOW, WS_EX_LAYERED,
-    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT,
+    IsIconic, IsWindowVisible, SetLayeredWindowAttributes, SetWindowLongPtrW, SetWindowPos,
+    GWL_EXSTYLE, HWND_TOPMOST, LWA_ALPHA, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+    WS_EX_APPWINDOW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+    WS_EX_TRANSPARENT,
 };
 use winit::error::EventLoopError;
 use winit::event_loop::EventLoop;
@@ -69,6 +70,7 @@ pub fn apply_click_through(window: &Window, click_through: bool) -> Result<(), P
     window.set_window_level(WindowLevel::AlwaysOnTop);
     let _ = window.set_cursor_hittest(!click_through);
     reassert_style(hwnd, click_through);
+    arm_layered(hwnd);
     Ok(())
 }
 
@@ -149,6 +151,12 @@ fn hwnd(window: &Window) -> Result<HWND, PlatformError> {
     Ok(win32.hwnd.get() as HWND)
 }
 
+/// A layered window is not shown, and gets no `WM_PAINT`, until its layered attributes
+/// have been set once. Full opacity keeps the per-pixel alpha of the swapchain intact.
+fn arm_layered(hwnd: HWND) {
+    unsafe { SetLayeredWindowAttributes(hwnd, 0, 255, LWA_ALPHA) };
+}
+
 /// Returns true when the style had to change.
 fn reassert_style(hwnd: HWND, click_through: bool) -> bool {
     let current = unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) } as u32;
@@ -168,6 +176,7 @@ fn reassert_style(hwnd: HWND, click_through: bool) -> bool {
             SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED,
         );
     }
+    arm_layered(hwnd);
     true
 }
 

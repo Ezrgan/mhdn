@@ -17,7 +17,8 @@ pub use error::RenderError;
 pub use font::{glyph_quads, text_quads};
 pub use gpu::{required_device_limits, PresentStats, Renderer};
 pub use schedule::{
-    pick_format, premul, select_alpha_mode, FrameClock, POWER_PREFERENCE, PRESENT_MODE,
+    pick_format, premul, select_alpha_mode, FrameClock, Paint, PaintWatch, POWER_PREFERENCE,
+    PRESENT_MODE,
 };
 
 pub const SHADER: &str = include_str!("shader.wgsl");
