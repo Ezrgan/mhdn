@@ -36,7 +36,7 @@ jobs:
         run: bash tools/package-macos.sh
 
       - name: Zip macOS bundle
-        run: ditto -c -k --sequesterResource --keepParent dist/mhdn.app mhdn-macos-universal.zip
+        run: ditto -c -k --keepParent dist/mhdn.app mhdn-macos-universal.zip
 
       - name: Upload to GitHub Release
         uses: softprops/action-gh-release@v2
