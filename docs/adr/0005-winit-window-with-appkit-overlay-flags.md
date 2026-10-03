@@ -46,3 +46,19 @@ on other hosts the same winit window is created and the AppKit call is a no-op.
   on macOS; covering Azahar in fullscreen stays a manual check.
 - **Follow-ups:** Phase 5.2 finds the Azahar window. Phase 5.3 moves this window onto that rectangle.
   Calibration (5.6) turns `ignoresMouseEvents` off while the user drags the screen rect.
+
+## Addendum: native fullscreen and Game Mode (measured)
+
+- **Space membership.** Setting the flags after winit shows the window as a regular app is not enough. The
+  window stayed on the desktop space and never appeared in Azahar's fullscreen space. The event loop now
+  starts with the accessory policy, and the window is created hidden, configured, and then shown. `follow()`
+  reorders it with `orderFrontRegardless` if it is ever off the active space.
+- **Game Mode throttling.** Fullscreen Azahar turns on Game Mode. While it is on, every wake-up of every
+  thread in our process lands about 116 ms late. This was measured with `tools/sleepprobe.swift` and holds
+  for default QoS, user-interactive QoS, a Mach time-constraint (real-time) thread, and a `CVDisplayLink`
+  callback. The sampler fell from about 57 to 8 samples/s, so the text moved in steps. RPC latency did not
+  change (0.12 ms), and neither `NSActivityLatencyCritical` nor a QoS raise helped.
+- **What still runs on time.** The main thread keeps vsync pace while it presents frames. In a fullscreen
+  hunt it now renders continuously and takes samples itself through `mhdn_game::Pump` whenever the period
+  is due. That brings the rate back to about 42 samples/s, above the game's 30 fps. Windowed play is
+  unchanged: the sampler thread keeps up and the main thread never samples.

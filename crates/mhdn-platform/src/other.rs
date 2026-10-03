@@ -11,6 +11,25 @@ pub fn apply_click_through(
     Ok(())
 }
 
+pub fn overlay_event_loop() -> Result<winit::event_loop::EventLoop<()>, winit::error::EventLoopError>
+{
+    winit::event_loop::EventLoop::new()
+}
+
+pub fn join_active_space(_window: &winit::window::Window) -> Result<bool, PlatformError> {
+    Ok(false)
+}
+
+pub struct LatencyCritical;
+
+pub fn begin_latency_critical() -> LatencyCritical {
+    LatencyCritical
+}
+
+pub fn raise_thread_qos() -> bool {
+    false
+}
+
 pub fn frontmost_pid() -> Option<i32> {
     None
 }

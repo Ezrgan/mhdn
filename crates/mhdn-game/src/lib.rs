@@ -31,7 +31,7 @@ pub use profile::{
     MonsterList, ObservedWindow, Profile, ProfileError, SceneFlag, Selection, SpeciesProfile,
     TapRing, MHXX_JP_TITLE_ID,
 };
-pub use sampler::{sample_period, spawn, EventQueue, Latest, SamplerJoin};
+pub use sampler::{sample_period, spawn, EventQueue, Latest, Pump, Sampler, SamplerJoin};
 pub use scene::Scene;
 pub use tap::{
     install as tap_install, read_events as tap_read_events, uninstall as tap_uninstall,

@@ -9,8 +9,9 @@ use std::time::{Duration, Instant};
 use glam::Vec3;
 use mhdn_game::{EventQueue, Latest, Profile, Scene, Snapshot};
 use mhdn_platform::{
-    apply_click_through, frontmost_pid, host_in_front, system_tracker, MenuStatus, OverlayHost,
-    SurfaceUpdate, TrackedWindow, WindowTracker,
+    apply_click_through, begin_latency_critical, frontmost_pid, host_in_front, join_active_space,
+    overlay_event_loop, system_tracker, MenuStatus, OverlayHost, SurfaceUpdate, TrackedWindow,
+    WindowTracker,
 };
 use mhdn_proj::{
     parse_layout_settings, project, resolve, Camera, EdgeMode, LayoutOption, LayoutSettings,
@@ -20,7 +21,7 @@ use mhdn_render::{FrameClock, Quad, RenderError, Renderer};
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalPosition, LogicalSize, PhysicalSize};
 use winit::event::{ElementState, MouseButton, WindowEvent};
-use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+use winit::event_loop::{ActiveEventLoop, ControlFlow};
 use winit::window::{Window, WindowAttributes, WindowId};
 
 use crate::calibrate::{command_from_key, handles, CalibCommand, Calibrator};
@@ -38,7 +39,8 @@ const STALE_AFTER: Duration = Duration::from_secs(2);
 
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let calibrate = std::env::args().any(|arg| arg == "--calibrate");
-    let event_loop = EventLoop::new()?;
+    let _latency = begin_latency_critical();
+    let event_loop = overlay_event_loop()?;
     let mut app = OverlayApp::new(calibrate);
     event_loop.run_app(&mut app)?;
     Ok(())
@@ -66,6 +68,10 @@ struct OverlayApp {
     parked: bool,
     /// Another app owns the keyboard, so the overlay is parked even though Azahar is on screen.
     behind: bool,
+    /// Times the overlay was reordered onto the active space, e.g. a native fullscreen one.
+    rejoins: u32,
+    /// Samples taken on this thread rather than the sampler thread.
+    pumped: u64,
     events: Arc<EventQueue>,
     combat: CombatView,
     profile: Option<Profile>,
@@ -75,7 +81,7 @@ struct OverlayApp {
     status_text: String,
     trace: Option<Trace>,
     last_snapshot_at: Instant,
-    _session: Option<Session>,
+    session: Option<Session>,
 }
 
 impl OverlayApp {
@@ -136,6 +142,8 @@ impl OverlayApp {
             cursor: (0.0, 0.0),
             parked: false,
             behind: false,
+            rejoins: 0,
+            pumped: 0,
             events,
             combat: CombatView::new(),
             profile,
@@ -145,7 +153,7 @@ impl OverlayApp {
             status_text: String::new(),
             trace: Trace::from_env(),
             last_snapshot_at: Instant::now(),
-            _session: session,
+            session,
         }
     }
 
@@ -168,11 +176,36 @@ impl OverlayApp {
             self.parked = false;
             self.host = OverlayHost::new();
         }
+        if let Ok(true) = join_active_space(&window) {
+            self.rejoins += 1;
+            self.clock.request();
+        }
         let update = self
             .host
             .sync(&window, tracked.content_rect, Instant::now());
         if !matches!(update, SurfaceUpdate::Idle) {
             self.clock.request();
+        }
+    }
+
+    /// Game Mode wakes every thread of a background process about 116 ms late, while
+    /// the thread presenting frames keeps vsync. In a fullscreen hunt that thread
+    /// samples, and keeps presenting so it stays on schedule.
+    fn pumping(&self) -> bool {
+        !self.parked
+            && self.tracked.is_some_and(|window| window.is_fullscreen)
+            && self
+                .delay
+                .latest()
+                .is_some_and(|snapshot| snapshot.scene == Scene::InQuest)
+    }
+
+    fn pump(&mut self) {
+        let Some(pump) = self.session.as_ref().and_then(Session::pump) else {
+            return;
+        };
+        if pump.pump() {
+            self.pumped += 1;
         }
     }
 
@@ -335,9 +368,10 @@ impl OverlayApp {
             })
             .unwrap_or_else(|| "scene=none".to_string());
         format!(
-            "{tracked}\tparked={} behind={}\tsize={}x{} scale={scale}\ttop={:.0},{:.0},{:.0}x{:.0}\t{latest}\talive={}\ttotal={}\tphase={}",
+            "{tracked}\tparked={} behind={} rejoins={}\tsize={}x{} scale={scale}\ttop={:.0},{:.0},{:.0}x{:.0}\t{latest}\talive={}\ttotal={}\tphase={}\trpc={:.0}/s lat={:.2}ms\tticks={} pumped={}",
             u8::from(self.parked),
             u8::from(self.behind),
+            self.rejoins,
             size.width,
             size.height,
             top.x,
@@ -346,7 +380,14 @@ impl OverlayApp {
             top.height,
             self.combat.alive_count(),
             self.combat.recount_total(),
-            self.meter.phase()
+            self.meter.phase(),
+            self.rate.requests_per_sec,
+            self.rate.latency_ms,
+            self.session
+                .as_ref()
+                .and_then(Session::pump)
+                .map_or(0, |pump| pump.ticks()),
+            self.pumped
         )
     }
 
@@ -495,7 +536,8 @@ impl ApplicationHandler for OverlayApp {
             .with_title("mhdn")
             .with_decorations(false)
             .with_transparent(true)
-            .with_resizable(false);
+            .with_resizable(false)
+            .with_visible(false);
         let window = match event_loop.create_window(attributes) {
             Ok(window) => Arc::new(window),
             Err(err) => {
@@ -507,6 +549,7 @@ impl ApplicationHandler for OverlayApp {
         if let Err(err) = apply_click_through(&window, !self.calibrator.active) {
             eprintln!("mhdn: {err}");
         }
+        window.set_visible(true);
         if self.calibrator.active {
             window.focus_window();
         }
@@ -571,21 +614,26 @@ impl ApplicationHandler for OverlayApp {
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         self.reload_layout();
         self.follow();
+        let pumping = self.pumping();
+        if pumping {
+            self.pump();
+        }
         self.take_snapshot();
         self.refresh_combat();
         self.refresh_status();
         if self.trace.as_ref().is_some_and(Trace::due) {
+            sample_rate(&mut self.rate, &self.meter, Instant::now());
             let context = self.trace_context();
             if let Some(trace) = self.trace.as_mut() {
                 trace.summary(&context);
             }
         }
-        if self.clock.take() {
+        if self.clock.take() || pumping {
             if let Some(window) = &self.window {
                 window.request_redraw();
             }
         }
-        let wait = if self.combat.alive() {
+        let wait = if self.combat.alive() || pumping {
             Duration::from_millis(16)
         } else {
             POLL

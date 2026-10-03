@@ -3,11 +3,11 @@
 #![forbid(unsafe_code)]
 
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use mhdn_game::{spawn, Latest, PatchMemory, Profile, Snapshot, TapError, MHXX_JP_TITLE_ID};
+use mhdn_game::{spawn, Latest, PatchMemory, Profile, Pump, Snapshot, TapError, MHXX_JP_TITLE_ID};
 use mhdn_rpc::{MemorySource, RpcClient};
 
 const RPC_ADDR: &str = "127.0.0.1:45987";
@@ -108,9 +108,12 @@ pub fn sample_rate(window: &mut RateWindow, meter: &RpcMeter, now: Instant) {
     window.last_at = now;
 }
 
+type PumpSlot = Arc<Mutex<Option<Pump>>>;
+
 pub struct Session {
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
+    pump: PumpSlot,
 }
 
 impl Session {
@@ -122,12 +125,21 @@ impl Session {
     ) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&stop);
-        let thread =
-            thread::spawn(move || run_until_stopped(profile, snapshots, meter, events, flag));
+        let pump = PumpSlot::default();
+        let slot = Arc::clone(&pump);
+        let thread = thread::spawn(move || {
+            run_until_stopped(profile, snapshots, meter, events, flag, slot);
+        });
         Self {
             stop,
             thread: Some(thread),
+            pump,
         }
+    }
+
+    /// Handle for sampling from the caller's thread while a game is attached.
+    pub fn pump(&self) -> Option<Pump> {
+        self.pump.lock().ok().and_then(|slot| slot.clone())
     }
 }
 
@@ -146,6 +158,7 @@ fn run_until_stopped(
     meter: Arc<RpcMeter>,
     events: Arc<mhdn_game::EventQueue>,
     stop: Arc<AtomicBool>,
+    pump: PumpSlot,
 ) {
     while !stop.load(Ordering::Relaxed) {
         match connect() {
@@ -161,14 +174,16 @@ fn run_until_stopped(
                     profile.clone(),
                     Arc::clone(&snapshots),
                     Arc::clone(&events),
-                    thread::sleep,
+                    sampler_sleep(),
                 );
+                set_pump(&pump, Some(join.pump()));
                 while !stop.load(Ordering::Relaxed) {
                     if events.supported() == Some(false) {
                         meter.set_phase(PHASE_UNSUPPORTED);
                     }
                     thread::sleep(Duration::from_millis(100));
                 }
+                set_pump(&pump, None);
                 drop(join);
                 meter.set_up(false);
                 if !stop.load(Ordering::Relaxed) {
@@ -186,6 +201,26 @@ fn run_until_stopped(
                 thread::sleep(Duration::from_secs(1));
             }
         }
+    }
+}
+
+fn set_pump(slot: &PumpSlot, pump: Option<Pump>) {
+    if let Ok(mut slot) = slot.lock() {
+        *slot = pump;
+    }
+}
+
+/// The sampler owns its thread, so the QoS is raised on its first sleep.
+fn sampler_sleep() -> impl FnMut(Duration) + Send + 'static {
+    let mut raised = false;
+    move |period| {
+        if !raised {
+            raised = true;
+            if !mhdn_platform::raise_thread_qos() {
+                eprintln!("mhdn: sampler thread kept its default QoS");
+            }
+        }
+        thread::sleep(period);
     }
 }
 

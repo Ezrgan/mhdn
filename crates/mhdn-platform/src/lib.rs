@@ -32,6 +32,12 @@ pub use track::{
 };
 
 #[cfg(target_os = "macos")]
-pub use macos::{apply_click_through, frontmost_pid, tint_spike, MenuStatus};
+pub use macos::{
+    apply_click_through, begin_latency_critical, frontmost_pid, join_active_space,
+    overlay_event_loop, raise_thread_qos, tint_spike, LatencyCritical, MenuStatus,
+};
 #[cfg(not(target_os = "macos"))]
-pub use other::{apply_click_through, frontmost_pid, MenuStatus};
+pub use other::{
+    apply_click_through, begin_latency_critical, frontmost_pid, join_active_space,
+    overlay_event_loop, raise_thread_qos, LatencyCritical, MenuStatus,
+};

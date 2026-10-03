@@ -1,14 +1,18 @@
 //! AppKit adjustments on the winit `NSWindow`. See `docs/adr/0005`.
 
 use objc2::rc::Retained;
+use objc2::runtime::{NSObjectProtocol, ProtocolObject};
 use objc2::MainThreadMarker;
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSColor, NSScreenSaverWindowLevel, NSStatusBar,
     NSStatusItem, NSVariableStatusItemLength, NSView, NSWindow, NSWindowCollectionBehavior,
     NSWorkspace,
 };
-use objc2_foundation::NSString;
+use objc2_foundation::{NSActivityOptions, NSProcessInfo, NSString};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+use winit::error::EventLoopError;
+use winit::event_loop::EventLoop;
+use winit::platform::macos::{ActivationPolicy, EventLoopBuilderExtMacOS};
 use winit::window::Window;
 
 use crate::error::PlatformError;
@@ -37,6 +41,57 @@ pub fn apply_click_through(window: &Window, click_through: bool) -> Result<(), P
     ns_window.setLevel(NSScreenSaverWindowLevel);
     ns_window.setCollectionBehavior(collection_behavior());
     Ok(())
+}
+
+/// Event loop for an accessory app. Space membership is decided when a window is
+/// first ordered in, and a regular app's windows never join another app's
+/// native fullscreen space.
+pub fn overlay_event_loop() -> Result<EventLoop<()>, EventLoopError> {
+    EventLoop::builder()
+        .with_activation_policy(ActivationPolicy::Accessory)
+        .with_activate_ignoring_other_apps(false)
+        .build()
+}
+
+/// Shows the overlay on the active space. Returns true when it had to be reordered.
+pub fn join_active_space(window: &Window) -> Result<bool, PlatformError> {
+    let ns_window = ns_window(window)?;
+    if ns_window.isVisible() && ns_window.isOnActiveSpace() {
+        return Ok(false);
+    }
+    ns_window.orderFrontRegardless();
+    Ok(true)
+}
+
+/// Keeps App Nap and timer coalescing off while alive. Without it, an accessory app
+/// under Game Mode sees its 16 ms sampler sleeps stretch to about 120 ms.
+pub struct LatencyCritical {
+    token: Retained<ProtocolObject<dyn NSObjectProtocol>>,
+}
+
+pub fn begin_latency_critical() -> LatencyCritical {
+    let token = NSProcessInfo::processInfo().beginActivityWithOptions_reason(
+        NSActivityOptions::UserInteractive,
+        &NSString::from_str("mhdn follows the game frame by frame"),
+    );
+    LatencyCritical { token }
+}
+
+impl Drop for LatencyCritical {
+    fn drop(&mut self) {
+        unsafe { NSProcessInfo::processInfo().endActivity(&self.token) };
+    }
+}
+
+const QOS_CLASS_USER_INTERACTIVE: u32 = 0x21;
+
+extern "C" {
+    fn pthread_set_qos_class_self_np(qos_class: u32, relative_priority: i32) -> i32;
+}
+
+/// Puts the calling thread in the user-interactive QoS class. Returns false if the kernel refused.
+pub fn raise_thread_qos() -> bool {
+    unsafe { pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0) == 0 }
 }
 
 /// Process id of the app that owns the keyboard. `None` when AppKit has no answer.
