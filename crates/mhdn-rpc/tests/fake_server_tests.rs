@@ -122,13 +122,16 @@ fn live_bss_write_roundtrip() {
     client.write(0x00D3_2000, &original).unwrap();
 }
 
+/// Well past the client timeout. Windows can stretch `SO_RCVTIMEO` by hundreds of milliseconds.
+const LATE_REPLY: Duration = Duration::from_millis(800);
+
 #[test]
 fn late_replies_after_a_timeout_do_not_desync_later_reads() {
     let (server, state) = FakeRpcServer::bind();
     {
         let mut st = state.lock().unwrap();
         st.memory.insert(0x3000, vec![1, 2, 3, 4]);
-        st.latency = Duration::from_millis(80);
+        st.latency = LATE_REPLY;
     }
     let mut client = RpcClient::connect(server.addr(), Duration::from_millis(30)).unwrap();
     let mut buf = [0u8; 4];
@@ -140,7 +143,7 @@ fn late_replies_after_a_timeout_do_not_desync_later_reads() {
         assert_eq!(buf, [1, 2, 3, 4]);
     }
 
-    state.lock().unwrap().latency = Duration::from_millis(80);
+    state.lock().unwrap().latency = LATE_REPLY;
     let mut reqs = [ReadReq {
         addr: 0x3000,
         buf: &mut buf,
