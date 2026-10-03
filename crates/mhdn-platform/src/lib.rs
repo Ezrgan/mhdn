@@ -48,15 +48,17 @@ pub use track::{
 #[cfg(target_os = "macos")]
 pub use macos::{
     apply_click_through, begin_latency_critical, frontmost_pid, join_active_space,
-    overlay_event_loop, raise_thread_qos, tint_spike, LatencyCritical, MenuStatus,
+    overlay_event_loop, raise_thread_qos, set_overlay_parked, tint_spike, LatencyCritical,
+    MenuStatus,
 };
 #[cfg(not(any(target_os = "macos", windows)))]
 pub use other::{
     apply_click_through, begin_latency_critical, frontmost_pid, join_active_space,
-    overlay_event_loop, raise_thread_qos, LatencyCritical, MenuStatus,
+    overlay_event_loop, raise_thread_qos, set_overlay_parked, LatencyCritical, MenuStatus,
 };
 #[cfg(windows)]
 pub use windows::{
     apply_click_through, begin_latency_critical, frontmost_pid, join_active_space,
-    overlay_event_loop, raise_thread_qos, tint_spike, LatencyCritical, MenuStatus,
+    overlay_event_loop, raise_thread_qos, set_overlay_parked, tint_spike, LatencyCritical,
+    MenuStatus,
 };

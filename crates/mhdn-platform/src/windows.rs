@@ -1,17 +1,19 @@
 //! Win32 backend: find the Azahar window, follow it, and keep the winit window
-//! topmost and click-through.
+//! topmost, click-through and transparent.
 //!
 //! Only borderless windowed and borderless fullscreen are supported. Exclusive
-//! fullscreen owns the display, so no ordinary window can draw over it.
+//! fullscreen owns the display, so no ordinary window can draw over it; that case is
+//! detected in [`WinTracker::poll`] and the overlay parks rather than sitting on the
+//! desktop behind the game.
 //!
-//! This file has not been compiled on Windows yet. The geometry and style decisions live
-//! in `win_geom`, which is tested on every host.
+//! The geometry and style decisions live in `win_geom`, which is tested on every host.
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::mem::size_of;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use windows_sys::core::BOOL;
@@ -28,11 +30,14 @@ use windows_sys::Win32::UI::HiDpi::{
     GetDpiForMonitor, SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
     MDT_EFFECTIVE_DPI,
 };
+use windows_sys::Win32::UI::Shell::{
+    SHQueryUserNotificationState, QUERY_USER_NOTIFICATION_STATE, QUNS_RUNNING_D3D_FULL_SCREEN,
+};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GetClientRect, GetForegroundWindow, GetWindowLongPtrW, GetWindowThreadProcessId,
-    IsIconic, IsWindowVisible, SetLayeredWindowAttributes, SetWindowLongPtrW, SetWindowPos,
-    GWL_EXSTYLE, HWND_TOPMOST, LWA_ALPHA, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
-    WS_EX_APPWINDOW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+    IsIconic, IsWindowVisible, SetWindowLongPtrW, SetWindowPos, GWL_EXSTYLE, HWND_NOTOPMOST,
+    HWND_TOPMOST, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, WS_EX_APPWINDOW,
+    WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
     WS_EX_TRANSPARENT,
 };
 use winit::error::EventLoopError;
@@ -44,8 +49,9 @@ use crate::geom::Insets;
 use crate::select::HostWindow;
 use crate::track::{track_windows, Display, TrackedWindow, WindowTracker};
 use crate::win_geom::{
-    display, host_window, is_azahar_exe, overlay_ex_style, windows_insets, RawMonitor, RawWindow,
-    BASE_DPI, EX_APPWINDOW, EX_LAYERED, EX_NOACTIVATE, EX_TOOLWINDOW, EX_TOPMOST, EX_TRANSPARENT,
+    display, host_display, host_window, is_azahar_exe, needs_raise, overlay_ex_style,
+    parked_ex_style, windows_insets, HostDisplay, RawMonitor, RawWindow, BASE_DPI, EX_APPWINDOW,
+    EX_LAYERED, EX_NOACTIVATE, EX_NOREDIRECTIONBITMAP, EX_TOOLWINDOW, EX_TOPMOST, EX_TRANSPARENT,
 };
 use crate::OverlayUserEvent;
 
@@ -56,21 +62,33 @@ const _: () = assert!(EX_TOPMOST == WS_EX_TOPMOST);
 const _: () = assert!(EX_NOACTIVATE == WS_EX_NOACTIVATE);
 const _: () = assert!(EX_TOOLWINDOW == WS_EX_TOOLWINDOW);
 const _: () = assert!(EX_APPWINDOW == WS_EX_APPWINDOW);
+const _: () = assert!(EX_NOREDIRECTIONBITMAP == WS_EX_NOREDIRECTIONBITMAP);
 
 /// Last mode requested, so `join_active_space` can repair the style the same way.
 static CLICK_THROUGH: AtomicBool = AtomicBool::new(true);
+/// The overlay's own window, so the tracker poll can look for it in the z-order.
+static OVERLAY_HWND: AtomicUsize = AtomicUsize::new(0);
+/// Set by the tracker poll when the host has moved above the overlay, e.g. by going
+/// borderless fullscreen. Consumed by `join_active_space`.
+static RAISE: AtomicBool = AtomicBool::new(false);
 
 /// Topmost, click-through, no focus, no taskbar button. `click_through` is false while
 /// calibration needs the mouse and the keyboard.
+///
+/// Click-through is `WS_EX_TRANSPARENT`, set here rather than through winit's
+/// `set_cursor_hittest`: winit implements that one as `WS_EX_TRANSPARENT |
+/// WS_EX_LAYERED`, and a layered window is composited with a single alpha for the
+/// whole surface, which hides the per-pixel alpha the swapchain produces.
 pub fn apply_click_through(window: &Window, click_through: bool) -> Result<(), PlatformError> {
     let hwnd = hwnd(window)?;
     CLICK_THROUGH.store(click_through, Ordering::Relaxed);
+    OVERLAY_HWND.store(hwnd as usize, Ordering::Relaxed);
     // Winit owns the window flags and rewrites the whole extended style when one
     // changes, so go through it first and add the remaining bits afterwards.
     window.set_window_level(WindowLevel::AlwaysOnTop);
-    let _ = window.set_cursor_hittest(!click_through);
-    reassert_style(hwnd, click_through);
-    arm_layered(hwnd);
+    if !reassert_style(hwnd, click_through) {
+        raise(hwnd);
+    }
     Ok(())
 }
 
@@ -78,11 +96,55 @@ pub fn overlay_event_loop() -> Result<EventLoop<OverlayUserEvent>, EventLoopErro
     EventLoop::<OverlayUserEvent>::with_user_event().build()
 }
 
-/// Windows has no spaces. Winit may reset the extended style when the window is shown,
-/// so this puts the overlay style back. It returns true only when it had to.
+/// Windows has no spaces, but it has the same two problems the macOS call solves:
+/// winit resets the extended style whenever it touches a window flag, and a game that
+/// goes borderless fullscreen lands in front of the overlay. This puts the style back
+/// and raises the overlay again. It returns true only when it had to.
 pub fn join_active_space(window: &Window) -> Result<bool, PlatformError> {
     let hwnd = hwnd(window)?;
-    Ok(reassert_style(hwnd, CLICK_THROUGH.load(Ordering::Relaxed)))
+    let restyled = reassert_style(hwnd, CLICK_THROUGH.load(Ordering::Relaxed));
+    let raised = RAISE.swap(false, Ordering::Relaxed);
+    if raised && !restyled {
+        raise(hwnd);
+    }
+    Ok(restyled || raised)
+}
+
+/// Takes the overlay out of the way while another app owns the keyboard, and brings it
+/// back afterwards. Shrinking the window is not enough on Windows: `WS_EX_TOPMOST`
+/// keeps even a one-pixel window in front of every normal window, so the parked
+/// overlay is hidden and dropped out of the topmost band.
+pub fn set_overlay_parked(window: &Window, parked: bool) -> Result<(), PlatformError> {
+    let hwnd = hwnd(window)?;
+    if parked {
+        // Hidden first: winit rebuilds the whole extended style when a flag changes,
+        // and a visible overlay without `TOOLWINDOW` grows a taskbar button.
+        window.set_visible(false);
+        window.set_window_level(WindowLevel::Normal);
+        let current = ex_style(hwnd);
+        let wanted = parked_ex_style(current);
+        if wanted != current {
+            unsafe {
+                SetWindowLongPtrW(hwnd, GWL_EXSTYLE, wanted as isize);
+                SetWindowPos(
+                    hwnd,
+                    HWND_NOTOPMOST,
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+                );
+            }
+        }
+    } else {
+        window.set_window_level(WindowLevel::AlwaysOnTop);
+        window.set_visible(true);
+        if !reassert_style(hwnd, CLICK_THROUGH.load(Ordering::Relaxed)) {
+            raise(hwnd);
+        }
+    }
+    Ok(())
 }
 
 pub struct LatencyCritical;
@@ -151,15 +213,28 @@ fn hwnd(window: &Window) -> Result<HWND, PlatformError> {
     Ok(win32.hwnd.get() as HWND)
 }
 
-/// A layered window is not shown, and gets no `WM_PAINT`, until its layered attributes
-/// have been set once. Full opacity keeps the per-pixel alpha of the swapchain intact.
-fn arm_layered(hwnd: HWND) {
-    unsafe { SetLayeredWindowAttributes(hwnd, 0, 255, LWA_ALPHA) };
+fn ex_style(hwnd: HWND) -> u32 {
+    unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32 }
+}
+
+/// Puts the overlay back at the top of the topmost band without activating it.
+fn raise(hwnd: HWND) {
+    unsafe {
+        SetWindowPos(
+            hwnd,
+            HWND_TOPMOST,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+        )
+    };
 }
 
 /// Returns true when the style had to change.
 fn reassert_style(hwnd: HWND, click_through: bool) -> bool {
-    let current = unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) } as u32;
+    let current = ex_style(hwnd);
     let wanted = overlay_ex_style(current, click_through);
     if wanted == current {
         return false;
@@ -176,9 +251,21 @@ fn reassert_style(hwnd: HWND, click_through: bool) -> bool {
             SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED,
         );
     }
-    arm_layered(hwnd);
     true
 }
+
+/// True while a Direct3D application owns the display in exclusive mode. Azahar's
+/// borderless fullscreen does not set this; a real exclusive-mode game does, and
+/// nothing another process creates is composited over it.
+fn d3d_exclusive_fullscreen() -> bool {
+    let mut state: QUERY_USER_NOTIFICATION_STATE = 0;
+    let result = unsafe { SHQueryUserNotificationState(&mut state) };
+    result >= 0 && state == QUNS_RUNNING_D3D_FULL_SCREEN
+}
+
+/// How often the shell is asked whether Direct3D owns the display. It is a shell32
+/// round trip and the answer only changes when a game switches mode.
+const EXCLUSIVE_POLL: Duration = Duration::from_millis(250);
 
 /// Polls Win32 for Azahar windows. Coordinates are logical, see `win_geom`.
 pub struct WinTracker {
@@ -186,6 +273,8 @@ pub struct WinTracker {
     preferred_id: Option<u32>,
     /// Executable path per process, so a poll does not reopen every process.
     images: HashMap<u32, String>,
+    exclusive: bool,
+    exclusive_checked: Option<Instant>,
 }
 
 impl WinTracker {
@@ -197,10 +286,32 @@ impl WinTracker {
             insets,
             preferred_id: None,
             images: HashMap::new(),
+            exclusive: false,
+            exclusive_checked: None,
         }
     }
 
-    fn azahar_windows(&mut self) -> Vec<HostWindow> {
+    /// Only asked while the host fills a monitor and owns the keyboard, which is the
+    /// only shape exclusive fullscreen can have.
+    fn exclusive_fullscreen(&mut self, tracked: &TrackedWindow) -> bool {
+        if !tracked.is_fullscreen || frontmost_pid() != Some(tracked.owner_pid) {
+            self.exclusive = false;
+            return false;
+        }
+        let now = Instant::now();
+        if self
+            .exclusive_checked
+            .is_none_or(|then| now.saturating_duration_since(then) >= EXCLUSIVE_POLL)
+        {
+            self.exclusive_checked = Some(now);
+            self.exclusive = d3d_exclusive_fullscreen();
+        }
+        self.exclusive
+    }
+
+    /// Azahar's windows, plus every top-level window in z-order, top first, the way
+    /// `EnumWindows` hands them over.
+    fn azahar_windows(&mut self) -> (Vec<HostWindow>, Vec<usize>) {
         let mut handles: Vec<HWND> = Vec::new();
         unsafe {
             EnumWindows(
@@ -208,6 +319,7 @@ impl WinTracker {
                 &mut handles as *mut Vec<HWND> as LPARAM,
             );
         }
+        let z_order: Vec<usize> = handles.iter().map(|hwnd| *hwnd as usize).collect();
         let own_pid = std::process::id();
         let mut seen = HashSet::new();
         let mut windows = Vec::new();
@@ -234,13 +346,13 @@ impl WinTracker {
             }
         }
         self.images.retain(|pid, _| seen.contains(pid));
-        windows
+        (windows, z_order)
     }
 }
 
 impl WindowTracker for WinTracker {
     fn poll(&mut self) -> Option<TrackedWindow> {
-        let windows = self.azahar_windows();
+        let (windows, z_order) = self.azahar_windows();
         let displays = list_displays();
         let tracked = track_windows(
             &windows,
@@ -249,7 +361,23 @@ impl WindowTracker for WinTracker {
             None,
             self.preferred_id,
         )?;
+        let exclusive = self.exclusive_fullscreen(&tracked);
+        if host_display(tracked.is_fullscreen, exclusive) == HostDisplay::Exclusive {
+            // Direct3D owns the display. Reporting the window would put the overlay on
+            // the desktop underneath it, where it is both invisible and in the way.
+            return None;
+        }
         self.preferred_id = Some(tracked.id);
+        let overlay = OVERLAY_HWND.load(Ordering::Relaxed);
+        if let Some(host) = z_order
+            .iter()
+            .copied()
+            .find(|hwnd| (hwnd & 0xFFFF_FFFF) as u32 == tracked.id)
+        {
+            if overlay != 0 && needs_raise(&z_order, overlay, host) {
+                RAISE.store(true, Ordering::Relaxed);
+            }
+        }
         Some(tracked)
     }
 
