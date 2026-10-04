@@ -1,8 +1,10 @@
 //! Install and read the damage-tap code patch. Addresses stay in [`stub`] until
 //! the profile grows a `[damage_tap]` section (plan 3.1).
 
+mod callers;
 mod stub;
 
+pub use callers::{CALLER_HIT, CALLER_MOUNT_TOPPLE, CALLER_STATUS};
 pub use stub::{
     hook_branch, stub_bytes, wide_stub_bytes, TapEvent, CAPACITY, CAVE_ADDR, ENTRY_SIZE,
     EXPECTED_HOOK, EXPECTED_HP_STORE, EXPECTED_NEXT, HOOK_ADDR, RETURN_ADDR, RING_ADDR,

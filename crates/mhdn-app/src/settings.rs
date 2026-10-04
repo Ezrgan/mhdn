@@ -3,13 +3,13 @@
 //! Plain data and decisions. No windowing and no UI toolkit, so it is testable on its own.
 //! Every default reproduces the look the overlay had before this window existed.
 //!
-//! The damage tap only distinguishes what `mhdn-fx` styles today: three magnitude bands
-//! of ordinary hits and poison ticks. There is no critical flag in the tap, so there is
-//! no critical category here.
+//! The damage tap distinguishes three magnitude bands of ordinary hits, poison and other
+//! status ticks, and the fixed damage from toppling a mounted monster. There is no
+//! critical flag in the tap, so there is no critical category here.
 
 #![forbid(unsafe_code)]
 
-use mhdn_fx::{ORANGE, POISON, WHITE, YELLOW};
+use mhdn_fx::{ORANGE, POISON, TOPPLE, WHITE, YELLOW};
 use serde::{Deserialize, Serialize};
 
 /// Glyph height of a floating number, in points. The value the overlay always used.
@@ -28,16 +28,19 @@ pub enum Category {
     Medium,
     /// A hit above the 85th percentile: the bigger, orange spike.
     Large,
-    /// A poison tick.
+    /// A poison tick, and other status damage from the same caller.
     Poison,
+    /// Fixed damage from toppling a mounted monster.
+    Topple,
 }
 
 impl Category {
-    pub const ALL: [Category; 4] = [
+    pub const ALL: [Category; 5] = [
         Category::Small,
         Category::Medium,
         Category::Large,
         Category::Poison,
+        Category::Topple,
     ];
 
     pub fn label(self) -> &'static str {
@@ -46,6 +49,7 @@ impl Category {
             Category::Medium => "Medium hits",
             Category::Large => "Large hits (spikes)",
             Category::Poison => "Poison",
+            Category::Topple => "Mount topple",
         }
     }
 
@@ -56,12 +60,15 @@ impl Category {
             Category::Medium => YELLOW,
             Category::Large => ORANGE,
             Category::Poison => POISON,
+            Category::Topple => TOPPLE,
         }
     }
 
     /// Which category a spawned number belongs to, from the color the pool stored for it.
     pub fn from_spawn_rgb(rgb: [f32; 3]) -> Category {
-        if rgb == POISON {
+        if rgb == TOPPLE {
+            Category::Topple
+        } else if rgb == POISON {
             Category::Poison
         } else if rgb == ORANGE {
             Category::Large
@@ -99,6 +106,8 @@ pub struct NumberSettings {
     pub large: CategoryStyle,
     #[serde(default = "poison")]
     pub poison: CategoryStyle,
+    #[serde(default = "topple")]
+    pub topple: CategoryStyle,
 }
 
 impl Default for NumberSettings {
@@ -108,6 +117,7 @@ impl Default for NumberSettings {
             medium: medium(),
             large: large(),
             poison: poison(),
+            topple: topple(),
         }
     }
 }
@@ -119,6 +129,7 @@ impl NumberSettings {
             Category::Medium => &self.medium,
             Category::Large => &self.large,
             Category::Poison => &self.poison,
+            Category::Topple => &self.topple,
         }
     }
 
@@ -128,6 +139,7 @@ impl NumberSettings {
             Category::Medium => &mut self.medium,
             Category::Large => &mut self.large,
             Category::Poison => &mut self.poison,
+            Category::Topple => &mut self.topple,
         }
     }
 
@@ -205,6 +217,10 @@ fn poison() -> CategoryStyle {
     CategoryStyle::standard(Category::Poison)
 }
 
+fn topple() -> CategoryStyle {
+    CategoryStyle::standard(Category::Topple)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -223,6 +239,9 @@ mod tests {
         assert_eq!(numbers.medium.rgb, YELLOW);
         assert_eq!(numbers.large.rgb, ORANGE);
         assert_eq!(numbers.poison.rgb, POISON);
+        assert_eq!(numbers.topple.rgb, TOPPLE);
+        assert!(numbers.topple.show);
+        assert_eq!(Category::Topple.label(), "Mount topple");
         assert_eq!(DEFAULT_NUMBER_PX, 36.0);
     }
 
@@ -256,6 +275,9 @@ mod tests {
         let mut window = MagnitudeWindow::new();
         let poison = window.style(3, HitKind::Poison);
         assert_eq!(Category::from_spawn_rgb(poison.rgb), Category::Poison);
+        let topple = window.style(150, HitKind::Topple);
+        assert_eq!(Category::from_spawn_rgb(topple.rgb), Category::Topple);
+        assert!((topple.scale - 1.25).abs() < 0.001);
         for amount in 1..=20 {
             window.style(amount, HitKind::Hit);
         }
@@ -288,6 +310,32 @@ mod tests {
         numbers.get_mut(Category::Large).rgb = [0.0, 1.0, 0.0];
         assert_eq!(numbers.color_for(ORANGE), Some([0.0, 1.0, 0.0]));
         assert_eq!(numbers.color_for(YELLOW), Some(YELLOW));
+    }
+
+    #[test]
+    fn an_old_config_without_topple_loads_the_default_mount_topple_style() {
+        let old = "\
+[small]
+show = true
+rgb = [1.0, 1.0, 1.0]
+
+[medium]
+show = true
+rgb = [1.0, 0.95, 0.62]
+
+[large]
+show = true
+rgb = [1.0, 0.55, 0.12]
+
+[poison]
+show = false
+rgb = [0.72, 0.42, 0.95]
+";
+        let loaded: NumberSettings = toml::from_str(old).expect("old numbers section parses");
+        assert!(!loaded.poison.show);
+        assert_eq!(loaded.topple, NumberSettings::default().topple);
+        assert_eq!(loaded.topple.rgb, TOPPLE);
+        assert!(loaded.topple.show);
     }
 
     #[test]

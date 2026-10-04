@@ -15,7 +15,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::numbers::DrawStats;
 use crate::session::{sample_rate, RateWindow, RpcMeter};
-use mhdn_game::{DamageConfidence, DamageEvent, EventSource, MonsterState, Scene};
+use mhdn_game::{DamageConfidence, DamageEvent, DamageKind, EventSource, MonsterState, Scene};
 
 /// Stamped into the start line so a log says which build wrote it.
 pub const BUILD: &str = concat!("v0.4.0-dev+", env!("MHDN_GIT_SHA"));
@@ -191,8 +191,9 @@ pub fn format_dmg(event: &DamageEvent) -> String {
         ),
     };
     let mut line = format!(
-        "dmg source={} confidence={} amount={} mon=0x{mon:08X} species={species} gen={generation} max_hp={max_hp} hp_before={} hp_after={} frames={} lr=0x{:08X}",
+        "dmg source={} kind={} confidence={} amount={} mon=0x{mon:08X} species={species} gen={generation} max_hp={max_hp} hp_before={} hp_after={} frames={} lr=0x{:08X}",
         source_name(event.source),
+        kind_name(event.kind),
         confidence_name(event.confidence),
         event.amount,
         opt_u32(event.hp_before),
@@ -240,6 +241,16 @@ pub fn scene_identity(scene: Scene, monsters: &[MonsterState]) -> String {
         ));
     }
     key
+}
+
+fn kind_name(kind: DamageKind) -> &'static str {
+    match kind {
+        DamageKind::Hit => "hit",
+        DamageKind::Poison => "poison",
+        DamageKind::Status => "status",
+        DamageKind::Topple => "topple",
+        DamageKind::Unknown => "unknown",
+    }
 }
 
 fn source_name(source: EventSource) -> &'static str {
@@ -511,7 +522,7 @@ mod tests {
         };
         assert_eq!(
             format_dmg(&tap),
-            "dmg source=tap confidence=exact amount=42 mon=0x300E0E38 species=30 gen=1 max_hp=720 hp_before=700 hp_after=658 frames=1 lr=0x008BA260 r3=0x08123456 sp=0x00000001,0x0000005A,0x082CE744,0x0000002A,0x0000000E"
+            "dmg source=tap kind=hit confidence=exact amount=42 mon=0x300E0E38 species=30 gen=1 max_hp=720 hp_before=700 hp_after=658 frames=1 lr=0x008BA260 r3=0x08123456 sp=0x00000001,0x0000005A,0x082CE744,0x0000002A,0x0000000E"
         );
 
         let mut passive = tap.clone();
@@ -532,7 +543,7 @@ mod tests {
         passive.tap_sp = None;
         assert_eq!(
             format_dmg(&passive),
-            "dmg source=passive confidence=aggregated_hp_delta amount=682 mon=0x300E0E38 species=30 gen=2 max_hp=720 hp_before=720 hp_after=38 frames=12 lr=0x00000000"
+            "dmg source=passive kind=hit confidence=aggregated_hp_delta amount=682 mon=0x300E0E38 species=30 gen=2 max_hp=720 hp_before=720 hp_after=38 frames=12 lr=0x00000000"
         );
 
         let mut unknown = tap;
@@ -548,8 +559,16 @@ mod tests {
         unknown.tap_sp = None;
         assert_eq!(
             format_dmg(&unknown),
-            "dmg source=plugin confidence=exact amount=8 mon=0x08200000 species=- gen=- max_hp=- hp_before=- hp_after=- frames=- lr=0x00000000"
+            "dmg source=plugin kind=hit confidence=exact amount=8 mon=0x08200000 species=- gen=- max_hp=- hp_before=- hp_after=- frames=- lr=0x00000000"
         );
+
+        let mut status = unknown;
+        status.kind = DamageKind::Status;
+        assert!(format_dmg(&status).contains("kind=status"));
+        status.kind = DamageKind::Topple;
+        assert!(format_dmg(&status).contains("kind=topple"));
+        status.kind = DamageKind::Poison;
+        assert!(format_dmg(&status).contains("kind=poison"));
     }
 
     #[test]

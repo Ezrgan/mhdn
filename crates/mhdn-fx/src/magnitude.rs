@@ -1,6 +1,7 @@
 //! Color and size from the last 50 hits of this hunt.
 //!
-//! Poison stays out of the window: it is a small purple tick, not a hit.
+//! Poison and other status stay out of the window: they are small purple ticks, not hits.
+//! Mount-topple damage stays out too, and keeps the large size.
 
 #![forbid(unsafe_code)]
 
@@ -13,11 +14,14 @@ pub const WHITE: [f32; 3] = [1.0, 1.0, 1.0];
 pub const YELLOW: [f32; 3] = [1.0, 0.95, 0.62];
 pub const ORANGE: [f32; 3] = [1.0, 0.55, 0.12];
 pub const POISON: [f32; 3] = [0.72, 0.42, 0.95];
+/// Mount-topple numbers. Distinct from the hit bands so settings can recolor them.
+pub const TOPPLE: [f32; 3] = [0.22, 0.82, 0.94];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HitKind {
     Hit,
     Poison,
+    Topple,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -57,12 +61,20 @@ impl MagnitudeWindow {
     }
 
     pub fn style(&mut self, amount: u32, kind: HitKind) -> HitStyle {
-        if kind == HitKind::Poison {
-            return HitStyle {
+        match kind {
+            HitKind::Poison => HitStyle {
                 rgb: POISON,
                 scale: 0.75,
-            };
+            },
+            HitKind::Topple => HitStyle {
+                rgb: TOPPLE,
+                scale: 1.25,
+            },
+            HitKind::Hit => self.hit_style(amount),
         }
+    }
+
+    fn hit_style(&mut self, amount: u32) -> HitStyle {
         if self.values.len() == WINDOW {
             self.values.pop_front();
         }
@@ -140,6 +152,15 @@ mod tests {
         let style = window.style(5, HitKind::Poison);
         assert_eq!(style.rgb, POISON);
         assert!((style.scale - 0.75).abs() < 0.001);
+        assert_eq!(window.len(), 0);
+    }
+
+    #[test]
+    fn topple_is_large_and_cyan_and_does_not_enter_the_window() {
+        let mut window = MagnitudeWindow::new();
+        let style = window.style(150, HitKind::Topple);
+        assert_eq!(style.rgb, TOPPLE);
+        assert!((style.scale - 1.25).abs() < 0.001);
         assert_eq!(window.len(), 0);
     }
 }
