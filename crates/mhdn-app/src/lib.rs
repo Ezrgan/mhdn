@@ -6,6 +6,7 @@ mod calibrate;
 mod config;
 mod diag;
 mod hud;
+mod meter;
 mod numbers;
 mod run;
 mod session;

@@ -2,6 +2,7 @@
 
 #![forbid(unsafe_code)]
 
+mod attacker;
 mod chain;
 mod damage;
 mod model;
@@ -19,6 +20,7 @@ mod track;
 #[cfg(test)]
 mod support;
 
+pub use attacker::{Attacker, AttackerFilter, DEFAULT_ATTACKER_FILTER_ATTACKERS};
 pub use chain::{ChainError, ChainStep, PointerCache};
 pub use damage::{
     events_from_tap, overkill, tap_sum_for, DamageConfidence, DamageEvent, DamageKind, EventSource,
