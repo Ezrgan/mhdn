@@ -276,6 +276,7 @@ impl OverlayApp {
         let Some(snapshot) = self.snapshots.take() else {
             return;
         };
+        self.diag.note_guest_frame(snapshot.guest_frame);
         self.delay.push(snapshot);
         self.diag.snapshot();
         self.last_snapshot_at = Instant::now();
@@ -353,6 +354,7 @@ impl OverlayApp {
         if self.events.supported() == Some(false) {
             let dropped = self.events.drain();
             self.diag.events(dropped.len());
+            log_damage(&mut self.diag, &dropped);
             if let Some(first) = dropped.first() {
                 if self.diag.first_event() {
                     diag::line(&format!(
@@ -365,6 +367,7 @@ impl OverlayApp {
         } else {
             let events = self.events.drain();
             self.diag.events(events.len());
+            log_damage(&mut self.diag, &events);
             let monsters = newest
                 .as_ref()
                 .map(|snapshot| snapshot.monsters.as_slice())
@@ -542,13 +545,16 @@ impl OverlayApp {
         self.diag
             .changed("settings_focused", settings_focused.to_string());
         let fresh = Instant::now().saturating_duration_since(self.last_snapshot_at) < STALE_AFTER;
-        let scene = self
-            .delay
-            .latest()
-            .filter(|_| fresh)
+        let latest = self.delay.latest().filter(|_| fresh);
+        let scene = latest
             .map(|snapshot| snapshot.scene)
             .unwrap_or(Scene::Disconnected);
-        self.diag.changed("scene", format!("{scene:?}"));
+        let monsters = latest
+            .map(|snapshot| snapshot.monsters.as_slice())
+            .unwrap_or(&[]);
+        if let Some(text) = self.diag.scene_change(scene, monsters) {
+            diag::line(&text);
+        }
         let tap = if self.session.is_none() {
             "no session"
         } else if self.events.tap_installed() {
@@ -983,6 +989,8 @@ impl ApplicationHandler<OverlayUserEvent> for OverlayApp {
             &self.meter,
             self.combat.alive_count(),
             self.pumped,
+            self.events.tap_installed(),
+            self.events.lost_tap(),
         );
         if self.trace.as_ref().is_some_and(Trace::due) {
             sample_rate(&mut self.rate, &self.meter, Instant::now());
@@ -1097,5 +1105,12 @@ fn load_profile() -> Option<Profile> {
             eprintln!("mhdn: embedded profile: {err}");
             None
         }
+    }
+}
+
+fn log_damage(diag: &mut Diag, events: &[mhdn_game::DamageEvent]) {
+    for event in events {
+        diag.note_damage(event.source, event.amount);
+        diag::line(&diag::format_dmg(event));
     }
 }

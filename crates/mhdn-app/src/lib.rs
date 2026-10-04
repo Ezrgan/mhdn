@@ -5,6 +5,7 @@
 mod calibrate;
 mod config;
 mod diag;
+mod git_sha;
 mod hud;
 mod numbers;
 mod run;

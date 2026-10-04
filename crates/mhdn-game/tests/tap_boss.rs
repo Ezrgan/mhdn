@@ -25,6 +25,8 @@ fn boss_kill_sums_to_one_point_of_overkill() {
             r3: 0,
             lr,
             stack: [0; 5],
+            stack_hi: [0; 11],
+            sp_len: 5,
         });
     }
 
