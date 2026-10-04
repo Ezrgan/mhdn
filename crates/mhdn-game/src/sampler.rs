@@ -37,6 +37,7 @@ pub struct EventQueue {
     supported: AtomicU8,
     /// 0 not installed, 1 installed, 2 blocked by a foreign hook or an occupied cave.
     tap: AtomicU8,
+    lost_tap: AtomicU64,
 }
 
 impl EventQueue {
@@ -48,6 +49,7 @@ impl EventQueue {
             dropped: AtomicU64::new(0),
             supported: AtomicU8::new(0),
             tap: AtomicU8::new(0),
+            lost_tap: AtomicU64::new(0),
         }
     }
 
@@ -111,6 +113,14 @@ impl EventQueue {
     pub fn tap_blocked(&self) -> bool {
         self.tap.load(Ordering::Relaxed) == 2
     }
+
+    pub fn set_lost_tap(&self, lost: u64) {
+        self.lost_tap.store(lost, Ordering::Relaxed);
+    }
+
+    pub fn lost_tap(&self) -> u64 {
+        self.lost_tap.load(Ordering::Relaxed)
+    }
 }
 
 #[derive(Debug)]
@@ -164,7 +174,7 @@ impl<M: MemorySource + PatchMemory> Sampler<M> {
         Self {
             mem,
             profile,
-            pipeline: Pipeline::new(),
+            pipeline: Pipeline::from_env(),
             snapshots,
             events,
             started: Instant::now(),
@@ -219,6 +229,7 @@ impl<M: MemorySource + PatchMemory> Sampler<M> {
         }
         self.events
             .set_tap(self.pipeline.tap_installed(), self.pipeline.tap_blocked());
+        self.events.set_lost_tap(self.pipeline.lost_tap());
     }
 
     /// A healthy hunt, the only state where a caller outside the sampler thread may sample.
@@ -363,6 +374,12 @@ mod tests {
             key: None,
             anchor: crate::model::Anchor::Unknown,
             part_hp: None,
+            hp_before: None,
+            hp_after: None,
+            frames_since: None,
+            tap_r3: None,
+            tap_sp: None,
+            tap_sp_hi: None,
         }
     }
 

@@ -137,6 +137,7 @@ mod tests {
             visible: true,
             large: max_hp >= 400,
             poisoned: false,
+            slot: 0,
         }
     }
 

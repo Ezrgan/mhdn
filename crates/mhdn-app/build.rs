@@ -1,6 +1,42 @@
+#[path = "src/git_sha.rs"]
+mod git_sha;
+
 fn main() {
+    let sha = git_short_sha();
+    println!("cargo:rustc-env=MHDN_GIT_SHA={sha}");
+    if let Some(head) = git_head_path() {
+        println!("cargo:rerun-if-changed={head}");
+    }
+
     #[cfg(windows)]
     embed_windows_icon();
+}
+
+fn git_short_sha() -> String {
+    match std::process::Command::new("git")
+        .args(["rev-parse", "--short", "HEAD"])
+        .output()
+    {
+        Ok(output) => git_sha::normalize(&output.stdout, output.status.success()),
+        Err(_) => "unknown".to_string(),
+    }
+}
+
+fn git_head_path() -> Option<String> {
+    let output = std::process::Command::new("git")
+        .args(["rev-parse", "--absolute-git-dir"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let dir = String::from_utf8(output.stdout).ok()?;
+    let dir = dir.trim();
+    if dir.is_empty() {
+        None
+    } else {
+        Some(format!("{dir}/HEAD"))
+    }
 }
 
 #[cfg(windows)]

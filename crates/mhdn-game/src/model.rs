@@ -63,6 +63,8 @@ pub struct MonsterState {
     pub visible: bool,
     pub large: bool,
     pub poisoned: bool,
+    /// Index in the monster-list slot table. Empty slots are omitted, so this is not the vec index.
+    pub slot: u32,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -86,4 +88,5 @@ pub(crate) struct RawMonster {
     pub visible: bool,
     pub large: bool,
     pub poisoned: bool,
+    pub slot: u32,
 }

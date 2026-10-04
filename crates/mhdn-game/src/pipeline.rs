@@ -9,8 +9,8 @@ use crate::profile::Profile;
 use crate::scene::{Scene, SceneMachine};
 use crate::snapshot::{capture, CaptureCache, RejectedRead, SnapshotError};
 use crate::tap::{
-    hook_branch, install, uninstall, InstallOutcome, PatchMemory, TapError, TapEvent, ENTRY_SIZE,
-    HOOK_ADDR, RING_ADDR, WRITE_SEQ_ADDR,
+    hook_branch, install, install_wide, uninstall, InstallOutcome, PatchMemory, RingLayout,
+    TapError, TapEvent, HOOK_ADDR, RING_ADDR, WIDE_ENTRY_SIZE,
 };
 use crate::track::MonsterTrack;
 
@@ -39,6 +39,7 @@ pub struct Pipeline {
     tap_installed: bool,
     tap_blocked: bool,
     plugin_present: Option<bool>,
+    wide: bool,
 }
 
 impl Default for Pipeline {
@@ -49,6 +50,15 @@ impl Default for Pipeline {
 
 impl Pipeline {
     pub fn new() -> Self {
+        Self::with_wide(false)
+    }
+
+    /// Reads `MHDN_TAP_WIDE` once, when the session starts.
+    pub fn from_env() -> Self {
+        Self::with_wide(crate::tap::wide_requested())
+    }
+
+    pub fn with_wide(wide: bool) -> Self {
         Self {
             scene: SceneMachine::new(),
             track: MonsterTrack::default(),
@@ -63,6 +73,15 @@ impl Pipeline {
             tap_installed: false,
             tap_blocked: false,
             plugin_present: None,
+            wide,
+        }
+    }
+
+    fn ring(&self) -> RingLayout {
+        if self.wide {
+            RingLayout::wide()
+        } else {
+            RingLayout::standard()
         }
     }
 
@@ -175,6 +194,7 @@ impl Pipeline {
                 visible: raw.visible,
                 large: raw.large,
                 poisoned: raw.poisoned,
+                slot: raw.slot,
             })
             .collect();
         Ok(Sample {
@@ -214,7 +234,11 @@ impl Pipeline {
         if self.scene.committed() != Scene::InQuest {
             return Ok(());
         }
-        match install(mem) {
+        match if self.wide {
+            install_wide(mem)
+        } else {
+            install(mem)
+        } {
             Ok(InstallOutcome::Installed | InstallOutcome::AlreadyInstalled) => {
                 self.adopt_tap(mem);
                 Ok(())
@@ -222,6 +246,7 @@ impl Pipeline {
             Err(
                 TapError::ForeignHook { .. }
                 | TapError::CaveOccupied
+                | TapError::RingOccupied
                 | TapError::UnexpectedWord { .. },
             ) => {
                 self.tap_blocked = true;
@@ -245,7 +270,7 @@ impl Pipeline {
         if self.tap_installed {
             return;
         }
-        if let Ok(seq) = read_patch_u32(mem, WRITE_SEQ_ADDR) {
+        if let Ok(seq) = read_patch_u32(mem, self.ring().write_seq) {
             self.last_tap_seq = seq;
             self.tap_installed = true;
         }
@@ -311,7 +336,8 @@ impl Pipeline {
     }
 
     fn read_new_taps(&mut self, mem: &mut dyn MemorySource) -> Vec<TapEvent> {
-        let Ok(write_seq) = mem.read_u32(WRITE_SEQ_ADDR) else {
+        let layout = self.ring();
+        let Ok(write_seq) = mem.read_u32(layout.write_seq) else {
             return Vec::new();
         };
         if write_seq == 0 || write_seq == self.last_tap_seq {
@@ -319,19 +345,24 @@ impl Pipeline {
         }
         if self.last_tap_seq != 0 {
             let gap = write_seq.wrapping_sub(self.last_tap_seq);
-            if gap > 64 {
-                self.lost_tap = self.lost_tap.saturating_add(u64::from(gap - 64));
+            if gap > layout.capacity {
+                self.lost_tap = self
+                    .lost_tap
+                    .saturating_add(u64::from(gap - layout.capacity));
             }
         }
-        let start = write_seq.saturating_sub(64).max(self.last_tap_seq);
+        let start = write_seq
+            .saturating_sub(layout.capacity)
+            .max(self.last_tap_seq);
         let mut events = Vec::new();
         for seq in (start + 1)..=write_seq {
-            let addr = RING_ADDR + (seq % 64) * ENTRY_SIZE;
-            let mut buf = [0u8; ENTRY_SIZE as usize];
-            if mem.read(addr, &mut buf).is_err() {
+            let addr = RING_ADDR + (seq % layout.capacity) * layout.entry_size;
+            let mut buf = [0u8; WIDE_ENTRY_SIZE as usize];
+            let len = layout.entry_size as usize;
+            if mem.read(addr, &mut buf[..len]).is_err() {
                 continue;
             }
-            if let Some(event) = TapEvent::decode(&buf) {
+            if let Some(event) = TapEvent::decode(&buf[..len]) {
                 if event.seq == seq && event.seq > self.last_tap_seq {
                     events.push(event);
                 }
@@ -419,6 +450,7 @@ mod tests {
     use crate::support::{hp_addr, live_profile, place_monster, stage_hunt};
     use crate::tap::{
         hook_branch, ENTRY_SIZE, EXPECTED_HOOK, EXPECTED_HP_STORE, EXPECTED_NEXT, RING_ADDR,
+        WIDE_CAPACITY, WIDE_ENTRY_SIZE, WIDE_WRITE_SEQ_ADDR, WRITE_SEQ_ADDR,
     };
     use crate::{DamageConfidence, DamageKind, EventSource};
     use mhdn_rpc::MemorySource;
@@ -460,6 +492,10 @@ mod tests {
         assert_eq!(events[0].source, EventSource::Passive);
         assert_eq!(events[0].confidence, DamageConfidence::HpDelta);
         assert_eq!(events[0].kind, DamageKind::Hit);
+        assert_eq!(events[0].hp_before, Some(774));
+        assert_eq!(events[0].hp_after, Some(760));
+        assert_eq!(events[0].frames_since, Some(1));
+        assert!(events[0].tap_sp.is_none());
         assert_eq!(sample.snapshot.unwrap().monsters[0].pos.x, 11.0);
     }
 
@@ -478,6 +514,9 @@ mod tests {
             DamageConfidence::AggregatedHpDelta
         );
         assert_eq!(sample.events[0].kind, DamageKind::Poison);
+        assert_eq!(sample.events[0].frames_since, Some(6));
+        assert_eq!(sample.events[0].hp_before, Some(774));
+        assert_eq!(sample.events[0].hp_after, Some(769));
     }
 
     #[test]
@@ -509,6 +548,10 @@ mod tests {
         assert_eq!(sample.events[0].confidence, DamageConfidence::Exact);
         assert_eq!(sample.events[0].amount, 14);
         assert_eq!(sample.events[0].part_hp, Some(90));
+        assert_eq!(sample.events[0].tap_sp, Some([0, 90, 0x300A_0000, 0, 0]));
+        assert_eq!(sample.events[0].hp_before, Some(774));
+        assert_eq!(sample.events[0].hp_after, Some(760));
+        assert_eq!(sample.events[0].frames_since, Some(1));
         assert_eq!(sample.events[0].anchor, Anchor::Unknown);
         assert_eq!(
             sample.events[0].key.map(|key| key.struct_addr),
@@ -613,6 +656,37 @@ mod tests {
             "steady-state reads {reads} * 60 = {per_second}",
             reads = counted.reads
         );
+    }
+
+    #[test]
+    fn wide_tap_reads_the_short_ring_and_keeps_the_extra_stack_words() {
+        let (_default, mut mem, profile) = prepared();
+        let mut pipeline = Pipeline::with_wide(true);
+        warm(&mut pipeline, &mut mem, &profile);
+        pipeline.maintain_tap(&mut mem, &profile).unwrap();
+        let object = hp_addr(0) - HP_FROM_OBJECT;
+        let mut raw = [0u8; WIDE_ENTRY_SIZE as usize];
+        raw[0..4].copy_from_slice(&1u32.to_le_bytes());
+        raw[4..8].copy_from_slice(&(-14i32 as u32).to_le_bytes());
+        raw[8..12].copy_from_slice(&object.to_le_bytes());
+        raw[80..84].copy_from_slice(&0x0102_0304u32.to_le_bytes());
+        let addr = RING_ADDR + (1 % WIDE_CAPACITY) * WIDE_ENTRY_SIZE;
+        mem.write_bytes(addr, &raw);
+        mem.write_u32(WIDE_WRITE_SEQ_ADDR, 1);
+        mem.write_u32(profile.frame_counter.addr.unwrap(), 4);
+        place_monster(&mut mem, 0, 760, 774, 1, [10.0, 20.0, 30.0], 0);
+        let sample = pipeline.poll(&mut mem, &profile, 70_000).unwrap();
+        assert_eq!(sample.events.len(), 1);
+        assert_eq!(sample.events[0].source, EventSource::Tap);
+        assert_eq!(sample.events[0].amount, 14);
+        assert_eq!(
+            sample.events[0].tap_sp_hi.map(|words| words[10]),
+            Some(0x0102_0304)
+        );
+        mem.write_u32(WIDE_WRITE_SEQ_ADDR, 5);
+        mem.write_u32(profile.frame_counter.addr.unwrap(), 5);
+        pipeline.poll(&mut mem, &profile, 80_000).unwrap();
+        assert_eq!(pipeline.lost_tap(), 2);
     }
 
     #[test]

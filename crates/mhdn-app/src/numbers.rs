@@ -395,6 +395,7 @@ mod tests {
             visible: true,
             large,
             poisoned: false,
+            slot: 0,
         }
     }
 
@@ -416,6 +417,12 @@ mod tests {
             }),
             anchor,
             part_hp: None,
+            hp_before: None,
+            hp_after: None,
+            frames_since: None,
+            tap_r3: None,
+            tap_sp: None,
+            tap_sp_hi: None,
         }
     }
 

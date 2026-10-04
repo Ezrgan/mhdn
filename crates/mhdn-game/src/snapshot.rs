@@ -188,7 +188,8 @@ fn read_monsters(
                 continue;
             }
         };
-        if let Some(monster) = read_monster(mem, profile, cache, slot_ptr, hp_addr, &mut rejected)?
+        if let Some(monster) =
+            read_monster(mem, profile, cache, slot, slot_ptr, hp_addr, &mut rejected)?
         {
             monsters.push(monster);
         } else {
@@ -202,6 +203,7 @@ fn read_monster(
     mem: &mut dyn MemorySource,
     profile: &Profile,
     cache: &mut CaptureCache,
+    slot: u32,
     slot_ptr: u32,
     hp_addr: u32,
     rejected: &mut Vec<RejectedRead>,
@@ -307,6 +309,7 @@ fn read_monster(
         visible,
         large: max_hp >= LARGE_MIN_HP,
         poisoned,
+        slot,
     }))
 }
 

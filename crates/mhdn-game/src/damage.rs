@@ -42,6 +42,18 @@ pub struct DamageEvent {
     pub key: Option<MonsterKey>,
     pub anchor: Anchor,
     pub part_hp: Option<u32>,
+    /// HP of this monster on the previous sample, when the tracker had a baseline.
+    pub hp_before: Option<u32>,
+    /// HP of this monster on the sample that emitted the event.
+    pub hp_after: Option<u32>,
+    /// Guest frames from that previous sample to this one.
+    pub frames_since: Option<u32>,
+    /// `r3` at the hook. Set only for tap events.
+    pub tap_r3: Option<u32>,
+    /// `sp[0..4]` at the hook. Set only for tap events.
+    pub tap_sp: Option<[u32; 5]>,
+    /// `sp[5..15]` when the wide stub captured them.
+    pub tap_sp_hi: Option<[u32; 11]>,
 }
 
 /// One plugin hit. `hp_addr` is the monster HP word, the same address as [`MonsterKey::struct_addr`].
@@ -105,6 +117,7 @@ pub fn events_from_tap(events: &[TapEvent]) -> Vec<DamageEvent> {
         if amount <= 0 {
             continue;
         }
+        let (tap_r3, tap_sp, tap_sp_hi) = tap_words(event);
         out.push(DamageEvent {
             seq: event.seq,
             guest_frame: 0,
@@ -117,6 +130,12 @@ pub fn events_from_tap(events: &[TapEvent]) -> Vec<DamageEvent> {
             key: None,
             anchor: Anchor::Unknown,
             part_hp: None,
+            hp_before: None,
+            hp_after: None,
+            frames_since: None,
+            tap_r3,
+            tap_sp,
+            tap_sp_hi,
         });
     }
     out
@@ -228,6 +247,8 @@ fn tap_events(
             });
             continue;
         };
+        let (hp_before, hp_after, frames_since) = sample_span(monster, frame);
+        let (tap_r3, tap_sp, tap_sp_hi) = tap_words(&tap.event);
         events.push(DamageEvent {
             seq: tap.event.seq,
             guest_frame: frame,
@@ -240,6 +261,12 @@ fn tap_events(
             key: Some(monster.key),
             anchor: tap.anchor,
             part_hp: Some(tap.event.stack[1]),
+            hp_before,
+            hp_after,
+            frames_since,
+            tap_r3,
+            tap_sp,
+            tap_sp_hi,
         });
     }
     (events, unmatched)
@@ -259,6 +286,9 @@ fn plugin_events(frame: u32, monsters: &[LiveMonster], hits: &[PluginHit]) -> Ve
             let monster = monsters
                 .iter()
                 .find(|monster| monster.key.struct_addr == hit.hp_addr);
+            let (hp_before, hp_after, frames_since) = monster
+                .map(|monster| sample_span(monster, frame))
+                .unwrap_or((None, None, None));
             DamageEvent {
                 seq: 0,
                 guest_frame: frame,
@@ -271,6 +301,12 @@ fn plugin_events(frame: u32, monsters: &[LiveMonster], hits: &[PluginHit]) -> Ve
                 key: monster.map(|monster| monster.key),
                 anchor: Anchor::Unknown,
                 part_hp: None,
+                hp_before,
+                hp_after,
+                frames_since,
+                tap_r3: None,
+                tap_sp: None,
+                tap_sp_hi: None,
             }
         })
         .collect()
@@ -435,6 +471,7 @@ fn passive_like(
     kind: DamageKind,
     confidence: DamageConfidence,
 ) -> DamageEvent {
+    let (hp_before, hp_after, frames_since) = sample_span(monster, frame);
     DamageEvent {
         seq: 0,
         guest_frame: frame,
@@ -447,7 +484,29 @@ fn passive_like(
         key: Some(monster.key),
         anchor: Anchor::Unknown,
         part_hp: None,
+        hp_before,
+        hp_after,
+        frames_since,
+        tap_r3: None,
+        tap_sp: None,
+        tap_sp_hi: None,
     }
+}
+
+fn sample_span(monster: &LiveMonster, frame: u32) -> (Option<u32>, Option<u32>, Option<u32>) {
+    (
+        monster.prev_hp,
+        Some(monster.hp),
+        monster.prev_frame.map(|prev| frame.wrapping_sub(prev)),
+    )
+}
+
+fn tap_words(event: &TapEvent) -> (Option<u32>, Option<[u32; 5]>, Option<[u32; 11]>) {
+    (
+        Some(event.r3),
+        Some(event.stack),
+        (event.sp_len == 16).then_some(event.stack_hi),
+    )
 }
 
 pub fn overkill(tap_sum: u32, hp_start: u32, hp_end: u32) -> Option<u32> {
@@ -473,6 +532,8 @@ mod tests {
             r3: 0,
             lr: 0x008B_A260,
             stack: [0; 5],
+            stack_hi: [0; 11],
+            sp_len: 5,
         }
     }
 
