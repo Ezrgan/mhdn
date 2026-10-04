@@ -163,6 +163,7 @@ mod tests {
                 visible: true,
                 large: true,
                 poisoned: false,
+                slot: 0,
             }],
         }
     }

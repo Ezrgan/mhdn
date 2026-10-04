@@ -1,8 +1,8 @@
 //! `mhdn-probe tap install|uninstall|events` (plan 2.20).
 
 use mhdn_game::{
-    tap_install, tap_read_events, tap_uninstall, InstallOutcome, PatchMemory, TapError, TapEvent,
-    ENTRY_SIZE, RING_ADDR, WRITE_SEQ_ADDR,
+    tap_install, tap_install_wide, tap_read_events, tap_read_events_wide, tap_uninstall,
+    wide_requested, InstallOutcome, PatchMemory, RingLayout, TapError, TapEvent, RING_ADDR,
 };
 use mhdn_rpc::RpcClient;
 
@@ -21,7 +21,13 @@ pub fn install(addr: SocketAddr, title_id: u64, timeout: Duration) -> Result<()>
     let mut mem = RpcMem {
         client: &mut attached.client,
     };
-    match tap_install(&mut mem).map_err(probe_tap)? {
+    match if wide_requested() {
+        tap_install_wide(&mut mem)
+    } else {
+        tap_install(&mut mem)
+    }
+    .map_err(probe_tap)?
+    {
         InstallOutcome::Installed => println!("damage tap installed"),
         InstallOutcome::AlreadyInstalled => println!("damage tap already installed"),
     }
@@ -43,25 +49,18 @@ pub fn events(addr: SocketAddr, title_id: u64, timeout: Duration) -> Result<()> 
     let mut mem = RpcMem {
         client: &mut attached.client,
     };
-    let events = tap_read_events(&mut mem).map_err(probe_tap)?;
+    let events = if wide_requested() {
+        tap_read_events_wide(&mut mem)
+    } else {
+        tap_read_events(&mut mem)
+    }
+    .map_err(probe_tap)?;
     if events.is_empty() {
         println!("no tap events");
         return Ok(());
     }
     for event in events {
-        println!(
-            "seq={} damage={} r1={} monster=0x{:08X} lr=0x{:08X} sp=[0x{:08X}, 0x{:08X}, 0x{:08X}, 0x{:08X}, 0x{:08X}]",
-            event.seq,
-            event.damage(),
-            event.r1,
-            event.monster,
-            event.lr,
-            event.stack[0],
-            event.stack[1],
-            event.stack[2],
-            event.stack[3],
-            event.stack[4],
-        );
+        println!("{}", format_tap(&event));
     }
     Ok(())
 }
@@ -84,6 +83,7 @@ pub fn follow(
             std::fs::create_dir_all(parent)?;
         }
     }
+    let layout = RingLayout::selected();
     let mut log = OpenOptions::new()
         .create(true)
         .append(true)
@@ -95,17 +95,17 @@ pub fn follow(
     println!("tap follow → {}", log_path.display());
     writeln!(log, "# follow start").ok();
     loop {
-        match read_u32(&mut mem, WRITE_SEQ_ADDR) {
+        match read_u32(&mut mem, layout.write_seq) {
             Ok(write_seq) if write_seq != last_seq => {
-                if last_seq != 0 && write_seq.wrapping_sub(last_seq) > 64 {
+                if last_seq != 0 && write_seq.wrapping_sub(last_seq) > layout.capacity {
                     let line = format!("lost seq {last_seq}..={write_seq}");
                     println!("{line}");
                     writeln!(log, "{line}").ok();
                 }
-                let start = write_seq.saturating_sub(64).max(last_seq);
+                let start = write_seq.saturating_sub(layout.capacity).max(last_seq);
                 for seq in (start + 1)..=write_seq {
-                    let slot = RING_ADDR + (seq % 64) * ENTRY_SIZE;
-                    let mut buf = [0u8; ENTRY_SIZE as usize];
+                    let slot = RING_ADDR + (seq % layout.capacity) * layout.entry_size;
+                    let mut buf = vec![0u8; layout.entry_size as usize];
                     if mem.read(slot, &mut buf).is_err() {
                         continue;
                     }
@@ -117,19 +117,7 @@ pub fn follow(
                     }
                     hits += 1;
                     sum += i64::from(event.damage());
-                    let line = format!(
-                        "seq={} damage={} r1={} monster=0x{:08X} lr=0x{:08X} sp=[0x{:08X}, 0x{:08X}, 0x{:08X}, 0x{:08X}, 0x{:08X}]",
-                        event.seq,
-                        event.damage(),
-                        event.r1,
-                        event.monster,
-                        event.lr,
-                        event.stack[0],
-                        event.stack[1],
-                        event.stack[2],
-                        event.stack[3],
-                        event.stack[4],
-                    );
+                    let line = format_tap(&event);
                     println!("{line}");
                     writeln!(log, "{line}").ok();
                 }
@@ -158,6 +146,32 @@ pub fn follow(
         }
         thread::sleep(Duration::from_millis(100));
     }
+}
+
+fn format_tap(event: &TapEvent) -> String {
+    let mut line = format!(
+        "seq={} damage={} r1={} monster=0x{:08X} lr=0x{:08X} sp=[0x{:08X}, 0x{:08X}, 0x{:08X}, 0x{:08X}, 0x{:08X}]",
+        event.seq,
+        event.damage(),
+        event.r1,
+        event.monster,
+        event.lr,
+        event.stack[0],
+        event.stack[1],
+        event.stack[2],
+        event.stack[3],
+        event.stack[4],
+    );
+    if event.sp_len == 16 {
+        let hi = event
+            .stack_hi
+            .iter()
+            .map(|word| format!("0x{word:08X}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        line.push_str(&format!(" sp_hi=[{hi}]"));
+    }
+    line
 }
 
 fn read_u32(mem: &mut RpcMem<'_>, addr: u32) -> std::result::Result<u32, TapError> {

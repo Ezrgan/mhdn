@@ -141,7 +141,7 @@ fn read_monsters(
                 continue;
             }
         };
-        if let Some(monster) = read_monster(mem, profile, cache, slot_ptr, hp_addr)? {
+        if let Some(monster) = read_monster(mem, profile, cache, slot, slot_ptr, hp_addr)? {
             monsters.push(monster);
         } else {
             cache.pointers.forget(slot_ptr, &steps);
@@ -154,6 +154,7 @@ fn read_monster(
     mem: &mut dyn MemorySource,
     profile: &Profile,
     cache: &mut CaptureCache,
+    slot: u32,
     slot_ptr: u32,
     hp_addr: u32,
 ) -> Result<Option<RawMonster>, SnapshotError> {
@@ -235,6 +236,7 @@ fn read_monster(
         visible,
         large: max_hp >= LARGE_MIN_HP,
         poisoned,
+        slot,
     }))
 }
 

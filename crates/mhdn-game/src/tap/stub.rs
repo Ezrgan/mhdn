@@ -24,6 +24,17 @@ pub const WRITE_SEQ_ADDR: u32 = RING_ADDR + ENTRY_SIZE * CAPACITY;
 pub const LOCAL_SEQ_ADDR: u32 = WRITE_SEQ_ADDR + 4;
 pub const SCRATCH_ADDR: u32 = WRITE_SEQ_ADDR + 8;
 
+/// Research ring. The notes only prove 256 zero bytes at [`RING_ADDR`], and one wide
+/// entry is 21 words, so two slots plus the three control words stay inside that page.
+pub const WIDE_ENTRY_SIZE: u32 = 84;
+pub const WIDE_CAPACITY: u32 = 2;
+pub const WIDE_RING_SPAN: u32 = 256;
+pub const WIDE_WRITE_SEQ_ADDR: u32 = RING_ADDR + WIDE_ENTRY_SIZE * WIDE_CAPACITY;
+pub const WIDE_LOCAL_SEQ_ADDR: u32 = WIDE_WRITE_SEQ_ADDR + 4;
+pub const WIDE_SCRATCH_ADDR: u32 = WIDE_WRITE_SEQ_ADDR + 8;
+
+const _: () = assert!(WIDE_SCRATCH_ADDR + 4 <= RING_ADDR + WIDE_RING_SPAN);
+
 const POOL_SCRATCH: u32 = 38;
 const POOL_SEQ: u32 = 39;
 const POOL_RING: u32 = 40;
@@ -38,6 +49,10 @@ pub struct TapEvent {
     pub r3: u32,
     pub lr: u32,
     pub stack: [u32; 5],
+    /// `sp[5..15]`. Zero when the default stub wrote the entry.
+    pub stack_hi: [u32; 11],
+    /// 5 for the default ring, 16 when the wide stub wrote this entry.
+    pub sp_len: u8,
 }
 
 impl TapEvent {
@@ -56,6 +71,13 @@ impl TapEvent {
         if seq == 0 {
             return None;
         }
+        let wide = bytes.len() >= WIDE_ENTRY_SIZE as usize;
+        let mut stack_hi = [0; 11];
+        if wide {
+            for (index, slot) in stack_hi.iter_mut().enumerate() {
+                *slot = word(10 + index);
+            }
+        }
         Some(Self {
             seq,
             r1: word(1) as i32,
@@ -63,6 +85,8 @@ impl TapEvent {
             r3: word(3),
             lr: word(4),
             stack: [word(5), word(6), word(7), word(8), word(9)],
+            stack_hi,
+            sp_len: if wide { 16 } else { 5 },
         })
     }
 }
@@ -162,9 +186,127 @@ pub fn stub_bytes() -> Vec<u8> {
         .collect()
 }
 
+fn arm_and_imm(rd: u32, rn: u32, imm: u32) -> u32 {
+    0xE200_0000 | (rn << 16) | (rd << 12) | imm
+}
+
+fn arm_mov_imm(rd: u32, imm: u32) -> u32 {
+    debug_assert!(imm < 0x100);
+    0xE3A0_0000 | (rd << 12) | imm
+}
+
+/// `mul rd, rm, rs` with `rd = rm * rs`. `rd` and `rm` stay different, which ARMv5 requires.
+fn arm_mul(rd: u32, rm: u32, rs: u32) -> u32 {
+    0xE000_0090 | (rd << 16) | (rs << 8) | rm
+}
+
+/// Same save/restore as [`stub_words`], storing `sp[0..15]` into the short ring.
+pub fn wide_stub_words() -> Vec<u32> {
+    const POOL_SCRATCH: u32 = 60;
+    const POOL_SEQ: u32 = 61;
+    const POOL_RING: u32 = 62;
+    const POOL_WRITE_SEQ: u32 = 63;
+
+    let ldr_pc = |rt: u32, index: u32, pool: u32| {
+        let from = CAVE_ADDR + index * 4;
+        let literal = CAVE_ADDR + pool * 4;
+        let imm = literal.wrapping_sub(from.wrapping_add(8));
+        debug_assert!(imm < 0x1000);
+        0xE590_0000 | (15 << 16) | (rt << 12) | imm
+    };
+    let str_imm = |rt: u32, rn: u32, imm: u32| 0xE580_0000 | (rn << 16) | (rt << 12) | imm;
+    let ldr_imm = |rt: u32, rn: u32, imm: u32| 0xE590_0000 | (rn << 16) | (rt << 12) | imm;
+
+    let mut words = vec![
+        EXPECTED_HOOK,                   // 0  ldr r12, [r3, #0xA8]
+        ldr_pc(0, 1, POOL_SCRATCH),      // 1  ldr r0, scratch
+        str_imm(2, 0, 0),                // 2  str r2, [r0]
+        ldr_pc(2, 3, POOL_SEQ),          // 3  ldr r2, local_seq
+        ldr_imm(0, 2, 0),                // 4  ldr r0, [r2]
+        0xE280_0001,                     // 5  add r0, r0, #1
+        str_imm(0, 2, 0),                // 6  str r0, [r2]
+        arm_and_imm(0, 0, 1),            // 7  and r0, r0, #1
+        arm_mov_imm(2, WIDE_ENTRY_SIZE), // 8  mov r2, #84
+        arm_mul(0, 2, 0),                // 9  mul r0, r2, r0
+        ldr_pc(2, 10, POOL_RING),        // 10 ldr r2, ring
+        0xE082_2000,                     // 11 add r2, r2, r0
+        ldr_pc(0, 12, POOL_SEQ),         // 12 ldr r0, local_seq
+        ldr_imm(0, 0, 0),                // 13 ldr r0, [r0]
+        str_imm(0, 2, 0),                // 14 seq
+        str_imm(1, 2, 4),                // 15 r1
+        str_imm(12, 2, 8),               // 16 r12
+        str_imm(3, 2, 12),               // 17 r3
+        str_imm(14, 2, 16),              // 18 lr
+    ];
+    let mut index = words.len() as u32;
+    for sp in 0..16u32 {
+        words.push(ldr_imm(0, 13, sp * 4));
+        index += 1;
+        words.push(str_imm(0, 2, 20 + sp * 4));
+        index += 1;
+    }
+    words.push(0xEE07_0FBA);
+    index += 1;
+    words.push(ldr_pc(0, index, POOL_SEQ));
+    index += 1;
+    words.push(ldr_imm(0, 0, 0));
+    index += 1;
+    words.push(ldr_pc(2, index, POOL_WRITE_SEQ));
+    index += 1;
+    words.push(str_imm(0, 2, 0));
+    index += 1;
+    words.push(0xEE07_0FBA);
+    index += 1;
+    words.push(ldr_pc(0, index, POOL_SCRATCH));
+    index += 1;
+    words.push(ldr_imm(2, 0, 0));
+    index += 1;
+    let branch_index = index;
+    words.push(0);
+    index += 1;
+    debug_assert_eq!(index, POOL_SCRATCH);
+    words[branch_index as usize] = arm_b(CAVE_ADDR + branch_index * 4, RETURN_ADDR);
+    words.extend_from_slice(&[
+        WIDE_SCRATCH_ADDR,
+        WIDE_LOCAL_SEQ_ADDR,
+        RING_ADDR,
+        WIDE_WRITE_SEQ_ADDR,
+    ]);
+    debug_assert_eq!(words.len(), 64);
+    words
+}
+
+pub fn wide_stub_bytes() -> Vec<u8> {
+    wide_stub_words()
+        .into_iter()
+        .flat_map(u32::to_le_bytes)
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Bytes of `stub_words()` at v0.3.4 (`e55cdc8`). The default guest patch must stay identical.
+    const DEFAULT_STUB: &[u8] = &[
+        0xA8, 0xC0, 0x93, 0xE5, 0x8C, 0x00, 0x9F, 0xE5, 0x00, 0x20, 0x80, 0xE5, 0x88, 0x20, 0x9F,
+        0xE5, 0x00, 0x00, 0x92, 0xE5, 0x01, 0x00, 0x80, 0xE2, 0x00, 0x00, 0x82, 0xE5, 0x3F, 0x00,
+        0x00, 0xE2, 0x00, 0x01, 0x80, 0xE0, 0x80, 0x01, 0xA0, 0xE1, 0x70, 0x20, 0x9F, 0xE5, 0x00,
+        0x20, 0x82, 0xE0, 0x64, 0x00, 0x9F, 0xE5, 0x00, 0x00, 0x90, 0xE5, 0x00, 0x00, 0x82, 0xE5,
+        0x04, 0x10, 0x82, 0xE5, 0x08, 0xC0, 0x82, 0xE5, 0x0C, 0x30, 0x82, 0xE5, 0x10, 0xE0, 0x82,
+        0xE5, 0x00, 0x00, 0x9D, 0xE5, 0x14, 0x00, 0x82, 0xE5, 0x04, 0x00, 0x9D, 0xE5, 0x18, 0x00,
+        0x82, 0xE5, 0x08, 0x00, 0x9D, 0xE5, 0x1C, 0x00, 0x82, 0xE5, 0x0C, 0x00, 0x9D, 0xE5, 0x20,
+        0x00, 0x82, 0xE5, 0x10, 0x00, 0x9D, 0xE5, 0x24, 0x00, 0x82, 0xE5, 0xBA, 0x0F, 0x07, 0xEE,
+        0x1C, 0x00, 0x9F, 0xE5, 0x00, 0x00, 0x90, 0xE5, 0x1C, 0x20, 0x9F, 0xE5, 0x00, 0x00, 0x82,
+        0xE5, 0xBA, 0x0F, 0x07, 0xEE, 0x04, 0x00, 0x9F, 0xE5, 0x00, 0x20, 0x90, 0xE5, 0x94, 0x75,
+        0xF3, 0xEA, 0x08, 0x2A, 0xD3, 0x00, 0x04, 0x2A, 0xD3, 0x00, 0x00, 0x20, 0xD3, 0x00, 0x00,
+        0x2A, 0xD3, 0x00,
+    ];
+
+    #[test]
+    fn default_stub_bytes_are_frozen() {
+        assert_eq!(stub_bytes(), DEFAULT_STUB);
+    }
 
     #[test]
     fn known_arm_words() {
@@ -191,6 +333,62 @@ mod tests {
         raw[4..8].copy_from_slice(&(-8i32 as u32).to_le_bytes());
         let event = TapEvent::decode(&raw).unwrap();
         assert_eq!(event.damage(), 8);
+        assert_eq!(event.sp_len, 5);
+        assert_eq!(event.stack_hi, [0; 11]);
         assert!(TapEvent::decode(&[0u8; 40]).is_none());
+    }
+
+    #[test]
+    fn wide_stub_branches_back_and_restores_r2() {
+        let words = wide_stub_words();
+        assert_eq!(words.len(), 64);
+        assert!(words.len() * 4 <= 0x300);
+        assert_eq!(words[0], EXPECTED_HOOK);
+        assert_eq!(decode_b(CAVE_ADDR + 59 * 4, words[59]), Some(RETURN_ADDR));
+        assert_eq!(
+            words[58], 0xE590_2000,
+            "ldr r2, [r0] restores the borrowed register"
+        );
+        assert_eq!(decode_ldr_pc(1, words[1]), Some(CAVE_ADDR + 60 * 4));
+        assert_eq!(words[60], WIDE_SCRATCH_ADDR);
+        assert_eq!(words[61], WIDE_LOCAL_SEQ_ADDR);
+        assert_eq!(words[62], RING_ADDR);
+        assert_eq!(words[63], WIDE_WRITE_SEQ_ADDR);
+        assert_eq!(words[7], arm_and_imm(0, 0, 1));
+        assert_eq!(words[8], arm_mov_imm(2, 84));
+        assert_eq!(decode_mul(words[9]), Some((0, 2, 0)));
+        assert_eq!(words[49], 0xE59D_003C, "ldr r0, [sp, #60]");
+        assert_eq!(words[50], 0xE582_0050, "str r0, [r2, #80]");
+    }
+
+    #[test]
+    fn wide_entry_keeps_sixteen_stack_words() {
+        let mut raw = [0u8; WIDE_ENTRY_SIZE as usize];
+        raw[0..4].copy_from_slice(&1u32.to_le_bytes());
+        raw[4..8].copy_from_slice(&(-3i32 as u32).to_le_bytes());
+        raw[80..84].copy_from_slice(&0xAABB_CCDDu32.to_le_bytes());
+        let event = TapEvent::decode(&raw).unwrap();
+        assert_eq!(event.sp_len, 16);
+        assert_eq!(event.damage(), 3);
+        assert_eq!(event.stack_hi[10], 0xAABB_CCDD);
+    }
+
+    fn decode_ldr_pc(index: u32, word: u32) -> Option<u32> {
+        if word & 0x0F7F_0000 != 0x051F_0000 {
+            return None;
+        }
+        let imm = word & 0xFFF;
+        let from = CAVE_ADDR + index * 4;
+        Some(from.wrapping_add(8).wrapping_add(imm))
+    }
+
+    fn decode_mul(word: u32) -> Option<(u32, u32, u32)> {
+        if word & 0x0FF0_00F0 != 0x0000_0090 {
+            return None;
+        }
+        let rd = (word >> 16) & 0xF;
+        let rs = (word >> 8) & 0xF;
+        let rm = word & 0xF;
+        Some((rd, rm, rs))
     }
 }

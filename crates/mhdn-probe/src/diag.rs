@@ -53,7 +53,7 @@ pub fn run(
         profile.id()
     )?;
 
-    let mut pipeline = Pipeline::new();
+    let mut pipeline = Pipeline::from_env();
     let mut totals = Totals::default();
     let started = Instant::now();
     let deadline = started + Duration::from_secs(seconds);

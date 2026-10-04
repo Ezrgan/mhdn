@@ -34,7 +34,9 @@ pub use profile::{
 pub use sampler::{sample_period, spawn, EventQueue, Latest, Pump, Sampler, SamplerJoin};
 pub use scene::Scene;
 pub use tap::{
-    install as tap_install, read_events as tap_read_events, uninstall as tap_uninstall,
-    InstallOutcome, PatchMemory, TapError, TapEvent, CAVE_ADDR, ENTRY_SIZE, EXPECTED_HOOK,
-    EXPECTED_HP_STORE, EXPECTED_NEXT, HOOK_ADDR, RETURN_ADDR, RING_ADDR, WRITE_SEQ_ADDR,
+    install as tap_install, install_wide as tap_install_wide, read_events as tap_read_events,
+    read_events_wide as tap_read_events_wide, uninstall as tap_uninstall, wide_requested,
+    InstallOutcome, PatchMemory, RingLayout, TapError, TapEvent, CAVE_ADDR, ENTRY_SIZE,
+    EXPECTED_HOOK, EXPECTED_HP_STORE, EXPECTED_NEXT, HOOK_ADDR, RETURN_ADDR, RING_ADDR,
+    WRITE_SEQ_ADDR,
 };
