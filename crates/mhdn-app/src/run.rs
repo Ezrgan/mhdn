@@ -329,6 +329,9 @@ impl OverlayApp {
     }
 
     fn refresh_combat(&mut self) {
+        for note in self.events.drain_notes() {
+            diag::line(&note);
+        }
         let now = Instant::now();
         let dt = now.saturating_duration_since(self.last_tick);
         self.last_tick = now;

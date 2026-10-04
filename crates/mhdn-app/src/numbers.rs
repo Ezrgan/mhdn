@@ -108,13 +108,17 @@ impl CombatView {
         };
         let mut anchors = Vec::with_capacity(events.len());
         for event in events {
+            let Some(counted) = recount_amount(event, monsters) else {
+                anchors.push(None);
+                continue;
+            };
             let world = anchor_world(event, monsters, &height, hunter);
             anchors.push(world);
             let Some(world) = world else {
                 continue;
             };
             let style = self.magnitude.style(event.amount, hit_kind(event.kind));
-            self.recount.add(event.amount);
+            self.recount.add(counted);
             self.pool.spawn(Spawn {
                 world,
                 rgb: style.rgb,
@@ -301,6 +305,29 @@ fn near_hunter(hunter: [f32; 3], monster: [f32; 3]) -> [f32; 3] {
         hunter[1] + HIT_HEIGHT,
         hunter[2] + dz * step,
     ]
+}
+
+fn max_hp_of(event: &DamageEvent, monsters: &[MonsterState]) -> Option<u32> {
+    find_monster(event, monsters)
+        .map(|monster| monster.key.max_hp)
+        .or_else(|| event.key.map(|key| key.max_hp))
+}
+
+/// Recount contribution. `None` drops the floater too.
+fn recount_amount(event: &DamageEvent, monsters: &[MonsterState]) -> Option<u32> {
+    if let Some(max_hp) = max_hp_of(event, monsters) {
+        // Pre-clamp overkill is a few points over the bar. Twice max HP is not,
+        // and an over-max amount with no previous HP cannot be checked.
+        let absurd = event.amount > max_hp.saturating_mul(2);
+        let unchecked = event.amount > max_hp && event.hp_before.is_none();
+        if absurd || unchecked {
+            return None;
+        }
+    }
+    Some(match event.hp_before {
+        Some(before) => event.amount.min(before),
+        None => event.amount,
+    })
 }
 
 fn find_monster<'a>(event: &DamageEvent, monsters: &'a [MonsterState]) -> Option<&'a MonsterState> {
@@ -699,6 +726,85 @@ mod tests {
             .expect("spike");
         assert_eq!(orange.rgb, ORANGE);
         assert!((orange.mag_scale - 1.25).abs() < 0.001);
+    }
+
+    #[test]
+    fn an_amount_above_max_hp_never_reaches_the_recount_or_the_magnitude_window() {
+        let mut view = CombatView::new();
+        view.observe(Scene::InQuest, 10);
+        let monsters = [monster(0x1000, true)];
+        let at_cap = event(
+            3000,
+            Anchor::World(GameVec3::new(0.0, 1.0, 0.0)),
+            DamageKind::Hit,
+        );
+        view.ingest(std::slice::from_ref(&at_cap), &monsters, |_, _| 10.0);
+        assert_eq!(view.recount.total, 3000);
+        assert_eq!(view.magnitude.len(), 1);
+
+        let huge = event(
+            3001,
+            Anchor::World(GameVec3::new(0.0, 1.0, 0.0)),
+            DamageKind::Hit,
+        );
+        let ingested = view.ingest(std::slice::from_ref(&huge), &monsters, |_, _| 10.0);
+        assert_eq!(ingested.anchors, vec![None]);
+        assert_eq!(view.recount.total, 3000);
+        assert_eq!(view.magnitude.len(), 1);
+        assert_eq!(view.alive_count(), 1);
+    }
+
+    #[test]
+    fn an_overkill_kill_shot_counts_hp_before_and_draws_the_real_amount() {
+        let mut view = CombatView::new();
+        view.observe(Scene::InQuest, 10);
+        let mut small = monster(0x1000, false);
+        small.key.max_hp = 38;
+        small.hp = 0;
+        let mut hit = event(
+            39,
+            Anchor::World(GameVec3::new(0.0, 1.0, 0.0)),
+            DamageKind::Hit,
+        );
+        hit.key = Some(MonsterKey {
+            struct_addr: 0x1000,
+            species: 7,
+            max_hp: 38,
+            generation: 1,
+        });
+        hit.hp_before = Some(9);
+        hit.hp_after = Some(0);
+        let ingested = view.ingest(std::slice::from_ref(&hit), &[small], |_, _| 10.0);
+        assert_eq!(ingested.anchors, vec![Some([0.0, 1.0, 0.0])]);
+        assert_eq!(view.recount.total, 9);
+        assert_eq!(view.magnitude.len(), 1);
+        let shown = view.pool.live().next().expect("number");
+        assert_eq!(shown.text, "39");
+    }
+
+    #[test]
+    fn an_amount_above_twice_max_hp_is_still_dropped() {
+        let mut view = CombatView::new();
+        view.observe(Scene::InQuest, 10);
+        let mut small = monster(0x1000, false);
+        small.key.max_hp = 38;
+        let mut hit = event(
+            80,
+            Anchor::World(GameVec3::new(0.0, 1.0, 0.0)),
+            DamageKind::Hit,
+        );
+        hit.key = Some(MonsterKey {
+            struct_addr: 0x1000,
+            species: 7,
+            max_hp: 38,
+            generation: 1,
+        });
+        hit.hp_before = Some(9);
+        let ingested = view.ingest(std::slice::from_ref(&hit), &[small], |_, _| 10.0);
+        assert_eq!(ingested.anchors, vec![None]);
+        assert_eq!(view.recount.total, 0);
+        assert_eq!(view.magnitude.len(), 0);
+        assert_eq!(view.alive_count(), 0);
     }
 
     #[test]
