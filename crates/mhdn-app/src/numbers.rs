@@ -108,6 +108,10 @@ impl CombatView {
         };
         let mut anchors = Vec::with_capacity(events.len());
         for event in events {
+            if amount_above_max(event, monsters) {
+                anchors.push(None);
+                continue;
+            }
             let world = anchor_world(event, monsters, &height, hunter);
             anchors.push(world);
             let Some(world) = world else {
@@ -301,6 +305,13 @@ fn near_hunter(hunter: [f32; 3], monster: [f32; 3]) -> [f32; 3] {
         hunter[1] + HIT_HEIGHT,
         hunter[2] + dz * step,
     ]
+}
+
+fn amount_above_max(event: &DamageEvent, monsters: &[MonsterState]) -> bool {
+    if let Some(monster) = find_monster(event, monsters) {
+        return event.amount > monster.key.max_hp;
+    }
+    event.key.is_some_and(|key| event.amount > key.max_hp)
 }
 
 fn find_monster<'a>(event: &DamageEvent, monsters: &'a [MonsterState]) -> Option<&'a MonsterState> {
@@ -692,6 +703,32 @@ mod tests {
             .expect("spike");
         assert_eq!(orange.rgb, ORANGE);
         assert!((orange.mag_scale - 1.25).abs() < 0.001);
+    }
+
+    #[test]
+    fn an_amount_above_max_hp_never_reaches_the_recount_or_the_magnitude_window() {
+        let mut view = CombatView::new();
+        view.observe(Scene::InQuest, 10);
+        let monsters = [monster(0x1000, true)];
+        let at_cap = event(
+            3000,
+            Anchor::World(GameVec3::new(0.0, 1.0, 0.0)),
+            DamageKind::Hit,
+        );
+        view.ingest(std::slice::from_ref(&at_cap), &monsters, |_, _| 10.0);
+        assert_eq!(view.recount.total, 3000);
+        assert_eq!(view.magnitude.len(), 1);
+
+        let huge = event(
+            3001,
+            Anchor::World(GameVec3::new(0.0, 1.0, 0.0)),
+            DamageKind::Hit,
+        );
+        let ingested = view.ingest(std::slice::from_ref(&huge), &monsters, |_, _| 10.0);
+        assert_eq!(ingested.anchors, vec![None]);
+        assert_eq!(view.recount.total, 3000);
+        assert_eq!(view.magnitude.len(), 1);
+        assert_eq!(view.alive_count(), 1);
     }
 
     #[test]

@@ -21,7 +21,8 @@ mod support;
 
 pub use chain::{ChainError, ChainStep, PointerCache};
 pub use damage::{
-    events_from_tap, overkill, tap_sum_for, DamageConfidence, DamageEvent, DamageKind, EventSource,
+    events_from_tap, overkill, tap_sum_for, DamageConfidence, DamageEvent, DamageKind, DmgDrop,
+    EventSource, UnmatchedTap,
 };
 pub use model::{Anchor, CameraState, MonsterKey, MonsterState, Snapshot, Vec3, HP_FROM_OBJECT};
 pub use pipeline::{Pipeline, Sample};
@@ -33,6 +34,7 @@ pub use profile::{
 };
 pub use sampler::{sample_period, spawn, EventQueue, Latest, Pump, Sampler, SamplerJoin};
 pub use scene::Scene;
+pub use snapshot::{ReadReject, RejectedRead};
 pub use tap::{
     install as tap_install, read_events as tap_read_events, uninstall as tap_uninstall,
     InstallOutcome, PatchMemory, TapError, TapEvent, CAVE_ADDR, ENTRY_SIZE, EXPECTED_HOOK,

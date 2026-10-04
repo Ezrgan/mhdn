@@ -6,6 +6,13 @@ use crate::scene::Scene;
 /// A large monster in the live notes starts at 720 HP. Bars under this are small monsters.
 pub const LARGE_MIN_HP: u32 = 400;
 
+/// Upper bound on a live monster's max HP.
+///
+/// `docs/RE_NOTES.md` records pools of 720, 920, 2205, and 774. G-rank and
+/// multiplayer scaling stay in the tens of thousands, well below a guest pointer
+/// (`0x08000000` is 134_217_728). Reads above this are a freed slot, not a monster.
+pub const MAX_PLAUSIBLE_HP: u32 = 200_000;
+
 /// `r12 + 0x360` is the HP word the monster list resolves to.
 pub const HP_FROM_OBJECT: u32 = 0x360;
 

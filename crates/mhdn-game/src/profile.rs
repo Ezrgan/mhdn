@@ -241,6 +241,20 @@ impl SpeciesProfile {
             base * 0.35
         }
     }
+
+    /// `by_id` is the species table. Empty means this profile does not name ids yet.
+    pub(crate) fn has_species_table(&self) -> bool {
+        !self.by_id.is_empty()
+    }
+
+    /// Species `0` is unused. Any other id has to be a key in `by_id`.
+    pub(crate) fn knows_species(&self, species: u16) -> bool {
+        species != 0
+            && self
+                .by_id
+                .keys()
+                .any(|id| id.parse::<u16>().ok() == Some(species))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]

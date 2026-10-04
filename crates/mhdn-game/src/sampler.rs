@@ -30,6 +30,7 @@ pub fn sample_period(scene: Scene, failures: u32) -> Duration {
 #[derive(Debug)]
 pub struct EventQueue {
     events: Mutex<VecDeque<DamageEvent>>,
+    notes: Mutex<VecDeque<String>>,
     capacity: usize,
     dropped: AtomicU64,
     /// 0 unknown, 1 fingerprint matched, 2 this build is not the profile.
@@ -42,6 +43,7 @@ impl EventQueue {
     pub fn new(capacity: usize) -> Self {
         Self {
             events: Mutex::new(VecDeque::new()),
+            notes: Mutex::new(VecDeque::new()),
             capacity: capacity.max(1),
             dropped: AtomicU64::new(0),
             supported: AtomicU8::new(0),
@@ -60,6 +62,18 @@ impl EventQueue {
 
     pub fn drain(&self) -> Vec<DamageEvent> {
         self.events.lock().expect("event queue").drain(..).collect()
+    }
+
+    pub fn push_note(&self, line: String) {
+        let mut notes = self.notes.lock().expect("diag notes");
+        if notes.len() == 256 {
+            notes.pop_front();
+        }
+        notes.push_back(line);
+    }
+
+    pub fn drain_notes(&self) -> Vec<String> {
+        self.notes.lock().expect("diag notes").drain(..).collect()
     }
 
     pub fn dropped(&self) -> u64 {
@@ -194,6 +208,9 @@ impl<M: MemorySource + PatchMemory> Sampler<M> {
             }
             for event in sample.events {
                 self.events.push(event);
+            }
+            for line in self.pipeline.drain_diag_lines() {
+                self.events.push_note(line);
             }
         }
         let _ = self.pipeline.maintain_tap(&mut self.mem, &self.profile);
@@ -377,6 +394,18 @@ mod tests {
         let drained = queue.drain();
         assert_eq!(drained[0].seq, 2);
         assert_eq!(drained[1].seq, 3);
+    }
+
+    #[test]
+    fn notes_drain_in_order() {
+        let queue = EventQueue::new(2);
+        queue.push_note("hp_bad".to_string());
+        queue.push_note("dmg_drop".to_string());
+        assert_eq!(
+            queue.drain_notes(),
+            vec!["hp_bad".to_string(), "dmg_drop".to_string()]
+        );
+        assert!(queue.drain_notes().is_empty());
     }
 
     #[test]

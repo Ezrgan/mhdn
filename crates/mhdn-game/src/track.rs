@@ -59,13 +59,16 @@ impl MonsterTrack {
             .position(|known| known.hp_addr == raw.hp_addr || known.slot_ptr == raw.slot_ptr)
         {
             let known = &mut self.known[index];
-            let changed = known.absent > 0
+            let identity_changed = known.absent > 0
                 || known.species != raw.species
                 || known.max_hp != raw.max_hp
                 || known.hp_addr != raw.hp_addr;
-            let prev_hp = (!changed).then_some(known.hp);
-            let prev_frame = (!changed).then_some(known.frame);
-            if changed {
+            // A higher bar (heal, or HP restored after a rejected sample) is a new baseline.
+            let hp_rose = !identity_changed && raw.hp > known.hp;
+            let rebaseline = identity_changed || hp_rose;
+            let prev_hp = (!rebaseline).then_some(known.hp);
+            let prev_frame = (!rebaseline).then_some(known.frame);
+            if identity_changed {
                 known.generation = known.generation.saturating_add(1);
             }
             known.hp_addr = raw.hp_addr;
@@ -81,7 +84,7 @@ impl MonsterTrack {
                 hp: raw.hp,
                 prev_hp,
                 prev_frame,
-                fresh: changed,
+                fresh: rebaseline,
                 poisoned: raw.poisoned,
             }
         } else {
@@ -156,7 +159,22 @@ mod tests {
         track.update(&[raw(0x1000, 1, 774, 10)], 1);
         let next = track.update(&[raw(0x1000, 2, 200, 200)], 2);
         assert!(next[0].fresh);
+        assert!(next[0].prev_hp.is_none());
         assert_eq!(next[0].key.generation, 2);
         assert_eq!(next[0].key.species, 2);
+    }
+
+    #[test]
+    fn an_hp_increase_rebaselines_without_bumping_generation() {
+        let mut track = MonsterTrack::default();
+        track.update(&[raw(0x1000, 1, 774, 100)], 1);
+        let up = track.update(&[raw(0x1000, 1, 774, 774)], 2);
+        assert!(up[0].fresh);
+        assert!(up[0].prev_hp.is_none());
+        assert_eq!(up[0].key.generation, 1);
+        assert_eq!(up[0].hp, 774);
+        let down = track.update(&[raw(0x1000, 1, 774, 760)], 3);
+        assert!(!down[0].fresh);
+        assert_eq!(down[0].prev_hp, Some(774));
     }
 }
