@@ -208,8 +208,17 @@ pub fn format_dmg(event: &DamageEvent) -> String {
         }
         let r3 = event.tap_r3.unwrap_or(0);
         line.push_str(&format!(" r3=0x{r3:08X} sp={}", format_words(&words)));
+        line.push(' ');
+        line.push_str(&format_hunter_slot(event.hunter_slot));
     }
     line
+}
+
+fn format_hunter_slot(word: Option<u32>) -> String {
+    match word {
+        Some(word) => format!("slot=0x{word:08X}"),
+        None => "slot=miss".to_string(),
+    }
 }
 
 pub fn format_scene(scene: Scene, monsters: &[MonsterState]) -> String {
@@ -519,10 +528,11 @@ mod tests {
             tap_r3: Some(0x0812_3456),
             tap_sp: Some([1, 0x5A, 0x082C_E744, 0x2A, 0x0E]),
             tap_sp_hi: None,
+            hunter_slot: Some(0x3004_0000),
         };
         assert_eq!(
             format_dmg(&tap),
-            "dmg source=tap kind=hit confidence=exact amount=42 mon=0x300E0E38 species=30 gen=1 max_hp=720 hp_before=700 hp_after=658 frames=1 lr=0x008BA260 r3=0x08123456 sp=0x00000001,0x0000005A,0x082CE744,0x0000002A,0x0000000E"
+            "dmg source=tap kind=hit confidence=exact amount=42 mon=0x300E0E38 species=30 gen=1 max_hp=720 hp_before=700 hp_after=658 frames=1 lr=0x008BA260 r3=0x08123456 sp=0x00000001,0x0000005A,0x082CE744,0x0000002A,0x0000000E slot=0x30040000"
         );
 
         let mut passive = tap.clone();
@@ -569,6 +579,50 @@ mod tests {
         assert!(format_dmg(&status).contains("kind=topple"));
         status.kind = DamageKind::Poison;
         assert!(format_dmg(&status).contains("kind=poison"));
+    }
+
+    #[test]
+    fn a_tap_stack_records_a_known_hunter_slot_word() {
+        let line = format_dmg(&stacked_hit(Some(0x3004_BEEF)));
+        assert!(line.contains("sp=0x00000000,0x00000000,0x300A0000,0x00000000,0x00000000"));
+        assert!(line.contains("slot=0x3004BEEF"));
+        assert!(!line.contains("slot=miss"));
+    }
+
+    #[test]
+    fn a_failed_hunter_slot_read_is_miss_on_the_tap_line() {
+        let line = format_dmg(&stacked_hit(None));
+        assert!(line.contains("sp=0x00000000,0x00000000,0x300A0000,0x00000000,0x00000000"));
+        assert!(line.contains("slot=miss"));
+        assert!(!line.contains("slot=0x"));
+        let mut bare = stacked_hit(None);
+        bare.tap_sp = None;
+        assert!(!format_dmg(&bare).contains("slot="));
+    }
+
+    fn stacked_hit(hunter_slot: Option<u32>) -> DamageEvent {
+        use mhdn_game::{Anchor, DamageConfidence, DamageKind, EventSource};
+
+        DamageEvent {
+            seq: 1,
+            guest_frame: 10,
+            monster: 0x0820_0000,
+            amount: 42,
+            lr: 0x008B_A260,
+            kind: DamageKind::Hit,
+            source: EventSource::Tap,
+            confidence: DamageConfidence::Exact,
+            key: None,
+            anchor: Anchor::Unknown,
+            part_hp: None,
+            hp_before: None,
+            hp_after: None,
+            frames_since: None,
+            tap_r3: Some(0),
+            tap_sp: Some([0, 0, 0x300A_0000, 0, 0]),
+            tap_sp_hi: None,
+            hunter_slot,
+        }
     }
 
     #[test]

@@ -56,6 +56,9 @@ pub struct DamageEvent {
     pub tap_sp: Option<[u32; 5]>,
     /// `sp[5..15]` when the wide stub captured them.
     pub tap_sp_hi: Option<[u32; 11]>,
+    /// Word at static `0x0814E620` on a tap that already has a stack.
+    /// `None` with [`Self::tap_sp`] set means that read failed.
+    pub hunter_slot: Option<u32>,
 }
 
 /// One plugin hit. `hp_addr` is the monster HP word, the same address as [`MonsterKey::struct_addr`].
@@ -138,6 +141,7 @@ pub fn events_from_tap(events: &[TapEvent]) -> Vec<DamageEvent> {
             tap_r3,
             tap_sp,
             tap_sp_hi,
+            hunter_slot: None,
         });
     }
     out
@@ -269,6 +273,7 @@ fn tap_events(
             tap_r3,
             tap_sp,
             tap_sp_hi,
+            hunter_slot: None,
         });
     }
     (events, unmatched)
@@ -309,6 +314,7 @@ fn plugin_events(frame: u32, monsters: &[LiveMonster], hits: &[PluginHit]) -> Ve
                 tap_r3: None,
                 tap_sp: None,
                 tap_sp_hi: None,
+                hunter_slot: None,
             }
         })
         .collect()
@@ -504,6 +510,7 @@ fn passive_like(
         tap_r3: None,
         tap_sp: None,
         tap_sp_hi: None,
+        hunter_slot: None,
     }
 }
 

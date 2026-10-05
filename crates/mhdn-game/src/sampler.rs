@@ -380,6 +380,7 @@ mod tests {
             tap_r3: None,
             tap_sp: None,
             tap_sp_hi: None,
+            hunter_slot: None,
         }
     }
 

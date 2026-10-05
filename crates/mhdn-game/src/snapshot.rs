@@ -100,6 +100,8 @@ pub(crate) struct RawSnapshot {
     pub loading: bool,
     pub camera: Option<CameraState>,
     pub hunter_pos: Option<Vec3>,
+    /// Word at `profile.hunter.base` (`0x0814E620`). `None` when that read fails.
+    pub hunter_slot: Option<u32>,
     pub monsters: Vec<RawMonster>,
     pub rejected: Vec<RejectedRead>,
 }
@@ -134,11 +136,13 @@ fn read_body(
         None => false,
     };
     let (monsters, rejected) = read_monsters(mem, profile, cache, guest_frame)?;
+    let (hunter_pos, hunter_slot) = read_hunter(mem, profile)?;
     Ok(RawSnapshot {
         guest_frame,
         loading,
         camera: read_camera(mem, profile)?,
-        hunter_pos: read_hunter(mem, profile)?,
+        hunter_pos,
+        hunter_slot,
         monsters,
         rejected,
     })
@@ -360,16 +364,25 @@ fn resolve_list(
     Ok(None)
 }
 
+/// Feet, plus the raw word at the static hunter slot. One read of that address.
 fn read_hunter(
     mem: &mut dyn MemorySource,
     profile: &Profile,
-) -> Result<Option<Vec3>, SnapshotError> {
+) -> Result<(Option<Vec3>, Option<u32>), SnapshotError> {
     let Some(base) = profile.hunter.base else {
-        return Ok(None);
+        return Ok((None, None));
     };
-    let Ok(object) = mem.read_u32(base) else {
-        return Ok(None);
+    let Ok(word) = mem.read_u32(base) else {
+        return Ok((None, None));
     };
+    Ok((hunter_feet(mem, profile, word)?, Some(word)))
+}
+
+fn hunter_feet(
+    mem: &mut dyn MemorySource,
+    profile: &Profile,
+    object: u32,
+) -> Result<Option<Vec3>, SnapshotError> {
     if !is_guest_heap(object) {
         return Ok(None);
     }

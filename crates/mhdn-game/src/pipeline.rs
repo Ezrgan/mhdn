@@ -180,7 +180,14 @@ impl Pipeline {
         };
         let taps = self.poll_taps(mem);
         let events = if change.scene == Scene::InQuest {
-            self.events(mem, raw.guest_frame, &live, taps, profile)
+            self.events(
+                mem,
+                raw.guest_frame,
+                &live,
+                taps,
+                profile,
+                raw.hunter_slot,
+            )
         } else {
             Vec::new()
         };
@@ -306,6 +313,7 @@ impl Pipeline {
         live: &[crate::track::LiveMonster],
         taps: Option<Vec<TapEvent>>,
         profile: &Profile,
+        hunter_slot: Option<u32>,
     ) -> Vec<crate::DamageEvent> {
         let tap_active = taps.is_some();
         let plugin = self.plugin_hits(mem);
@@ -332,7 +340,13 @@ impl Pipeline {
         );
         self.drops = composed.drops;
         self.unmatched = composed.unmatched;
-        composed.events
+        let mut events = composed.events;
+        for event in &mut events {
+            if event.tap_sp.is_some() {
+                event.hunter_slot = hunter_slot;
+            }
+        }
+        events
     }
 
     fn read_new_taps(&mut self, mem: &mut dyn MemorySource) -> Vec<TapEvent> {
@@ -553,12 +567,54 @@ mod tests {
         assert_eq!(sample.events[0].hp_after, Some(760));
         assert_eq!(sample.events[0].frames_since, Some(1));
         assert_eq!(sample.events[0].anchor, Anchor::Unknown);
+        assert_eq!(sample.events[0].hunter_slot, Some(0x3004_0000));
         assert_eq!(
             sample.events[0].key.map(|key| key.struct_addr),
             Some(hp_addr(0))
         );
         pipeline.shutdown_tap(&mut mem);
         assert_eq!(mem_word(&mut mem, HOOK_ADDR), EXPECTED_HOOK);
+    }
+
+    #[test]
+    fn a_tap_keeps_the_word_read_at_the_static_hunter_slot() {
+        let (mut pipeline, mut mem, profile) = prepared();
+        warm(&mut pipeline, &mut mem, &profile);
+        pipeline.maintain_tap(&mut mem, &profile).unwrap();
+        let object = hp_addr(0) - HP_FROM_OBJECT;
+        write_tap(&mut mem, 1, -14, object, 0x300A_0000, 90);
+        mem.write_u32(0x0814_E620, 0x3004_BEEF);
+        mem.write_u32(profile.frame_counter.addr.unwrap(), 4);
+        place_monster(&mut mem, 0, 760, 774, 1, [10.0, 20.0, 30.0], 0);
+        let sample = pipeline.poll(&mut mem, &profile, 70_000).unwrap();
+        assert_eq!(sample.events.len(), 1);
+        assert!(sample.events[0].tap_sp.is_some());
+        assert_eq!(sample.events[0].hunter_slot, Some(0x3004_BEEF));
+        assert_eq!(sample.events[0].anchor, Anchor::Unknown);
+        assert_eq!(sample.events[0].kind, DamageKind::Hit);
+    }
+
+    #[test]
+    fn a_failed_static_slot_read_stays_unset_on_the_tap() {
+        let (mut pipeline, mut mem, profile) = prepared();
+        warm(&mut pipeline, &mut mem, &profile);
+        pipeline.maintain_tap(&mut mem, &profile).unwrap();
+        let object = hp_addr(0) - HP_FROM_OBJECT;
+        write_tap(&mut mem, 1, -14, object, 0x300A_0000, 90);
+        mem.write_u32(profile.frame_counter.addr.unwrap(), 4);
+        place_monster(&mut mem, 0, 760, 774, 1, [10.0, 20.0, 30.0], 0);
+        let sample = pipeline
+            .poll(
+                &mut FailHunterSlot { inner: &mut mem },
+                &profile,
+                70_000,
+            )
+            .unwrap();
+        assert_eq!(sample.events.len(), 1);
+        assert!(sample.events[0].tap_sp.is_some());
+        assert_eq!(sample.events[0].hunter_slot, None);
+        assert_eq!(sample.events[0].anchor, Anchor::Unknown);
+        assert_eq!(sample.events[0].kind, DamageKind::Hit);
     }
 
     #[test]
@@ -858,6 +914,19 @@ mod tests {
 
     fn mem_word(mem: &mut SparseMemory, addr: u32) -> u32 {
         mem.read_u32(addr).unwrap()
+    }
+
+    struct FailHunterSlot<'a> {
+        inner: &'a mut SparseMemory,
+    }
+
+    impl MemorySource for FailHunterSlot<'_> {
+        fn read(&mut self, addr: u32, buf: &mut [u8]) -> mhdn_rpc::Result<()> {
+            if addr == 0x0814_E620 {
+                return Err(mhdn_rpc::RpcError::ReadFailed { addr });
+            }
+            MemorySource::read(self.inner, addr, buf)
+        }
     }
 
     struct CountMem<'a> {
