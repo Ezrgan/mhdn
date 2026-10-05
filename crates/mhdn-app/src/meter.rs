@@ -1,11 +1,16 @@
-//! Per-monster hunt damage meter (logic only; wired in a later phase).
+//! Per-monster hunt damage. The corner and the diag log read this.
+//!
+//! Attacker attribution stays [`Attacker::Unknown`] until a later phase. Player
+//! totals count only [`Attacker::You`] and are never filled with that unknown damage.
+//!
+//! Filter queries and the quest corner modes are covered by tests. The overlay
+//! draws [`Meter::screen_lines`] today; phase 5 switches modes from Settings.
 
-#![allow(
-    dead_code,
-    reason = "Phase 4 model only; run.rs and corner UI connect in a later phase."
-)]
+#![cfg_attr(not(test), allow(dead_code))]
 
-use mhdn_game::{Attacker, AttackerFilter, MonsterKey};
+use mhdn_game::{Attacker, AttackerFilter, DamageKind, MonsterKey};
+
+use crate::settings::Category;
 
 /// Minimum elapsed time when computing DPS so one hit does not divide by zero.
 pub const MIN_DPS_WINDOW_MS: u64 = 1000;
@@ -15,6 +20,8 @@ pub struct MeterHit {
     pub key: MonsterKey,
     pub amount: u32,
     pub attacker: Attacker,
+    /// Read from the event. This module does not classify hits.
+    pub kind: DamageKind,
     /// Monotonic milliseconds from the caller (same clock for the whole quest).
     pub at_ms: u64,
 }
@@ -32,7 +39,20 @@ pub struct MonsterMeterStats {
     pub damage: u32,
     pub hits: u32,
     pub dps: f32,
+    /// Player damage only (`Attacker::You` / max HP), capped at 100. Unknown damage stays at 0.
     pub pct_of_max_hp: f32,
+}
+
+/// Everything one monster has received, independent of the attacker filter.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MonsterRow {
+    pub key: MonsterKey,
+    pub total: u32,
+    pub poison: u32,
+    pub topple: u32,
+    pub player: u32,
+    pub player_pct: f32,
+    pub dps: f32,
 }
 
 #[derive(Debug, Default)]
@@ -45,6 +65,8 @@ struct MonsterEntry {
     key: MonsterKey,
     damage: [u32; Attacker::ALL.len()],
     hits: [u32; Attacker::ALL.len()],
+    poison: u32,
+    topple: u32,
     first_hit_ms: u64,
     last_hit_ms: u64,
     first_hit_at: [Option<u64>; Attacker::ALL.len()],
@@ -62,6 +84,15 @@ impl Meter {
         let a = hit.attacker.index();
         entry.damage[a] = entry.damage[a].saturating_add(hit.amount);
         entry.hits[a] = entry.hits[a].saturating_add(1);
+        match hit.kind {
+            DamageKind::Poison => {
+                entry.poison = entry.poison.saturating_add(hit.amount);
+            }
+            DamageKind::Topple => {
+                entry.topple = entry.topple.saturating_add(hit.amount);
+            }
+            DamageKind::Hit | DamageKind::Status | DamageKind::Unknown => {}
+        }
         if entry.first_hit_at[a].is_none() {
             entry.first_hit_at[a] = Some(hit.at_ms);
         }
@@ -101,7 +132,10 @@ impl Meter {
                     damage,
                     hits: filtered_hits(&entry.hits, filter),
                     dps: monster_dps(damage, first, last, now_ms),
-                    pct_of_max_hp: pct_of_max_hp(damage, entry.key.max_hp),
+                    pct_of_max_hp: player_pct(
+                        entry.damage[Attacker::You.index()],
+                        entry.key.max_hp,
+                    ),
                 })
             })
             .collect();
@@ -118,6 +152,77 @@ impl Meter {
             .iter()
             .map(|entry| filtered_sum(&entry.damage, filter))
             .sum()
+    }
+
+    /// All damage recorded against every monster. This is not the player's total.
+    pub fn received_total(&self) -> u32 {
+        self.monsters.iter().map(MonsterEntry::received).sum()
+    }
+
+    /// Damage attributed to [`Attacker::You`] only. Unknown hits do not add to this.
+    pub fn player_total(&self) -> u32 {
+        self.monsters
+            .iter()
+            .map(|entry| entry.damage[Attacker::You.index()])
+            .sum()
+    }
+
+    /// Monsters that have received damage, highest total first.
+    pub fn rows(&self, now_ms: u64) -> Vec<MonsterRow> {
+        let mut rows: Vec<MonsterRow> = self
+            .monsters
+            .iter()
+            .filter_map(|entry| entry.row(now_ms))
+            .collect();
+        rows.sort_by(|a, b| {
+            b.total
+                .cmp(&a.total)
+                .then_with(|| a.key.species.cmp(&b.key.species))
+                .then_with(|| a.key.struct_addr.cmp(&b.key.struct_addr))
+        });
+        rows
+    }
+
+    pub fn row(&self, key: MonsterKey, now_ms: u64) -> Option<MonsterRow> {
+        self.monsters
+            .iter()
+            .find(|entry| entry.key == key)
+            .and_then(|entry| entry.row(now_ms))
+    }
+
+    /// Corner text, stacked from the bottom of the screen.
+    ///
+    /// With the total on, each monster gets its received damage and then poison plus
+    /// mount topple. DPS is a third line when that part of the corner is on.
+    ///
+    /// The overlay atlas has no lowercase, so the settings labels are drawn in capitals.
+    /// `MOUNT TOPPLE` is [`Category::Topple`]'s name ("Mount topple"), the cyan number.
+    pub fn screen_lines(&self, show_total: bool, show_dps: bool, now_ms: u64) -> Vec<String> {
+        if !show_total && !show_dps {
+            return Vec::new();
+        }
+        let mut lines = Vec::new();
+        for row in self.rows(now_ms) {
+            if show_total {
+                let mut head = format!("{}  TOTAL {}", row.key.species, row.total);
+                if row.player > 0 {
+                    head.push_str(&format!("  YOU {:.0}%", row.player_pct));
+                }
+                lines.push(head);
+                lines.push(format!(
+                    "{}  {} {}  {} {}",
+                    row.key.species,
+                    Category::Poison.label().to_ascii_uppercase(),
+                    row.poison,
+                    Category::Topple.label().to_ascii_uppercase(),
+                    row.topple,
+                ));
+            }
+            if show_dps {
+                lines.push(format!("{}  DPS {:.0}", row.key.species, row.dps));
+            }
+        }
+        lines
     }
 
     pub fn session_dps(&self, filter: AttackerFilter, now_ms: u64) -> f32 {
@@ -139,6 +244,8 @@ impl Meter {
             key,
             damage: [0; Attacker::ALL.len()],
             hits: [0; Attacker::ALL.len()],
+            poison: 0,
+            topple: 0,
             first_hit_ms: u64::MAX,
             last_hit_ms: 0,
             first_hit_at: [None; Attacker::ALL.len()],
@@ -180,7 +287,7 @@ impl Meter {
             damage,
             hits: filtered_hits(&entry.hits, filter),
             dps: monster_dps(damage, first, last, now_ms),
-            pct_of_max_hp: pct_of_max_hp(damage, entry.key.max_hp),
+            pct_of_max_hp: player_pct(entry.damage[Attacker::You.index()], entry.key.max_hp),
         })
     }
 
@@ -250,6 +357,36 @@ fn whole_quest_corner_text(meter: &Meter, filter: AttackerFilter, now_ms: u64) -
     lines.join("\n")
 }
 
+impl MonsterEntry {
+    fn received(&self) -> u32 {
+        self.damage.iter().copied().sum()
+    }
+
+    fn row(&self, now_ms: u64) -> Option<MonsterRow> {
+        let total = self.received();
+        if total == 0 {
+            return None;
+        }
+        let player = self.damage[Attacker::You.index()];
+        let first = (self.first_hit_ms != u64::MAX).then_some(self.first_hit_ms);
+        let last = first.map(|_| self.last_hit_ms);
+        Some(MonsterRow {
+            key: self.key,
+            total,
+            poison: self.poison,
+            topple: self.topple,
+            player,
+            player_pct: player_pct(player, self.key.max_hp),
+            dps: monster_dps(total, first, last, now_ms),
+        })
+    }
+}
+
+/// Diag line for one monster. Addresses match the `dmg mon=` field.
+pub fn format_meter_line(addr: u32, total: u32, poison: u32, topple: u32) -> String {
+    format!("meter mon=0x{addr:08X} total={total} poison={poison} topple={topple}")
+}
+
 fn filtered_sum(damage: &[u32; Attacker::ALL.len()], filter: AttackerFilter) -> u32 {
     Attacker::ALL
         .iter()
@@ -287,11 +424,12 @@ fn filtered_hits(hits: &[u32; Attacker::ALL.len()], filter: AttackerFilter) -> u
         .sum()
 }
 
-fn pct_of_max_hp(damage: u32, max_hp: u32) -> f32 {
-    if max_hp == 0 {
+/// Share of max HP dealt by the player. Unknown damage contributes nothing, and the result never passes 100.
+fn player_pct(player: u32, max_hp: u32) -> f32 {
+    if player == 0 || max_hp == 0 {
         return 0.0;
     }
-    (damage as f32 / max_hp as f32) * 100.0
+    ((player as f32 / max_hp as f32) * 100.0).min(100.0)
 }
 
 fn dps_window_ms(first_ms: u64, last_ms: u64, now_ms: u64) -> u64 {
@@ -339,8 +477,14 @@ mod tests {
             key: key(addr, species, max_hp, generation),
             amount,
             attacker,
+            kind: DamageKind::Hit,
             at_ms,
         }
+    }
+
+    fn with_kind(mut hit: MeterHit, kind: DamageKind) -> MeterHit {
+        hit.kind = kind;
+        hit
     }
 
     #[test]
@@ -496,7 +640,117 @@ mod tests {
 
     #[test]
     fn max_hp_zero_yields_zero_pct_not_nan() {
-        assert_eq!(pct_of_max_hp(100, 0), 0.0);
-        assert!(!pct_of_max_hp(100, 0).is_nan());
+        assert_eq!(player_pct(100, 0), 0.0);
+        assert!(!player_pct(100, 0).is_nan());
+        assert_eq!(player_pct(0, 800), 0.0);
+    }
+
+    #[test]
+    fn damage_on_one_monster_does_not_enter_the_other_total() {
+        let mut meter = Meter::new();
+        meter.add(hit(0x1000, 7, 5_000, 1, 40, Attacker::Unknown, 0));
+        meter.add(with_kind(
+            hit(0x1000, 7, 5_000, 1, 5, Attacker::Unknown, 100),
+            DamageKind::Poison,
+        ));
+        meter.add(with_kind(
+            hit(0x2000, 42, 8_000, 1, 100, Attacker::Unknown, 200),
+            DamageKind::Topple,
+        ));
+        meter.add(with_kind(
+            hit(0x1000, 7, 5_000, 1, 40, Attacker::Unknown, 300),
+            DamageKind::Status,
+        ));
+        let rows = meter.rows(1_000);
+        let a = rows
+            .iter()
+            .find(|row| row.key.struct_addr == 0x1000)
+            .unwrap();
+        let b = rows
+            .iter()
+            .find(|row| row.key.struct_addr == 0x2000)
+            .unwrap();
+        assert_eq!(a.total, 85);
+        assert_eq!(a.poison, 5);
+        assert_eq!(a.topple, 0);
+        assert_eq!(b.total, 100);
+        assert_eq!(b.poison, 0);
+        assert_eq!(b.topple, 100);
+        assert_eq!(meter.received_total(), 185);
+        assert_eq!(meter.player_total(), 0);
+    }
+
+    #[test]
+    fn poison_and_topple_accumulate_on_the_event_monster_not_a_session_bag() {
+        let mut meter = Meter::new();
+        meter.add(with_kind(
+            hit(0x1000, 30, 774, 1, 5, Attacker::Unknown, 0),
+            DamageKind::Poison,
+        ));
+        meter.add(with_kind(
+            hit(0x1000, 30, 774, 1, 5, Attacker::Unknown, 1_000),
+            DamageKind::Poison,
+        ));
+        meter.add(with_kind(
+            hit(0x2000, 31, 774, 1, 150, Attacker::Unknown, 2_000),
+            DamageKind::Topple,
+        ));
+        let rows = meter.rows(2_000);
+        assert_eq!(rows.len(), 2);
+        let poisoned = rows
+            .iter()
+            .find(|row| row.key.struct_addr == 0x1000)
+            .unwrap();
+        let toppled = rows
+            .iter()
+            .find(|row| row.key.struct_addr == 0x2000)
+            .unwrap();
+        assert_eq!(poisoned.poison, 10);
+        assert_eq!(poisoned.topple, 0);
+        assert_eq!(poisoned.total, 10);
+        assert_eq!(toppled.topple, 150);
+        assert_eq!(toppled.poison, 0);
+        assert_eq!(toppled.total, 150);
+        let lines = meter.screen_lines(true, false, 2_000);
+        assert!(lines.iter().any(|line| line.contains("POISON 10")));
+        assert!(lines.iter().any(|line| line.contains("MOUNT TOPPLE 150")));
+        assert!(!lines.iter().any(|line| line.contains("YOU")));
+        assert_eq!(
+            format_meter_line(0x1000, poisoned.total, poisoned.poison, poisoned.topple),
+            "meter mon=0x00001000 total=10 poison=10 topple=0"
+        );
+    }
+
+    #[test]
+    fn unknown_damage_does_not_increment_the_player_total() {
+        let mut meter = Meter::new();
+        meter.add(hit(0x1000, 7, 800, 1, 400, Attacker::Unknown, 0));
+        meter.add(hit(0x2000, 8, 800, 1, 50, Attacker::Unknown, 10));
+        assert_eq!(meter.player_total(), 0);
+        assert_eq!(meter.received_total(), 450);
+        let rows = meter.rows(1_000);
+        assert!(rows
+            .iter()
+            .all(|row| row.player == 0 && row.player_pct == 0.0));
+        let lines = meter.screen_lines(true, true, 1_000);
+        assert!(!lines.is_empty());
+        assert!(lines.iter().all(|line| !line.contains("YOU")));
+    }
+
+    #[test]
+    fn player_percentage_never_exceeds_one_hundred_and_is_not_the_unknown_total() {
+        let mut meter = Meter::new();
+        meter.add(hit(0x1000, 7, 100, 1, 250, Attacker::You, 0));
+        meter.add(hit(0x1000, 7, 100, 1, 400, Attacker::Unknown, 10));
+        let row = meter.row(key(0x1000, 7, 100, 1), 1_000).unwrap();
+        assert_eq!(row.player, 250);
+        assert_eq!(row.total, 650);
+        assert!(row.player_pct <= 100.0);
+        assert!((row.player_pct - 100.0).abs() < 0.01);
+        assert_eq!(meter.player_total(), 250);
+        let line = &meter.screen_lines(true, false, 1_000)[0];
+        assert!(line.contains("TOTAL 650"));
+        assert!(line.contains("YOU 100%"));
+        assert!(!line.contains("YOU 650"));
     }
 }
