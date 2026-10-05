@@ -156,6 +156,21 @@ Validated in a live 31-hit combat session:
 > targets in one area. The overlay now anchors tap hits on the monster position (`HP − 0x320`) plus the
 > species height and ignores `sp[2]`.
 
+## Tap callers
+
+The hook at `0x008D03E8` stores `lr`, the return address of whoever applied the HP change. Seven solo quests showed three callers:
+
+- `0x008BA260` (~97%): normal hits. `sp[3]` is the raw damage.
+- `0x008BA870`: fixed damage when a mounted monster is toppled. The amount is always 150 in high rank or 100 in low rank. All 12 events of amount 100 or 150 came from this caller.
+- `0x008BA214`: status damage. Poison ticks are amount 5 every 2.0 s exactly, with `sp[0] = 0` and `sp[3] = 0` (no raw damage word).
+
+The overlay classifies the status caller as poison when the matched monster is already poisoned, and as generic status otherwise. The mount-topple caller is its own kind. Any other `lr`, including an unknown one, stays a normal hit.
+
+Open:
+
+- The status caller also emits a burst of ticks about every 0.5 s, faster than the 2.0 s poison cadence.
+- Two 40-damage events on a small monster came from the status caller. That may be another status, or monster-vs-monster damage.
+
 ## 8. Scene Detection (correction)
 
 Same session, 5 minutes of continuous hunting with the hunter moving every sample:

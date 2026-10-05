@@ -26,6 +26,8 @@ pub enum DamageConfidence {
 pub enum DamageKind {
     Hit,
     Poison,
+    Status,
+    Topple,
     Unknown,
 }
 
@@ -124,7 +126,7 @@ pub fn events_from_tap(events: &[TapEvent]) -> Vec<DamageEvent> {
             monster: event.monster,
             amount: amount as u32,
             lr: event.lr,
-            kind: DamageKind::Hit,
+            kind: kind_from_caller(event.lr, false),
             source: EventSource::Tap,
             confidence: DamageConfidence::Exact,
             key: None,
@@ -255,7 +257,7 @@ fn tap_events(
             monster: tap.event.monster,
             amount: tap.event.damage() as u32,
             lr: tap.event.lr,
-            kind: DamageKind::Hit,
+            kind: kind_from_caller(tap.event.lr, monster.poisoned),
             source: EventSource::Tap,
             confidence: DamageConfidence::Exact,
             key: Some(monster.key),
@@ -464,6 +466,18 @@ fn kind_for(monster: &LiveMonster, amount: u32, poison_tick: Option<u32>) -> Dam
     }
 }
 
+/// `lr` at the tap names the caller. An unknown return address stays a normal hit.
+/// Poison is only the status caller while the matched monster is already poisoned;
+/// the same caller is generic status otherwise.
+fn kind_from_caller(lr: u32, poisoned: bool) -> DamageKind {
+    match lr {
+        crate::tap::CALLER_STATUS if poisoned => DamageKind::Poison,
+        crate::tap::CALLER_STATUS => DamageKind::Status,
+        crate::tap::CALLER_MOUNT_TOPPLE => DamageKind::Topple,
+        _ => DamageKind::Hit,
+    }
+}
+
 fn passive_like(
     monster: &LiveMonster,
     frame: u32,
@@ -633,5 +647,44 @@ mod tests {
         assert_eq!(composed.unmatched.len(), 1);
         assert_eq!(composed.unmatched[0].object, 0x1111_0000);
         assert_eq!(composed.unmatched[0].lr, 0x008B_A260);
+    }
+
+    #[test]
+    fn tap_caller_sets_the_damage_kind() {
+        use crate::tap::{CALLER_HIT, CALLER_MOUNT_TOPPLE, CALLER_STATUS};
+
+        let cases = [
+            (CALLER_HIT, false, DamageKind::Hit),
+            (0x0011_2233, false, DamageKind::Hit),
+            (CALLER_MOUNT_TOPPLE, false, DamageKind::Topple),
+            (CALLER_MOUNT_TOPPLE, true, DamageKind::Topple),
+            (CALLER_STATUS, false, DamageKind::Status),
+            (CALLER_STATUS, true, DamageKind::Poison),
+            (CALLER_HIT, true, DamageKind::Hit),
+        ];
+        for (index, (lr, poisoned, kind)) in cases.into_iter().enumerate() {
+            let mut monster = live(769, Some(774), 774);
+            monster.poisoned = poisoned;
+            let mut event = hit(index as u32 + 1, -5, monster.key.struct_addr);
+            event.lr = lr;
+            let composed = compose(
+                Scene::InQuest,
+                2,
+                &[monster],
+                &[ResolvedTap {
+                    event,
+                    anchor: Anchor::Unknown,
+                }],
+                None,
+                None,
+            );
+            let tap = composed
+                .events
+                .iter()
+                .find(|event| event.source == EventSource::Tap)
+                .expect("tap event");
+            assert_eq!(tap.kind, kind, "lr={lr:#010X} poisoned={poisoned}");
+            assert_eq!(composed.events.len(), 1);
+        }
     }
 }

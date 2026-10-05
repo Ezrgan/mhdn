@@ -38,7 +38,7 @@ pub use snapshot::{ReadReject, RejectedRead};
 pub use tap::{
     install as tap_install, install_wide as tap_install_wide, read_events as tap_read_events,
     read_events_wide as tap_read_events_wide, uninstall as tap_uninstall, wide_requested,
-    InstallOutcome, PatchMemory, RingLayout, TapError, TapEvent, CAVE_ADDR, ENTRY_SIZE,
-    EXPECTED_HOOK, EXPECTED_HP_STORE, EXPECTED_NEXT, HOOK_ADDR, RETURN_ADDR, RING_ADDR,
-    WRITE_SEQ_ADDR,
+    InstallOutcome, PatchMemory, RingLayout, TapError, TapEvent, CALLER_HIT, CALLER_MOUNT_TOPPLE,
+    CALLER_STATUS, CAVE_ADDR, ENTRY_SIZE, EXPECTED_HOOK, EXPECTED_HP_STORE, EXPECTED_NEXT,
+    HOOK_ADDR, RETURN_ADDR, RING_ADDR, WRITE_SEQ_ADDR,
 };

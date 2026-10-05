@@ -346,7 +346,8 @@ fn find_monster<'a>(event: &DamageEvent, monsters: &'a [MonsterState]) -> Option
 
 fn hit_kind(kind: DamageKind) -> HitKind {
     match kind {
-        DamageKind::Poison => HitKind::Poison,
+        DamageKind::Poison | DamageKind::Status => HitKind::Poison,
+        DamageKind::Topple => HitKind::Topple,
         DamageKind::Hit | DamageKind::Unknown => HitKind::Hit,
     }
 }
@@ -392,7 +393,7 @@ impl Recount {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mhdn_fx::{LIFE_MS, ORANGE, POISON, SCATTER_PX};
+    use mhdn_fx::{LIFE_MS, ORANGE, POISON, SCATTER_PX, TOPPLE};
     use mhdn_game::{
         CameraState, DamageConfidence, EventSource, FovUnit, MonsterKey, Vec3 as GameVec3,
     };
@@ -726,6 +727,47 @@ mod tests {
             .expect("spike");
         assert_eq!(orange.rgb, ORANGE);
         assert!((orange.mag_scale - 1.25).abs() < 0.001);
+    }
+
+    #[test]
+    fn status_and_poison_share_the_poison_category_and_topple_stays_large() {
+        use crate::settings::Category;
+
+        assert_eq!(super::hit_kind(DamageKind::Poison), HitKind::Poison);
+        assert_eq!(super::hit_kind(DamageKind::Status), HitKind::Poison);
+        assert_eq!(super::hit_kind(DamageKind::Topple), HitKind::Topple);
+        assert_eq!(super::hit_kind(DamageKind::Hit), HitKind::Hit);
+
+        let mut view = CombatView::new();
+        view.observe(Scene::InQuest, 1);
+        let monsters = [monster(0x1000, true)];
+        view.ingest(
+            &[
+                event(5, Anchor::Unknown, DamageKind::Poison),
+                event(40, Anchor::Unknown, DamageKind::Status),
+                event(150, Anchor::Unknown, DamageKind::Topple),
+            ],
+            &monsters,
+            |_, _| 1.0,
+        );
+        let spawned = |text: &str| {
+            let number = view
+                .pool
+                .live()
+                .find(|number| number.text == text)
+                .unwrap_or_else(|| panic!("missing {text}"));
+            (number.rgb, number.mag_scale)
+        };
+        let (poison_rgb, _) = spawned("5");
+        let (status_rgb, _) = spawned("40");
+        let (topple_rgb, topple_scale) = spawned("150");
+        assert_eq!(poison_rgb, POISON);
+        assert_eq!(status_rgb, POISON);
+        assert_eq!(Category::from_spawn_rgb(poison_rgb), Category::Poison);
+        assert_eq!(Category::from_spawn_rgb(status_rgb), Category::Poison);
+        assert_eq!(topple_rgb, TOPPLE);
+        assert!((topple_scale - 1.25).abs() < 0.001);
+        assert_eq!(Category::from_spawn_rgb(topple_rgb), Category::Topple);
     }
 
     #[test]
