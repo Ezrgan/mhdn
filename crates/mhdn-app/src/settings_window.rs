@@ -72,6 +72,22 @@ pub enum WindowFlow {
     CloseRequested,
 }
 
+/// Whether `event` should queue another frame on top of the one in progress.
+///
+/// `RedrawRequested` is that frame. Queueing another one calls
+/// `request_redraw`, which on macOS wakes the shared run loop at once. The
+/// settings surface then presents with vsync, so the process wakes at the
+/// display rate while the overlay is idle: no combat, no pumping, and
+/// `redraws` stays 0. A later frame is requested only from
+/// [`SettingsWindow::draw`] when egui's repaint delay is zero.
+pub fn schedules_another_frame(event: &WindowEvent, egui_repaint: bool) -> bool {
+    match event {
+        WindowEvent::CloseRequested | WindowEvent::RedrawRequested => false,
+        WindowEvent::Resized(_) => true,
+        _ => egui_repaint,
+    }
+}
+
 pub struct SettingsWindow {
     window: Arc<Window>,
     ctx: egui::Context,
@@ -159,21 +175,25 @@ impl SettingsWindow {
     }
 
     pub fn on_event(&mut self, event: &WindowEvent) -> WindowFlow {
-        match event {
-            WindowEvent::CloseRequested => return WindowFlow::CloseRequested,
-            WindowEvent::RedrawRequested => return WindowFlow::Redraw,
-            WindowEvent::Resized(size) => {
-                if let (Some(width), Some(height)) =
-                    (NonZeroU32::new(size.width), NonZeroU32::new(size.height))
-                {
-                    self.painter
-                        .on_window_resized(ViewportId::ROOT, width, height);
-                }
-            }
-            _ => {}
+        if matches!(event, WindowEvent::CloseRequested) {
+            return WindowFlow::CloseRequested;
         }
-        let response = self.state.on_window_event(&self.window, event);
-        if response.repaint || matches!(event, WindowEvent::Resized(_)) {
+        if let WindowEvent::Resized(size) = event {
+            if let (Some(width), Some(height)) =
+                (NonZeroU32::new(size.width), NonZeroU32::new(size.height))
+            {
+                self.painter
+                    .on_window_resized(ViewportId::ROOT, width, height);
+            }
+        }
+        // egui reports repaint for `RedrawRequested` itself. Asking it would
+        // queue the next frame from the one already being painted.
+        let egui_repaint = if matches!(event, WindowEvent::RedrawRequested) {
+            false
+        } else {
+            self.state.on_window_event(&self.window, event).repaint
+        };
+        if schedules_another_frame(event, egui_repaint) {
             WindowFlow::Redraw
         } else {
             WindowFlow::Nothing
@@ -376,5 +396,25 @@ mod tests {
         }
         assert_eq!(LOG_FILTER, "*:Info RPC_Server:Warning");
         assert!(!text.to_lowercase().contains("reinicia"));
+    }
+
+    #[test]
+    fn an_idle_settings_redraw_does_not_schedule_another_wake() {
+        // No combat and no pumping: the overlay must be able to sleep.
+        // egui marks `RedrawRequested` itself as a repaint. That must not
+        // become another `request_redraw`, or the shared loop wakes at 60 Hz
+        // while the overlay draws nothing.
+        assert!(!schedules_another_frame(
+            &WindowEvent::RedrawRequested,
+            true
+        ));
+        assert!(schedules_another_frame(
+            &WindowEvent::Resized(winit::dpi::PhysicalSize::new(8, 8)),
+            false
+        ));
+        assert!(!schedules_another_frame(
+            &WindowEvent::Focused(false),
+            false
+        ));
     }
 }

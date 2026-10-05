@@ -3,14 +3,14 @@
 use mhdn_rpc::MemorySource;
 use xxhash_rust::xxh3::xxh3_64;
 
-use crate::damage::{compose_sources, PluginHit, ResolvedTap};
+use crate::damage::{compose_sources, DmgDrop, PluginHit, ResolvedTap, UnmatchedTap};
 use crate::model::{Anchor, MonsterState, Snapshot};
 use crate::profile::Profile;
 use crate::scene::{Scene, SceneMachine};
-use crate::snapshot::{capture, CaptureCache, SnapshotError};
+use crate::snapshot::{capture, CaptureCache, RejectedRead, SnapshotError};
 use crate::tap::{
-    hook_branch, install, uninstall, InstallOutcome, PatchMemory, TapError, TapEvent, ENTRY_SIZE,
-    HOOK_ADDR, RING_ADDR, WRITE_SEQ_ADDR,
+    hook_branch, install, install_wide, uninstall, InstallOutcome, PatchMemory, RingLayout,
+    TapError, TapEvent, HOOK_ADDR, RING_ADDR, WIDE_ENTRY_SIZE,
 };
 use crate::track::MonsterTrack;
 
@@ -31,11 +31,15 @@ pub struct Pipeline {
     cache: CaptureCache,
     last_tap_seq: u32,
     lost_tap: u64,
+    rejected: Vec<RejectedRead>,
+    drops: Vec<DmgDrop>,
+    unmatched: Vec<UnmatchedTap>,
     failures: u32,
     fingerprints_ok: Option<bool>,
     tap_installed: bool,
     tap_blocked: bool,
     plugin_present: Option<bool>,
+    wide: bool,
 }
 
 impl Default for Pipeline {
@@ -46,17 +50,38 @@ impl Default for Pipeline {
 
 impl Pipeline {
     pub fn new() -> Self {
+        Self::with_wide(false)
+    }
+
+    /// Reads `MHDN_TAP_WIDE` once, when the session starts.
+    pub fn from_env() -> Self {
+        Self::with_wide(crate::tap::wide_requested())
+    }
+
+    pub fn with_wide(wide: bool) -> Self {
         Self {
             scene: SceneMachine::new(),
             track: MonsterTrack::default(),
             cache: CaptureCache::default(),
             last_tap_seq: 0,
             lost_tap: 0,
+            rejected: Vec::new(),
+            drops: Vec::new(),
+            unmatched: Vec::new(),
             failures: 0,
             fingerprints_ok: None,
             tap_installed: false,
             tap_blocked: false,
             plugin_present: None,
+            wide,
+        }
+    }
+
+    fn ring(&self) -> RingLayout {
+        if self.wide {
+            RingLayout::wide()
+        } else {
+            RingLayout::standard()
         }
     }
 
@@ -85,12 +110,46 @@ impl Pipeline {
         self.lost_tap
     }
 
+    /// Impossible HP reads from the latest `poll`.
+    pub fn take_rejected_reads(&mut self) -> Vec<RejectedRead> {
+        std::mem::take(&mut self.rejected)
+    }
+
+    /// HP-delta and residual events dropped because they exceeded the bar.
+    pub fn take_dmg_drops(&mut self) -> Vec<DmgDrop> {
+        std::mem::take(&mut self.drops)
+    }
+
+    /// Tap hits whose object was not in the monster list.
+    pub fn take_unmatched_taps(&mut self) -> Vec<UnmatchedTap> {
+        std::mem::take(&mut self.unmatched)
+    }
+
+    pub(crate) fn drain_diag_lines(&mut self) -> Vec<String> {
+        let mut lines = Vec::new();
+        lines.extend(
+            self.take_rejected_reads()
+                .iter()
+                .map(RejectedRead::diag_line),
+        );
+        lines.extend(self.take_dmg_drops().iter().map(DmgDrop::diag_line));
+        lines.extend(
+            self.take_unmatched_taps()
+                .iter()
+                .map(UnmatchedTap::diag_line),
+        );
+        lines
+    }
+
     pub fn poll(
         &mut self,
         mem: &mut dyn MemorySource,
         profile: &Profile,
         host_us: u64,
     ) -> Result<Sample, SnapshotError> {
+        self.rejected.clear();
+        self.drops.clear();
+        self.unmatched.clear();
         let raw = match capture(mem, profile, &mut self.cache) {
             Ok(Some(raw)) => raw,
             Ok(None) => {
@@ -106,6 +165,7 @@ impl Pipeline {
             }
         };
         self.failures = 0;
+        self.rejected = raw.rejected;
         // The profile's in-quest word reads 0 for most of a live hunt. A resolved monster list is the hunt.
         let hunting = !raw.monsters.is_empty();
         let change = self.scene.observe(hunting, raw.loading && !hunting);
@@ -134,6 +194,7 @@ impl Pipeline {
                 visible: raw.visible,
                 large: raw.large,
                 poisoned: raw.poisoned,
+                slot: raw.slot,
             })
             .collect();
         Ok(Sample {
@@ -173,7 +234,11 @@ impl Pipeline {
         if self.scene.committed() != Scene::InQuest {
             return Ok(());
         }
-        match install(mem) {
+        match if self.wide {
+            install_wide(mem)
+        } else {
+            install(mem)
+        } {
             Ok(InstallOutcome::Installed | InstallOutcome::AlreadyInstalled) => {
                 self.adopt_tap(mem);
                 Ok(())
@@ -181,6 +246,7 @@ impl Pipeline {
             Err(
                 TapError::ForeignHook { .. }
                 | TapError::CaveOccupied
+                | TapError::RingOccupied
                 | TapError::UnexpectedWord { .. },
             ) => {
                 self.tap_blocked = true;
@@ -204,7 +270,7 @@ impl Pipeline {
         if self.tap_installed {
             return;
         }
-        if let Ok(seq) = read_patch_u32(mem, WRITE_SEQ_ADDR) {
+        if let Ok(seq) = read_patch_u32(mem, self.ring().write_seq) {
             self.last_tap_seq = seq;
             self.tap_installed = true;
         }
@@ -255,7 +321,7 @@ impl Pipeline {
                 })
                 .collect()
         };
-        compose_sources(
+        let composed = compose_sources(
             Scene::InQuest,
             frame,
             live,
@@ -263,11 +329,15 @@ impl Pipeline {
             plugin.as_deref(),
             profile.species.poison_tick,
             tap_active,
-        )
+        );
+        self.drops = composed.drops;
+        self.unmatched = composed.unmatched;
+        composed.events
     }
 
     fn read_new_taps(&mut self, mem: &mut dyn MemorySource) -> Vec<TapEvent> {
-        let Ok(write_seq) = mem.read_u32(WRITE_SEQ_ADDR) else {
+        let layout = self.ring();
+        let Ok(write_seq) = mem.read_u32(layout.write_seq) else {
             return Vec::new();
         };
         if write_seq == 0 || write_seq == self.last_tap_seq {
@@ -275,19 +345,24 @@ impl Pipeline {
         }
         if self.last_tap_seq != 0 {
             let gap = write_seq.wrapping_sub(self.last_tap_seq);
-            if gap > 64 {
-                self.lost_tap = self.lost_tap.saturating_add(u64::from(gap - 64));
+            if gap > layout.capacity {
+                self.lost_tap = self
+                    .lost_tap
+                    .saturating_add(u64::from(gap - layout.capacity));
             }
         }
-        let start = write_seq.saturating_sub(64).max(self.last_tap_seq);
+        let start = write_seq
+            .saturating_sub(layout.capacity)
+            .max(self.last_tap_seq);
         let mut events = Vec::new();
         for seq in (start + 1)..=write_seq {
-            let addr = RING_ADDR + (seq % 64) * ENTRY_SIZE;
-            let mut buf = [0u8; ENTRY_SIZE as usize];
-            if mem.read(addr, &mut buf).is_err() {
+            let addr = RING_ADDR + (seq % layout.capacity) * layout.entry_size;
+            let mut buf = [0u8; WIDE_ENTRY_SIZE as usize];
+            let len = layout.entry_size as usize;
+            if mem.read(addr, &mut buf[..len]).is_err() {
                 continue;
             }
-            if let Some(event) = TapEvent::decode(&buf) {
+            if let Some(event) = TapEvent::decode(&buf[..len]) {
                 if event.seq == seq && event.seq > self.last_tap_seq {
                     events.push(event);
                 }
@@ -368,11 +443,14 @@ fn read_patch_u32(mem: &mut dyn PatchMemory, addr: u32) -> Result<u32, TapError>
 mod tests {
     use super::*;
     use crate::model::HP_FROM_OBJECT;
+    use crate::profile::SpeciesAnchor;
     use crate::scene::Scene;
+    use crate::snapshot::ReadReject;
     use crate::sparse::SparseMemory;
     use crate::support::{hp_addr, live_profile, place_monster, stage_hunt};
     use crate::tap::{
         hook_branch, ENTRY_SIZE, EXPECTED_HOOK, EXPECTED_HP_STORE, EXPECTED_NEXT, RING_ADDR,
+        WIDE_CAPACITY, WIDE_ENTRY_SIZE, WIDE_WRITE_SEQ_ADDR, WRITE_SEQ_ADDR,
     };
     use crate::{DamageConfidence, DamageKind, EventSource};
     use mhdn_rpc::MemorySource;
@@ -414,6 +492,10 @@ mod tests {
         assert_eq!(events[0].source, EventSource::Passive);
         assert_eq!(events[0].confidence, DamageConfidence::HpDelta);
         assert_eq!(events[0].kind, DamageKind::Hit);
+        assert_eq!(events[0].hp_before, Some(774));
+        assert_eq!(events[0].hp_after, Some(760));
+        assert_eq!(events[0].frames_since, Some(1));
+        assert!(events[0].tap_sp.is_none());
         assert_eq!(sample.snapshot.unwrap().monsters[0].pos.x, 11.0);
     }
 
@@ -432,6 +514,9 @@ mod tests {
             DamageConfidence::AggregatedHpDelta
         );
         assert_eq!(sample.events[0].kind, DamageKind::Poison);
+        assert_eq!(sample.events[0].frames_since, Some(6));
+        assert_eq!(sample.events[0].hp_before, Some(774));
+        assert_eq!(sample.events[0].hp_after, Some(769));
     }
 
     #[test]
@@ -463,6 +548,10 @@ mod tests {
         assert_eq!(sample.events[0].confidence, DamageConfidence::Exact);
         assert_eq!(sample.events[0].amount, 14);
         assert_eq!(sample.events[0].part_hp, Some(90));
+        assert_eq!(sample.events[0].tap_sp, Some([0, 90, 0x300A_0000, 0, 0]));
+        assert_eq!(sample.events[0].hp_before, Some(774));
+        assert_eq!(sample.events[0].hp_after, Some(760));
+        assert_eq!(sample.events[0].frames_since, Some(1));
         assert_eq!(sample.events[0].anchor, Anchor::Unknown);
         assert_eq!(
             sample.events[0].key.map(|key| key.struct_addr),
@@ -566,6 +655,192 @@ mod tests {
             per_second <= 2500,
             "steady-state reads {reads} * 60 = {per_second}",
             reads = counted.reads
+        );
+    }
+
+    #[test]
+    fn wide_tap_reads_the_short_ring_and_keeps_the_extra_stack_words() {
+        let (_default, mut mem, profile) = prepared();
+        let mut pipeline = Pipeline::with_wide(true);
+        warm(&mut pipeline, &mut mem, &profile);
+        pipeline.maintain_tap(&mut mem, &profile).unwrap();
+        let object = hp_addr(0) - HP_FROM_OBJECT;
+        let mut raw = [0u8; WIDE_ENTRY_SIZE as usize];
+        raw[0..4].copy_from_slice(&1u32.to_le_bytes());
+        raw[4..8].copy_from_slice(&(-14i32 as u32).to_le_bytes());
+        raw[8..12].copy_from_slice(&object.to_le_bytes());
+        raw[80..84].copy_from_slice(&0x0102_0304u32.to_le_bytes());
+        let addr = RING_ADDR + (1 % WIDE_CAPACITY) * WIDE_ENTRY_SIZE;
+        mem.write_bytes(addr, &raw);
+        mem.write_u32(WIDE_WRITE_SEQ_ADDR, 1);
+        mem.write_u32(profile.frame_counter.addr.unwrap(), 4);
+        place_monster(&mut mem, 0, 760, 774, 1, [10.0, 20.0, 30.0], 0);
+        let sample = pipeline.poll(&mut mem, &profile, 70_000).unwrap();
+        assert_eq!(sample.events.len(), 1);
+        assert_eq!(sample.events[0].source, EventSource::Tap);
+        assert_eq!(sample.events[0].amount, 14);
+        assert_eq!(
+            sample.events[0].tap_sp_hi.map(|words| words[10]),
+            Some(0x0102_0304)
+        );
+        mem.write_u32(WIDE_WRITE_SEQ_ADDR, 5);
+        mem.write_u32(profile.frame_counter.addr.unwrap(), 5);
+        pipeline.poll(&mut mem, &profile, 80_000).unwrap();
+        assert_eq!(pipeline.lost_tap(), 2);
+    }
+
+    #[test]
+    fn garbage_hp_then_a_real_read_emits_nothing() {
+        let (mut pipeline, mut mem, profile) = prepared();
+        warm(&mut pipeline, &mut mem, &profile);
+        mem.write_u32(profile.frame_counter.addr.unwrap(), 4);
+        place_monster(&mut mem, 0, 496_093_848, 774, 1, [10.0, 20.0, 30.0], 0);
+        let bad = pipeline.poll(&mut mem, &profile, 64_000).unwrap();
+        assert!(bad.events.is_empty());
+        assert!(bad.snapshot.unwrap().monsters.is_empty());
+        let rejected = pipeline.take_rejected_reads();
+        assert_eq!(rejected.len(), 1);
+        assert_eq!(rejected[0].hp_addr, hp_addr(0));
+        assert_eq!(rejected[0].species, 1);
+        assert_eq!(rejected[0].hp, 496_093_848);
+        assert_eq!(rejected[0].max_hp, 774);
+        assert_eq!(rejected[0].reason, ReadReject::HpAboveMax);
+        assert_eq!(
+            rejected[0].diag_line(),
+            format!(
+                "hp_bad addr=0x{:08X} species=1 hp=496093848 max_hp=774 reason=hp_above_max",
+                hp_addr(0)
+            )
+        );
+
+        mem.write_u32(profile.frame_counter.addr.unwrap(), 5);
+        place_monster(&mut mem, 0, 760, 774, 1, [10.0, 20.0, 30.0], 0);
+        let restored = pipeline.poll(&mut mem, &profile, 80_000).unwrap();
+        assert!(restored.events.is_empty());
+        assert_eq!(restored.snapshot.unwrap().monsters.len(), 1);
+
+        mem.write_u32(profile.frame_counter.addr.unwrap(), 6);
+        place_monster(&mut mem, 0, 750, 774, 1, [10.0, 20.0, 30.0], 0);
+        let hit = pipeline.poll(&mut mem, &profile, 96_000).unwrap();
+        assert_eq!(hit.events.len(), 1);
+        assert_eq!(hit.events[0].amount, 10);
+        assert!(pipeline.take_dmg_drops().is_empty());
+    }
+
+    #[test]
+    fn one_absent_sample_during_an_area_change_emits_nothing() {
+        let (mut pipeline, mut mem, profile) = prepared();
+        warm(&mut pipeline, &mut mem, &profile);
+        mem.write_u32(profile.frame_counter.addr.unwrap(), 4);
+        mem.write_u32(0x082C_E730 + 0x14, 0);
+        let gap = pipeline.poll(&mut mem, &profile, 64_000).unwrap();
+        assert!(gap.events.is_empty());
+        assert!(gap.snapshot.unwrap().monsters.is_empty());
+        assert!(pipeline.take_rejected_reads().is_empty());
+
+        mem.write_u32(profile.frame_counter.addr.unwrap(), 5);
+        place_monster(&mut mem, 0, 700, 774, 1, [10.0, 20.0, 30.0], 0);
+        let back = pipeline.poll(&mut mem, &profile, 80_000).unwrap();
+        assert!(back.events.is_empty());
+        assert_eq!(back.snapshot.unwrap().monsters[0].hp, 700);
+
+        mem.write_u32(profile.frame_counter.addr.unwrap(), 6);
+        place_monster(&mut mem, 0, 690, 774, 1, [10.0, 20.0, 30.0], 0);
+        let hit = pipeline.poll(&mut mem, &profile, 96_000).unwrap();
+        assert_eq!(hit.events.len(), 1);
+        assert_eq!(hit.events[0].amount, 10);
+    }
+
+    #[test]
+    fn a_reused_slot_with_another_species_emits_nothing() {
+        let (mut pipeline, mut mem, profile) = prepared();
+        warm(&mut pipeline, &mut mem, &profile);
+        mem.write_u32(profile.frame_counter.addr.unwrap(), 4);
+        place_monster(&mut mem, 0, 100, 500, 2, [10.0, 20.0, 30.0], 0);
+        let reused = pipeline.poll(&mut mem, &profile, 64_000).unwrap();
+        assert!(reused.events.is_empty());
+        let monster = &reused.snapshot.unwrap().monsters[0];
+        assert_eq!(monster.key.species, 2);
+        assert_eq!(monster.key.generation, 2);
+
+        mem.write_u32(profile.frame_counter.addr.unwrap(), 5);
+        place_monster(&mut mem, 0, 90, 500, 2, [10.0, 20.0, 30.0], 0);
+        let hit = pipeline.poll(&mut mem, &profile, 80_000).unwrap();
+        assert_eq!(hit.events.len(), 1);
+        assert_eq!(hit.events[0].amount, 10);
+    }
+
+    #[test]
+    fn max_hp_outside_the_plausible_range_is_rejected() {
+        let (mut pipeline, mut mem, profile) = prepared();
+        warm(&mut pipeline, &mut mem, &profile);
+        mem.write_u32(profile.frame_counter.addr.unwrap(), 4);
+        place_monster(&mut mem, 0, 200_000, 200_000, 1, [10.0, 20.0, 30.0], 0);
+        let ceiling = pipeline.poll(&mut mem, &profile, 64_000).unwrap();
+        assert_eq!(ceiling.snapshot.unwrap().monsters.len(), 1);
+        assert!(pipeline.take_rejected_reads().is_empty());
+
+        mem.write_u32(profile.frame_counter.addr.unwrap(), 5);
+        place_monster(&mut mem, 0, 100, 200_001, 1, [10.0, 20.0, 30.0], 0);
+        let bad = pipeline.poll(&mut mem, &profile, 80_000).unwrap();
+        assert!(bad.events.is_empty());
+        assert!(bad.snapshot.unwrap().monsters.is_empty());
+        let rejected = pipeline.take_rejected_reads();
+        assert_eq!(rejected.len(), 1);
+        assert_eq!(rejected[0].hp, 100);
+        assert_eq!(rejected[0].max_hp, 200_001);
+        assert_eq!(rejected[0].reason, ReadReject::MaxHpRange);
+        assert!(rejected[0].diag_line().contains("reason=max_hp_range"));
+    }
+
+    #[test]
+    fn an_unlisted_species_is_rejected_when_the_profile_has_a_table() {
+        let (mut pipeline, mut mem, mut profile) = prepared();
+        profile.species.by_id.insert(
+            "1".to_string(),
+            SpeciesAnchor {
+                anchor_height: 150.0,
+            },
+        );
+        warm(&mut pipeline, &mut mem, &profile);
+        mem.write_u32(profile.frame_counter.addr.unwrap(), 4);
+        place_monster(&mut mem, 0, 774, 774, 44, [10.0, 20.0, 30.0], 0);
+        let bad = pipeline.poll(&mut mem, &profile, 64_000).unwrap();
+        assert!(bad.events.is_empty());
+        assert!(bad.snapshot.unwrap().monsters.is_empty());
+        let rejected = pipeline.take_rejected_reads();
+        assert_eq!(rejected.len(), 1);
+        assert_eq!(rejected[0].species, 44);
+        assert_eq!(rejected[0].reason, ReadReject::Species);
+        assert!(rejected[0].diag_line().contains("reason=species"));
+    }
+
+    #[test]
+    fn a_tap_for_an_unknown_object_is_counted_and_not_emitted() {
+        let (mut pipeline, mut mem, profile) = prepared();
+        warm(&mut pipeline, &mut mem, &profile);
+        pipeline.maintain_tap(&mut mem, &profile).unwrap();
+        let lr = 0x008B_A260;
+        write_tap(&mut mem, 1, -14, 0x1111_0000, 0, 0);
+        let slot = RING_ADDR + ENTRY_SIZE;
+        mem.write_u32(slot + 16, lr);
+        mem.write_u32(profile.frame_counter.addr.unwrap(), 4);
+        place_monster(&mut mem, 0, 760, 774, 1, [10.0, 20.0, 30.0], 0);
+        let sample = pipeline.poll(&mut mem, &profile, 70_000).unwrap();
+        assert_eq!(sample.events.len(), 1);
+        assert_eq!(sample.events[0].source, EventSource::Passive);
+        assert_eq!(sample.events[0].amount, 14);
+        assert!(sample
+            .events
+            .iter()
+            .all(|event| event.source != EventSource::Tap));
+        let unmatched = pipeline.take_unmatched_taps();
+        assert_eq!(unmatched.len(), 1);
+        assert_eq!(unmatched[0].object, 0x1111_0000);
+        assert_eq!(unmatched[0].lr, lr);
+        assert_eq!(
+            unmatched[0].diag_line(),
+            "tap_unmatched obj=0x11110000 lr=0x008BA260"
         );
     }
 

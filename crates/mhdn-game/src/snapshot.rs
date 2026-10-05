@@ -3,7 +3,7 @@
 use mhdn_rpc::MemorySource;
 
 use crate::chain::{is_guest_heap, ChainStep, PointerCache};
-use crate::model::{CameraState, RawMonster, Vec3, LARGE_MIN_HP};
+use crate::model::{CameraState, RawMonster, Vec3, LARGE_MIN_HP, MAX_PLAUSIBLE_HP};
 use crate::plan::{coalesce, MAX_BLOCK, MAX_GAP};
 use crate::profile::{FieldRef, FieldSpec, FieldType, Profile};
 
@@ -23,6 +23,49 @@ impl std::fmt::Display for SnapshotError {
 }
 
 impl std::error::Error for SnapshotError {}
+
+/// A slot that resolved, but whose HP cannot belong to a live monster.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RejectedRead {
+    pub hp_addr: u32,
+    pub species: u16,
+    pub hp: u32,
+    pub max_hp: u32,
+    pub reason: ReadReject,
+}
+
+impl RejectedRead {
+    pub fn diag_line(&self) -> String {
+        format!(
+            "hp_bad addr=0x{:08X} species={} hp={} max_hp={} reason={}",
+            self.hp_addr, self.species, self.hp, self.max_hp, self.reason
+        )
+    }
+}
+
+/// Why a resolved slot was left out of the sample.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadReject {
+    HpAboveMax,
+    MaxHpRange,
+    Species,
+}
+
+impl ReadReject {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::HpAboveMax => "hp_above_max",
+            Self::MaxHpRange => "max_hp_range",
+            Self::Species => "species",
+        }
+    }
+}
+
+impl std::fmt::Display for ReadReject {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
 
 #[derive(Debug, Clone)]
 struct ColdFields {
@@ -58,6 +101,7 @@ pub(crate) struct RawSnapshot {
     pub camera: Option<CameraState>,
     pub hunter_pos: Option<Vec3>,
     pub monsters: Vec<RawMonster>,
+    pub rejected: Vec<RejectedRead>,
 }
 
 pub(crate) fn capture(
@@ -89,12 +133,14 @@ fn read_body(
         Some(flag) => read_flag(mem, flag.addr, flag.ty)? == flag.value,
         None => false,
     };
+    let (monsters, rejected) = read_monsters(mem, profile, cache, guest_frame)?;
     Ok(RawSnapshot {
         guest_frame,
         loading,
         camera: read_camera(mem, profile)?,
         hunter_pos: read_hunter(mem, profile)?,
-        monsters: read_monsters(mem, profile, cache, guest_frame)?,
+        monsters,
+        rejected,
     })
 }
 
@@ -103,28 +149,29 @@ fn read_monsters(
     profile: &Profile,
     cache: &mut CaptureCache,
     _guest_frame: u32,
-) -> Result<Vec<RawMonster>, SnapshotError> {
+) -> Result<(Vec<RawMonster>, Vec<RejectedRead>), SnapshotError> {
     let Some(list_base) = resolve_list(mem, profile, cache)? else {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), Vec::new()));
     };
     let slots = profile.monster_list.slots.min(16);
     let stride = profile.monster_list.slot_stride;
     let table = add_offset(list_base, profile.monster_list.slot_offset);
     let Some(table) = table else {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), Vec::new()));
     };
     let table_len = slots.saturating_mul(stride);
     let mut table_bytes = vec![0u8; table_len as usize];
     read_exact(mem, table, &mut table_bytes)?;
 
     let crate::profile::ChainSpec::Offsets(offsets) = &profile.monster_list.chain else {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), Vec::new()));
     };
     if offsets.is_empty() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), Vec::new()));
     }
     let steps = chain_steps(offsets);
     let mut monsters = Vec::new();
+    let mut rejected = Vec::new();
     for slot in 0..slots {
         let at = (slot * stride) as usize;
         if at + 4 > table_bytes.len() {
@@ -141,21 +188,25 @@ fn read_monsters(
                 continue;
             }
         };
-        if let Some(monster) = read_monster(mem, profile, cache, slot_ptr, hp_addr)? {
+        if let Some(monster) =
+            read_monster(mem, profile, cache, slot, slot_ptr, hp_addr, &mut rejected)?
+        {
             monsters.push(monster);
         } else {
             cache.pointers.forget(slot_ptr, &steps);
         }
     }
-    Ok(monsters)
+    Ok((monsters, rejected))
 }
 
 fn read_monster(
     mem: &mut dyn MemorySource,
     profile: &Profile,
     cache: &mut CaptureCache,
+    slot: u32,
     slot_ptr: u32,
     hp_addr: u32,
+    rejected: &mut Vec<RejectedRead>,
 ) -> Result<Option<RawMonster>, SnapshotError> {
     let Some(hp_spec) = relative(&profile.monster.hp) else {
         return Ok(None);
@@ -181,8 +232,31 @@ fn read_monster(
     let Some(max_hp) = parse_u32(&blocks, hp_addr, max_spec) else {
         return Ok(None);
     };
+    // Zero max HP is an empty slot. Any other value outside 1..=MAX_PLAUSIBLE_HP is garbage.
     if max_hp == 0 {
         return Ok(None);
+    }
+    if max_hp > MAX_PLAUSIBLE_HP || hp > max_hp {
+        let reason = if max_hp > MAX_PLAUSIBLE_HP {
+            ReadReject::MaxHpRange
+        } else {
+            ReadReject::HpAboveMax
+        };
+        rejected.push(rejected_read(mem, profile, hp_addr, hp, max_hp, reason)?);
+        return Ok(None);
+    }
+    if profile.species.has_species_table() {
+        let species = read_species(mem, profile, hp_addr)?;
+        if !profile.species.knows_species(species) {
+            rejected.push(RejectedRead {
+                hp_addr,
+                species,
+                hp,
+                max_hp,
+                reason: ReadReject::Species,
+            });
+            return Ok(None);
+        }
     }
     let pos = match relative(&profile.monster.pos) {
         Some(spec) => parse_vec3(&blocks, hp_addr, spec).unwrap_or(Vec3::new(0.0, 0.0, 0.0)),
@@ -235,7 +309,25 @@ fn read_monster(
         visible,
         large: max_hp >= LARGE_MIN_HP,
         poisoned,
+        slot,
     }))
+}
+
+fn rejected_read(
+    mem: &mut dyn MemorySource,
+    profile: &Profile,
+    hp_addr: u32,
+    hp: u32,
+    max_hp: u32,
+    reason: ReadReject,
+) -> Result<RejectedRead, SnapshotError> {
+    Ok(RejectedRead {
+        hp_addr,
+        species: read_species(mem, profile, hp_addr)?,
+        hp,
+        max_hp,
+        reason,
+    })
 }
 
 fn resolve_list(

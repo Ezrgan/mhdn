@@ -23,7 +23,8 @@ mod support;
 pub use attacker::{Attacker, AttackerFilter, DEFAULT_ATTACKER_FILTER_ATTACKERS};
 pub use chain::{ChainError, ChainStep, PointerCache};
 pub use damage::{
-    events_from_tap, overkill, tap_sum_for, DamageConfidence, DamageEvent, DamageKind, EventSource,
+    events_from_tap, overkill, tap_sum_for, DamageConfidence, DamageEvent, DamageKind, DmgDrop,
+    EventSource, UnmatchedTap,
 };
 pub use model::{Anchor, CameraState, MonsterKey, MonsterState, Snapshot, Vec3, HP_FROM_OBJECT};
 pub use pipeline::{Pipeline, Sample};
@@ -35,8 +36,11 @@ pub use profile::{
 };
 pub use sampler::{sample_period, spawn, EventQueue, Latest, Pump, Sampler, SamplerJoin};
 pub use scene::Scene;
+pub use snapshot::{ReadReject, RejectedRead};
 pub use tap::{
-    install as tap_install, read_events as tap_read_events, uninstall as tap_uninstall,
-    InstallOutcome, PatchMemory, TapError, TapEvent, CAVE_ADDR, ENTRY_SIZE, EXPECTED_HOOK,
-    EXPECTED_HP_STORE, EXPECTED_NEXT, HOOK_ADDR, RETURN_ADDR, RING_ADDR, WRITE_SEQ_ADDR,
+    install as tap_install, install_wide as tap_install_wide, read_events as tap_read_events,
+    read_events_wide as tap_read_events_wide, uninstall as tap_uninstall, wide_requested,
+    InstallOutcome, PatchMemory, RingLayout, TapError, TapEvent, CALLER_HIT, CALLER_MOUNT_TOPPLE,
+    CALLER_STATUS, CAVE_ADDR, ENTRY_SIZE, EXPECTED_HOOK, EXPECTED_HP_STORE, EXPECTED_NEXT,
+    HOOK_ADDR, RETURN_ADDR, RING_ADDR, WRITE_SEQ_ADDR,
 };

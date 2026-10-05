@@ -22,7 +22,7 @@ pub fn follow(
     let mut session = Session {
         client: &mut attached.client,
     };
-    let mut pipeline = Pipeline::new();
+    let mut pipeline = Pipeline::from_env();
     let started = Instant::now();
     let deadline = started + Duration::from_secs(seconds);
     println!("sampling {} for {seconds}s", profile.id());

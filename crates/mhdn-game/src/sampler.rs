@@ -30,22 +30,26 @@ pub fn sample_period(scene: Scene, failures: u32) -> Duration {
 #[derive(Debug)]
 pub struct EventQueue {
     events: Mutex<VecDeque<DamageEvent>>,
+    notes: Mutex<VecDeque<String>>,
     capacity: usize,
     dropped: AtomicU64,
     /// 0 unknown, 1 fingerprint matched, 2 this build is not the profile.
     supported: AtomicU8,
     /// 0 not installed, 1 installed, 2 blocked by a foreign hook or an occupied cave.
     tap: AtomicU8,
+    lost_tap: AtomicU64,
 }
 
 impl EventQueue {
     pub fn new(capacity: usize) -> Self {
         Self {
             events: Mutex::new(VecDeque::new()),
+            notes: Mutex::new(VecDeque::new()),
             capacity: capacity.max(1),
             dropped: AtomicU64::new(0),
             supported: AtomicU8::new(0),
             tap: AtomicU8::new(0),
+            lost_tap: AtomicU64::new(0),
         }
     }
 
@@ -60,6 +64,18 @@ impl EventQueue {
 
     pub fn drain(&self) -> Vec<DamageEvent> {
         self.events.lock().expect("event queue").drain(..).collect()
+    }
+
+    pub fn push_note(&self, line: String) {
+        let mut notes = self.notes.lock().expect("diag notes");
+        if notes.len() == 256 {
+            notes.pop_front();
+        }
+        notes.push_back(line);
+    }
+
+    pub fn drain_notes(&self) -> Vec<String> {
+        self.notes.lock().expect("diag notes").drain(..).collect()
     }
 
     pub fn dropped(&self) -> u64 {
@@ -96,6 +112,14 @@ impl EventQueue {
 
     pub fn tap_blocked(&self) -> bool {
         self.tap.load(Ordering::Relaxed) == 2
+    }
+
+    pub fn set_lost_tap(&self, lost: u64) {
+        self.lost_tap.store(lost, Ordering::Relaxed);
+    }
+
+    pub fn lost_tap(&self) -> u64 {
+        self.lost_tap.load(Ordering::Relaxed)
     }
 }
 
@@ -150,7 +174,7 @@ impl<M: MemorySource + PatchMemory> Sampler<M> {
         Self {
             mem,
             profile,
-            pipeline: Pipeline::new(),
+            pipeline: Pipeline::from_env(),
             snapshots,
             events,
             started: Instant::now(),
@@ -195,6 +219,9 @@ impl<M: MemorySource + PatchMemory> Sampler<M> {
             for event in sample.events {
                 self.events.push(event);
             }
+            for line in self.pipeline.drain_diag_lines() {
+                self.events.push_note(line);
+            }
         }
         let _ = self.pipeline.maintain_tap(&mut self.mem, &self.profile);
         if let Some(ok) = self.pipeline.supported() {
@@ -202,6 +229,7 @@ impl<M: MemorySource + PatchMemory> Sampler<M> {
         }
         self.events
             .set_tap(self.pipeline.tap_installed(), self.pipeline.tap_blocked());
+        self.events.set_lost_tap(self.pipeline.lost_tap());
     }
 
     /// A healthy hunt, the only state where a caller outside the sampler thread may sample.
@@ -346,6 +374,12 @@ mod tests {
             key: None,
             anchor: crate::model::Anchor::Unknown,
             part_hp: None,
+            hp_before: None,
+            hp_after: None,
+            frames_since: None,
+            tap_r3: None,
+            tap_sp: None,
+            tap_sp_hi: None,
         }
     }
 
@@ -377,6 +411,18 @@ mod tests {
         let drained = queue.drain();
         assert_eq!(drained[0].seq, 2);
         assert_eq!(drained[1].seq, 3);
+    }
+
+    #[test]
+    fn notes_drain_in_order() {
+        let queue = EventQueue::new(2);
+        queue.push_note("hp_bad".to_string());
+        queue.push_note("dmg_drop".to_string());
+        assert_eq!(
+            queue.drain_notes(),
+            vec!["hp_bad".to_string(), "dmg_drop".to_string()]
+        );
+        assert!(queue.drain_notes().is_empty());
     }
 
     #[test]
