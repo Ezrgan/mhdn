@@ -977,6 +977,7 @@ impl ApplicationHandler<OverlayUserEvent> for OverlayApp {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        self.diag.wake();
         self.reload_layout();
         self.follow();
         let pumping = self.pumping();

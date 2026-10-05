@@ -102,6 +102,8 @@ pub struct SecondStats {
     /// Frames this second that had live numbers and no camera.
     pub nocam: u32,
     pub redraws: u32,
+    /// Times the window thread entered `about_to_wait` during this second.
+    pub wakes: u32,
     /// Outdated, Lost or Validation from the surface.
     pub present_err: u32,
     /// Timeout or Occluded from the surface: the frame was skipped without an error.
@@ -121,7 +123,7 @@ pub struct SecondStats {
 
 pub fn format_second(stats: &SecondStats) -> String {
     format!(
-        "sec rpc_req_s={:.0} rpc_lat_ms={:.2} snaps={} events={} spawned={} alive={} proj_in={} proj_off={} behind={} nocam={} redraws={} present_err={} present_skip={} pumped={} guest_fps={} tap_installed={} lost_tap={} residual_n={} residual_sum={} tap_n={} tap_sum={}",
+        "sec rpc_req_s={:.0} rpc_lat_ms={:.2} snaps={} events={} spawned={} alive={} proj_in={} proj_off={} behind={} nocam={} redraws={} wakes={} present_err={} present_skip={} pumped={} guest_fps={} tap_installed={} lost_tap={} residual_n={} residual_sum={} tap_n={} tap_sum={}",
         stats.rpc_per_sec,
         stats.rpc_latency_ms,
         stats.snapshots,
@@ -133,6 +135,7 @@ pub fn format_second(stats: &SecondStats) -> String {
         stats.behind,
         stats.nocam,
         stats.redraws,
+        stats.wakes,
         stats.present_err,
         stats.present_skip,
         stats.pumped,
@@ -330,6 +333,11 @@ impl Diag {
         self.stats.redraws += 1;
     }
 
+    /// One entry into `about_to_wait`. Counted for the current second and reset by `tick`.
+    pub fn wake(&mut self) {
+        self.stats.wakes += 1;
+    }
+
     /// `None` is a frame with live numbers and no usable camera.
     pub fn projected(&mut self, drawn: Option<DrawStats>) {
         match drawn {
@@ -449,6 +457,7 @@ mod tests {
             behind: 0,
             nocam: 4,
             redraws: 60,
+            wakes: 48,
             present_err: 5,
             present_skip: 6,
             pumped: 7,
@@ -462,7 +471,7 @@ mod tests {
         };
         assert_eq!(
             format_second(&stats),
-            "sec rpc_req_s=412 rpc_lat_ms=0.31 snaps=58 events=2 spawned=1 alive=3 proj_in=2 proj_off=1 behind=0 nocam=4 redraws=60 present_err=5 present_skip=6 pumped=7 guest_fps=60 tap_installed=1 lost_tap=2 residual_n=1 residual_sum=14 tap_n=3 tap_sum=40"
+            "sec rpc_req_s=412 rpc_lat_ms=0.31 snaps=58 events=2 spawned=1 alive=3 proj_in=2 proj_off=1 behind=0 nocam=4 redraws=60 wakes=48 present_err=5 present_skip=6 pumped=7 guest_fps=60 tap_installed=1 lost_tap=2 residual_n=1 residual_sum=14 tap_n=3 tap_sum=40"
         );
     }
 
@@ -473,7 +482,8 @@ mod tests {
         assert!(text.ends_with(
             "guest_fps=0 tap_installed=0 lost_tap=0 residual_n=0 residual_sum=0 tap_n=0 tap_sum=0"
         ));
-        assert_eq!(text.split(' ').count(), 22);
+        assert!(text.contains("redraws=0 wakes=0 "));
+        assert_eq!(text.split(' ').count(), 23);
     }
 
     #[test]
