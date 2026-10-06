@@ -157,6 +157,7 @@ impl CombatView {
                     total: row.total,
                     poison: row.poison,
                     topple: row.topple,
+                    species: row.key.species,
                 })
             })
             .collect();
@@ -249,7 +250,7 @@ impl CombatView {
     }
 
     /// `px` is the glyph height in physical pixels.
-    /// One block per monster: its received total, poison, and mount topple.
+    /// One short block per large monster, highest total on the bottom corner.
     pub fn recount_quads(&self, top: ScreenRect, px: f32, corner: &CornerSettings) -> Vec<Quad> {
         let lines = self.corner_lines(corner);
         if lines.is_empty() {
@@ -283,6 +284,7 @@ pub struct MeterUpdate {
     pub total: u32,
     pub poison: u32,
     pub topple: u32,
+    pub species: u16,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -635,26 +637,29 @@ mod tests {
                     total: 45,
                     poison: 5,
                     topple: 0,
+                    species: 30,
                 },
                 MeterUpdate {
                     addr: 0x2000,
                     total: 100,
                     poison: 0,
                     topple: 100,
+                    species: 42,
                 },
             ]
         );
         let lines = view.corner_lines(&CornerSettings::default());
-        assert!(lines.iter().any(|line| line == "30  TOTAL 45"));
-        assert!(lines.iter().any(|line| line.contains("30  POISON 5")));
-        assert!(lines
-            .iter()
-            .any(|line| line.contains("30  POISON 5") && line.contains("MOUNT TOPPLE 0")));
-        assert!(lines.iter().any(|line| line == "42  TOTAL 100"));
-        assert!(lines.iter().any(|line| line.contains("42")
-            && line.contains("MOUNT TOPPLE 100")
-            && !line.contains("POISON 5")));
+        assert_eq!(
+            lines,
+            vec![
+                "DERRIBO 100  100%".to_string(),
+                "-  100  69%".to_string(),
+                "VENENO 5  11%".to_string(),
+                "BULLDROME  45  31%".to_string(),
+            ]
+        );
         assert!(lines.iter().all(|line| !line.contains("YOU")));
+        assert!(lines.iter().all(|line| !line.contains("JUMP")));
     }
 
     fn spawn_one(view: &mut CombatView, amount: u32, kind: DamageKind) {
@@ -734,8 +739,12 @@ mod tests {
         let both = view.recount_quads(top, 44.0, &corner).len();
         corner.show_dps = false;
         let total_only = view.recount_quads(top, 44.0, &corner).len();
-        assert!(total_only > 0 && total_only < both);
+        assert!(total_only > 0);
+        assert_eq!(total_only, both);
+        corner.show_dps = true;
         corner.show_total = false;
+        assert!(view.recount_quads(top, 44.0, &corner).is_empty());
+        corner.show_dps = false;
         assert!(view.recount_quads(top, 44.0, &corner).is_empty());
     }
 

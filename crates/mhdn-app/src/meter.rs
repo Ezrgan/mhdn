@@ -8,9 +8,7 @@
 
 #![cfg_attr(not(test), allow(dead_code))]
 
-use mhdn_game::{Attacker, AttackerFilter, DamageKind, MonsterKey};
-
-use crate::settings::Category;
+use mhdn_game::{Attacker, AttackerFilter, DamageKind, MonsterKey, LARGE_MIN_HP};
 
 /// Minimum elapsed time when computing DPS so one hit does not divide by zero.
 pub const MIN_DPS_WINDOW_MS: u64 = 1000;
@@ -190,37 +188,35 @@ impl Meter {
             .and_then(|entry| entry.row(now_ms))
     }
 
-    /// Corner text, stacked from the bottom of the screen.
+    /// Corner text. Index 0 is the line nearest the bottom corner.
     ///
-    /// With the total on, each monster gets its received damage and then poison plus
-    /// mount topple. DPS is a third line when that part of the corner is on.
+    /// Only large monsters (`max_hp >= LARGE_MIN_HP`) are drawn, one name line each,
+    /// plus a poison/topple line when those amounts are non-zero. The highest total
+    /// sits on the corner; the next large monster is above it. Small monsters stay
+    /// in the quest total used as the percentage denominator and do not add a row.
     ///
-    /// The overlay atlas has no lowercase, so the settings labels are drawn in capitals.
-    /// `MOUNT TOPPLE` is [`Category::Topple`]'s name ("Mount topple"), the cyan number.
-    pub fn screen_lines(&self, show_total: bool, show_dps: bool, now_ms: u64) -> Vec<String> {
-        if !show_total && !show_dps {
+    /// The big percentage is this monster's received damage over every monster in
+    /// the quest. Poison and topple percentages are over that monster's own total.
+    /// The atlas has no lowercase. `DERRIBO` is [`DamageKind::Topple`] (the fixed
+    /// 100/150 mount hit). There is no YOU line: unknown damage is not the player's.
+    pub fn screen_lines(&self, show_total: bool, _show_dps: bool, now_ms: u64) -> Vec<String> {
+        if !show_total {
             return Vec::new();
         }
+        let rows = self.rows(now_ms);
+        let quest_total = self.received_total();
+        let large: Vec<&MonsterRow> = rows
+            .iter()
+            .filter(|row| row.key.max_hp >= LARGE_MIN_HP)
+            .collect();
+        let totals: Vec<u32> = large.iter().map(|row| row.total).collect();
+        let percents = quest_percents(&totals, quest_total);
         let mut lines = Vec::new();
-        for row in self.rows(now_ms) {
-            if show_total {
-                let mut head = format!("{}  TOTAL {}", row.key.species, row.total);
-                if row.player > 0 {
-                    head.push_str(&format!("  YOU {:.0}%", row.player_pct));
-                }
-                lines.push(head);
-                lines.push(format!(
-                    "{}  {} {}  {} {}",
-                    row.key.species,
-                    Category::Poison.label().to_ascii_uppercase(),
-                    row.poison,
-                    Category::Topple.label().to_ascii_uppercase(),
-                    row.topple,
-                ));
+        for (row, pct) in large.into_iter().zip(percents) {
+            if let Some(detail) = detail_line(row.poison, row.topple, row.total) {
+                lines.push(detail);
             }
-            if show_dps {
-                lines.push(format!("{}  DPS {:.0}", row.key.species, row.dps));
-            }
+            lines.push(name_line(species_label(row.key.species), row.total, pct));
         }
         lines
     }
@@ -385,6 +381,81 @@ impl MonsterEntry {
 /// Diag line for one monster. Addresses match the `dmg mon=` field.
 pub fn format_meter_line(addr: u32, total: u32, poison: u32, topple: u32) -> String {
     format!("meter mon=0x{addr:08X} total={total} poison={poison} topple={topple}")
+}
+
+/// Names already measured in `docs/RE_NOTES.md` (the species id is the `em` number).
+/// Missing species stay unnamed: the corner draws a gap, never the raw id.
+pub fn species_name(species: u16) -> Option<&'static str> {
+    match species {
+        1 => Some("RATHIAN"),
+        14 => Some("VELOCIDROME"),
+        30 => Some("BULLDROME"),
+        _ => None,
+    }
+}
+
+fn species_label(species: u16) -> &'static str {
+    species_name(species).unwrap_or("-")
+}
+
+fn name_line(label: &str, total: u32, pct: u32) -> String {
+    format!("{label}  {total}  {pct}%")
+}
+
+/// Poison and topple, each as a share of this monster. Zero amounts are omitted.
+fn detail_line(poison: u32, topple: u32, total: u32) -> Option<String> {
+    let mut parts = Vec::new();
+    if poison > 0 {
+        parts.push(format!("VENENO {poison}  {}%", share_pct(poison, total)));
+    }
+    if topple > 0 {
+        parts.push(format!("DERRIBO {topple}  {}%", share_pct(topple, total)));
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("   "))
+    }
+}
+
+fn share_pct(part: u32, total: u32) -> u32 {
+    if part == 0 || total == 0 {
+        return 0;
+    }
+    let rounded = (u64::from(part) * 100 + u64::from(total) / 2) / u64::from(total);
+    u32::try_from(rounded).unwrap_or(100).min(100)
+}
+
+/// Integer percentages of `quest_total`. When `totals` are the whole quest, they sum to 100.
+fn quest_percents(totals: &[u32], quest_total: u32) -> Vec<u32> {
+    if quest_total == 0 {
+        return vec![0; totals.len()];
+    }
+    let den = u64::from(quest_total);
+    let mut floors = Vec::with_capacity(totals.len());
+    let mut remainders = Vec::with_capacity(totals.len());
+    let mut sum = 0u32;
+    for total in totals {
+        let num = u64::from(*total) * 100;
+        let floor = u32::try_from(num / den).unwrap_or(100);
+        sum = sum.saturating_add(floor);
+        floors.push(floor);
+        remainders.push(num % den);
+    }
+    let painted: u32 = totals.iter().copied().sum();
+    if painted == quest_total {
+        let mut leftover = 100u32.saturating_sub(sum);
+        let mut order: Vec<usize> = (0..totals.len()).collect();
+        order.sort_by(|&a, &b| remainders[b].cmp(&remainders[a]).then(a.cmp(&b)));
+        for idx in order {
+            if leftover == 0 {
+                break;
+            }
+            floors[idx] = floors[idx].saturating_add(1);
+            leftover -= 1;
+        }
+    }
+    floors
 }
 
 fn filtered_sum(damage: &[u32; Attacker::ALL.len()], filter: AttackerFilter) -> u32 {
@@ -712,13 +783,15 @@ mod tests {
         assert_eq!(toppled.poison, 0);
         assert_eq!(toppled.total, 150);
         let lines = meter.screen_lines(true, false, 2_000);
-        assert!(lines.iter().any(|line| line.contains("POISON 10")));
-        assert!(lines.iter().any(|line| line.contains("MOUNT TOPPLE 150")));
+        assert!(lines.iter().any(|line| line.contains("VENENO 10")));
+        assert!(lines.iter().any(|line| line.contains("DERRIBO 150")));
         assert!(!lines.iter().any(|line| line.contains("YOU")));
+        assert!(!lines.iter().any(|line| line.contains("JUMP")));
         assert_eq!(
             format_meter_line(0x1000, poisoned.total, poisoned.poison, poisoned.topple),
             "meter mon=0x00001000 total=10 poison=10 topple=0"
         );
+        assert_eq!(species_name(30), Some("BULLDROME"));
     }
 
     #[test]
@@ -748,9 +821,121 @@ mod tests {
         assert!(row.player_pct <= 100.0);
         assert!((row.player_pct - 100.0).abs() < 0.01);
         assert_eq!(meter.player_total(), 250);
-        let line = &meter.screen_lines(true, false, 1_000)[0];
-        assert!(line.contains("TOTAL 650"));
-        assert!(line.contains("YOU 100%"));
-        assert!(!line.contains("YOU 650"));
+        let lines = meter.screen_lines(true, false, 1_000);
+        assert!(
+            lines.is_empty(),
+            "a bar under {LARGE_MIN_HP} is not painted"
+        );
+        assert!(lines.iter().all(|line| !line.contains("YOU")));
+    }
+
+    #[test]
+    fn two_large_monsters_show_names_heaviest_at_the_corner_and_percents_sum_to_100() {
+        let mut meter = Meter::new();
+        meter.add(hit(0x1000, 30, 774, 1, 420, Attacker::Unknown, 0));
+        meter.add(hit(0x2000, 1, 2_205, 1, 200, Attacker::Unknown, 100));
+        let lines = meter.screen_lines(true, false, 1_000);
+        assert_eq!(
+            lines,
+            vec![
+                "BULLDROME  420  68%".to_string(),
+                "RATHIAN  200  32%".to_string(),
+            ]
+        );
+        assert_eq!(percent_of(&lines[0]) + percent_of(&lines[1]), 100);
+        assert!(lines.iter().all(|line| !line.contains("YOU")));
+    }
+
+    #[test]
+    fn a_small_monster_with_damage_does_not_add_a_row() {
+        let mut meter = Meter::new();
+        meter.add(hit(0x1000, 30, 774, 1, 420, Attacker::Unknown, 0));
+        meter.add(hit(0x3000, 4107, 80, 1, 100, Attacker::Unknown, 50));
+        let lines = meter.screen_lines(true, false, 1_000);
+        assert_eq!(lines, vec!["BULLDROME  420  80%".to_string()]);
+        assert!(lines.iter().all(|line| !has_id_token(line, 4107)));
+        assert_eq!(meter.received_total(), 520);
+    }
+
+    #[test]
+    fn zero_poison_and_topple_do_not_draw_those_words() {
+        let mut meter = Meter::new();
+        meter.add(hit(0x1000, 30, 774, 1, 420, Attacker::Unknown, 0));
+        let lines = meter.screen_lines(true, false, 1_000);
+        assert_eq!(lines, vec!["BULLDROME  420  100%".to_string()]);
+        assert!(lines.iter().all(|line| !line.contains("VENENO")));
+        assert!(lines.iter().all(|line| !line.contains("DERRIBO")));
+    }
+
+    #[test]
+    fn two_of_the_same_species_do_not_show_the_numeric_id() {
+        let mut meter = Meter::new();
+        meter.add(hit(0x1000, 30, 774, 1, 420, Attacker::Unknown, 0));
+        meter.add(hit(0x2000, 30, 774, 2, 200, Attacker::Unknown, 100));
+        let lines = meter.screen_lines(true, false, 1_000);
+        assert_eq!(
+            lines,
+            vec![
+                "BULLDROME  420  68%".to_string(),
+                "BULLDROME  200  32%".to_string(),
+            ]
+        );
+        assert!(lines.iter().all(|line| !has_id_token(line, 30)));
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|line| line.contains("BULLDROME"))
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn a_species_without_a_measured_name_leaves_a_gap_instead_of_the_id() {
+        let mut meter = Meter::new();
+        meter.add(hit(0x1000, 116, 1_200, 1, 420, Attacker::Unknown, 0));
+        meter.add(hit(0x2000, 116, 1_200, 2, 258, Attacker::Unknown, 100));
+        assert!(species_name(116).is_none());
+        let lines = meter.screen_lines(true, false, 1_000);
+        assert_eq!(
+            lines,
+            vec!["-  420  62%".to_string(), "-  258  38%".to_string()]
+        );
+        assert!(lines.iter().all(|line| !has_id_token(line, 116)));
+        assert_eq!(percent_of(&lines[0]) + percent_of(&lines[1]), 100);
+    }
+
+    #[test]
+    fn poison_and_topple_percentages_are_of_that_monster_and_zero_is_omitted() {
+        let mut meter = Meter::new();
+        meter.add(hit(0x1000, 30, 774, 1, 280, Attacker::Unknown, 0));
+        meter.add(with_kind(
+            hit(0x1000, 30, 774, 1, 40, Attacker::Unknown, 100),
+            DamageKind::Poison,
+        ));
+        meter.add(with_kind(
+            hit(0x1000, 30, 774, 1, 100, Attacker::Unknown, 200),
+            DamageKind::Topple,
+        ));
+        let lines = meter.screen_lines(true, false, 1_000);
+        assert_eq!(
+            lines,
+            vec![
+                "VENENO 40  10%   DERRIBO 100  24%".to_string(),
+                "BULLDROME  420  100%".to_string(),
+            ]
+        );
+        assert!(lines.iter().all(|line| !has_id_token(line, 30)));
+    }
+
+    fn has_id_token(line: &str, species: u16) -> bool {
+        let id = species.to_string();
+        line.split(|ch: char| !ch.is_ascii_digit())
+            .any(|token| token == id)
+    }
+
+    fn percent_of(line: &str) -> u32 {
+        let pct = line.rsplit_once(' ').unwrap().1;
+        pct.trim_end_matches('%').parse().unwrap()
     }
 }
