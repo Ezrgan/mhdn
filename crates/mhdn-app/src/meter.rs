@@ -216,7 +216,7 @@ impl Meter {
             if let Some(detail) = detail_line(row.poison, row.topple, row.total) {
                 lines.push(detail);
             }
-            lines.push(name_line(species_label(row.key.species), row.total, pct));
+            lines.push(name_line(&species_label(row.key.species), row.total, pct));
         }
         lines
     }
@@ -383,19 +383,17 @@ pub fn format_meter_line(addr: u32, total: u32, poison: u32, topple: u32) -> Str
     format!("meter mon=0x{addr:08X} total={total} poison={poison} topple={topple}")
 }
 
-/// Names already measured in `docs/RE_NOTES.md` (the species id is the `em` number).
-/// Missing species stay unnamed: the corner draws a gap, never the raw id.
+/// English name from the MHGU in-game id table, as written there.
+/// An id that is not in the table has no name: the corner draws `-`, never the number.
 pub fn species_name(species: u16) -> Option<&'static str> {
-    match species {
-        1 => Some("RATHIAN"),
-        14 => Some("VELOCIDROME"),
-        30 => Some("BULLDROME"),
-        _ => None,
-    }
+    crate::species_names::name(species)
 }
 
-fn species_label(species: u16) -> &'static str {
-    species_name(species).unwrap_or("-")
+/// Corner label. The atlas has no lowercase, so a table name is drawn in capitals.
+fn species_label(species: u16) -> String {
+    species_name(species)
+        .map(str::to_ascii_uppercase)
+        .unwrap_or_else(|| "-".to_string())
 }
 
 fn name_line(label: &str, total: u32, pct: u32) -> String {
@@ -791,7 +789,7 @@ mod tests {
             format_meter_line(0x1000, poisoned.total, poisoned.poison, poisoned.topple),
             "meter mon=0x00001000 total=10 poison=10 topple=0"
         );
-        assert_eq!(species_name(30), Some("BULLDROME"));
+        assert_eq!(species_name(30), Some("Bulldrome"));
     }
 
     #[test]
@@ -903,6 +901,27 @@ mod tests {
         );
         assert!(lines.iter().all(|line| !has_id_token(line, 116)));
         assert_eq!(percent_of(&lines[0]) + percent_of(&lines[1]), 100);
+    }
+
+    #[test]
+    fn great_maccao_of_420_at_62_percent_uses_the_table_name() {
+        assert_eq!(species_name(1), Some("Rathian"));
+        assert_eq!(species_name(14), Some("Velocidrome"));
+        assert_eq!(species_name(30), Some("Bulldrome"));
+        assert_eq!(species_name(85), Some("Great Maccao"));
+        let mut meter = Meter::new();
+        meter.add(hit(0x1000, 85, 1_200, 1, 420, Attacker::Unknown, 0));
+        meter.add(hit(0x2000, 14, 830, 1, 258, Attacker::Unknown, 100));
+        let lines = meter.screen_lines(true, false, 1_000);
+        assert_eq!(
+            lines,
+            vec![
+                "GREAT MACCAO  420  62%".to_string(),
+                "VELOCIDROME  258  38%".to_string(),
+            ]
+        );
+        assert!(lines.iter().all(|line| !has_id_token(line, 85)));
+        assert!(lines.iter().all(|line| !has_id_token(line, 14)));
     }
 
     #[test]

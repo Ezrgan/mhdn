@@ -13,6 +13,7 @@ mod run;
 mod session;
 mod settings;
 mod settings_window;
+mod species_names;
 mod status;
 mod trace;
 

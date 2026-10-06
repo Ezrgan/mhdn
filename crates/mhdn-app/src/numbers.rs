@@ -653,7 +653,7 @@ mod tests {
             lines,
             vec![
                 "DERRIBO 100  100%".to_string(),
-                "-  100  69%".to_string(),
+                "BARIOTH  100  69%".to_string(),
                 "VENENO 5  11%".to_string(),
                 "BULLDROME  45  31%".to_string(),
             ]
