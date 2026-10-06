@@ -523,6 +523,120 @@ fn tap_words(event: &TapEvent) -> (Option<u32>, Option<[u32; 5]>, Option<[u32; 1
     )
 }
 
+/// Guest frames. A mount topple can write HP on the next sample, still inside
+/// the same fraction of a second (half a second at 60 fps).
+const TAP_ECHO_FRAMES: u32 = 30;
+
+#[derive(Debug, Clone, Copy)]
+struct PendingTap {
+    addr: u32,
+    generation: u32,
+    amount: u32,
+    frame: u32,
+}
+
+/// Tap amounts whose HP drop has not landed yet.
+///
+/// The tap counts immediately. When the same amount shows up as a passive HP
+/// drop on that monster before [`TAP_ECHO_FRAMES`] have passed, it is the same
+/// hit and is not emitted again. A later drop of that amount, or a tap whose
+/// HP already moved in its own sample, still counts.
+#[derive(Debug, Default, Clone)]
+pub struct TapCredit {
+    pending: Vec<PendingTap>,
+}
+
+impl TapCredit {
+    pub fn clear(&mut self) {
+        self.pending.clear();
+    }
+
+    /// Remove a passive HP drop that repeats a tap already counted for this monster.
+    /// Call once per sample, after `compose`.
+    pub fn settle(&mut self, frame: u32, events: &mut Vec<DamageEvent>) {
+        self.pending
+            .retain(|credit| frame.wrapping_sub(credit.frame) <= TAP_ECHO_FRAMES);
+        events.retain(|event| !self.take_echo(event));
+        self.note_uncovered(frame, events);
+    }
+
+    fn take_echo(&mut self, event: &DamageEvent) -> bool {
+        if event.source != EventSource::Passive {
+            return false;
+        }
+        if !matches!(
+            event.confidence,
+            DamageConfidence::HpDelta | DamageConfidence::AggregatedHpDelta
+        ) {
+            return false;
+        }
+        let (addr, generation) = monster_id(event);
+        let Some(index) = self.pending.iter().position(|credit| {
+            credit.addr == addr && credit.generation == generation && credit.amount == event.amount
+        }) else {
+            return false;
+        };
+        self.pending.remove(index);
+        true
+    }
+
+    fn note_uncovered(&mut self, frame: u32, events: &[DamageEvent]) {
+        let mut ids = Vec::new();
+        for event in events
+            .iter()
+            .filter(|event| event.source == EventSource::Tap && event.amount > 0)
+        {
+            let id = monster_id(event);
+            if !ids.contains(&id) {
+                ids.push(id);
+            }
+        }
+        for id in ids {
+            let Some(mut loss) = hp_drop(events, id) else {
+                continue;
+            };
+            let mut amounts: Vec<u32> = events
+                .iter()
+                .filter(|event| event.source == EventSource::Tap && monster_id(event) == id)
+                .map(|event| event.amount)
+                .collect();
+            amounts.sort_unstable_by(|left, right| right.cmp(left));
+            for amount in amounts {
+                if loss >= amount {
+                    loss -= amount;
+                } else {
+                    self.pending.push(PendingTap {
+                        addr: id.0,
+                        generation: id.1,
+                        amount,
+                        frame,
+                    });
+                }
+            }
+        }
+    }
+}
+
+fn monster_id(event: &DamageEvent) -> (u32, u32) {
+    match event.key {
+        Some(key) => (key.struct_addr, key.generation),
+        None => (event.monster, 0),
+    }
+}
+
+/// `Some(0)` when both ends of the sample are known and HP did not fall.
+/// `None` when this sample has no baseline to compare.
+fn hp_drop(events: &[DamageEvent], id: (u32, u32)) -> Option<u32> {
+    events.iter().find_map(|event| {
+        if monster_id(event) != id {
+            return None;
+        }
+        let before = event.hp_before?;
+        let after = event.hp_after?;
+        Some(before.saturating_sub(after))
+    })
+}
+
 pub fn overkill(tap_sum: u32, hp_start: u32, hp_end: u32) -> Option<u32> {
     let lost = hp_start.checked_sub(hp_end)?;
     if hp_end == 0 {
@@ -686,5 +800,95 @@ mod tests {
             assert_eq!(tap.kind, kind, "lr={lr:#010X} poisoned={poisoned}");
             assert_eq!(composed.events.len(), 1);
         }
+    }
+
+    fn topple_tap(monster: &LiveMonster, seq: u32) -> ResolvedTap {
+        let mut event = hit(seq, -100, monster.key.struct_addr);
+        event.lr = crate::tap::CALLER_MOUNT_TOPPLE;
+        ResolvedTap {
+            event,
+            anchor: Anchor::Unknown,
+        }
+    }
+
+    /// Tap of 100 while HP stays put, then the same 100 lands as an HP drop.
+    #[test]
+    fn a_topple_tap_does_not_also_count_the_hp_drop_that_lands_next() {
+        let mut credit = TapCredit::default();
+        let mut flat = live(1041, Some(1041), 1480);
+        flat.prev_frame = Some(1);
+        let tap = topple_tap(&flat, 1);
+        let mut first = compose(Scene::InQuest, 2, &[flat], &[tap], None, None);
+        credit.settle(2, &mut first.events);
+        assert_eq!(first.events.len(), 1);
+        assert_eq!(first.events[0].kind, DamageKind::Topple);
+        assert_eq!(first.events[0].source, EventSource::Tap);
+        assert_eq!(first.events[0].amount, 100);
+        assert_eq!(first.events[0].hp_before, Some(1041));
+        assert_eq!(first.events[0].hp_after, Some(1041));
+
+        let mut dropped = live(941, Some(1041), 1480);
+        dropped.prev_frame = Some(2);
+        let mut second = compose(Scene::InQuest, 3, &[dropped], &[], None, None);
+        assert_eq!(second.events[0].confidence, DamageConfidence::HpDelta);
+        credit.settle(3, &mut second.events);
+        assert!(
+            second.events.is_empty(),
+            "the hp drop is the topple already counted"
+        );
+    }
+
+    /// A later 100, with a different HP span, is not the topple's echo.
+    #[test]
+    fn a_later_hit_of_100_with_its_own_hp_drop_still_counts() {
+        let mut credit = TapCredit::default();
+        let mut flat = live(1041, Some(1041), 1480);
+        flat.prev_frame = Some(1);
+        let tap = topple_tap(&flat, 1);
+        let mut first = compose(Scene::InQuest, 2, &[flat], &[tap], None, None);
+        credit.settle(2, &mut first.events);
+        let mut echo = live(941, Some(1041), 1480);
+        echo.prev_frame = Some(2);
+        let mut second = compose(Scene::InQuest, 3, &[echo], &[], None, None);
+        credit.settle(3, &mut second.events);
+        assert!(second.events.is_empty());
+
+        let mut later = live(841, Some(941), 1480);
+        later.prev_frame = Some(3);
+        let mut third = compose(Scene::InQuest, 4, &[later], &[], None, None);
+        credit.settle(4, &mut third.events);
+        assert_eq!(third.events.len(), 1);
+        assert_eq!(third.events[0].amount, 100);
+        assert_eq!(third.events[0].kind, DamageKind::Hit);
+        assert_eq!(third.events[0].source, EventSource::Passive);
+        assert_eq!(third.events[0].confidence, DamageConfidence::HpDelta);
+        assert_eq!(third.events[0].hp_before, Some(941));
+        assert_eq!(third.events[0].hp_after, Some(841));
+    }
+
+    #[test]
+    fn a_topple_whose_hp_already_fell_does_not_swallow_the_next_drop() {
+        let mut credit = TapCredit::default();
+        let mut fell = live(1125, Some(1225), 1480);
+        fell.prev_frame = Some(1);
+        let tap = topple_tap(&fell, 1);
+        let mut first = compose(Scene::InQuest, 2, &[fell], &[tap], None, None);
+        credit.settle(2, &mut first.events);
+        assert_eq!(first.events.len(), 1);
+        assert_eq!(first.events[0].kind, DamageKind::Topple);
+        assert_eq!(first.events[0].hp_before, Some(1225));
+        assert_eq!(first.events[0].hp_after, Some(1125));
+        assert!(first
+            .events
+            .iter()
+            .all(|event| event.source == EventSource::Tap));
+
+        let mut later = live(1025, Some(1125), 1480);
+        later.prev_frame = Some(2);
+        let mut second = compose(Scene::InQuest, 3, &[later], &[], None, None);
+        credit.settle(3, &mut second.events);
+        assert_eq!(second.events.len(), 1);
+        assert_eq!(second.events[0].amount, 100);
+        assert_eq!(second.events[0].source, EventSource::Passive);
     }
 }

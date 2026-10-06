@@ -441,7 +441,8 @@ mod tests {
     use super::*;
     use mhdn_fx::{LIFE_MS, ORANGE, POISON, SCATTER_PX, TOPPLE};
     use mhdn_game::{
-        CameraState, DamageConfidence, EventSource, FovUnit, MonsterKey, Vec3 as GameVec3,
+        CameraState, DamageConfidence, EventSource, FovUnit, MonsterKey, TapCredit,
+        Vec3 as GameVec3,
     };
     use mhdn_proj::ScreenRect;
 
@@ -988,5 +989,85 @@ mod tests {
         );
         view.tick(Duration::from_millis(LIFE_MS as u64));
         assert!(!view.alive());
+    }
+
+    fn keyed(
+        amount: u32,
+        kind: DamageKind,
+        source: EventSource,
+        before: u32,
+        after: u32,
+    ) -> DamageEvent {
+        let mut hit = event(amount, Anchor::World(GameVec3::new(0.0, 1.0, 0.0)), kind);
+        hit.source = source;
+        hit.confidence = DamageConfidence::HpDelta;
+        hit.hp_before = Some(before);
+        hit.hp_after = Some(after);
+        hit.frames_since = Some(1);
+        hit.key = Some(MonsterKey {
+            struct_addr: 0x1000,
+            species: 7,
+            max_hp: 3000,
+            generation: 1,
+        });
+        hit
+    }
+
+    #[test]
+    fn a_topple_whose_hp_drop_lands_next_counts_once_and_spawns_one_number() {
+        let mut credit = TapCredit::default();
+        let mut first = vec![keyed(100, DamageKind::Topple, EventSource::Tap, 1041, 1041)];
+        credit.settle(10, &mut first);
+        let mut echo = vec![keyed(100, DamageKind::Hit, EventSource::Passive, 1041, 941)];
+        credit.settle(11, &mut echo);
+
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].kind, DamageKind::Topple);
+        assert_eq!(first[0].source, EventSource::Tap);
+        assert_eq!(first[0].amount, 100);
+        assert!(echo.is_empty());
+
+        let mut view = CombatView::new();
+        view.observe(Scene::InQuest, 1);
+        view.set_anchor(NumberAnchor::Monster);
+        let monsters = [monster(0x1000, true)];
+        let ingested = view.ingest(&first, &monsters, |_, _| 150.0);
+        assert_eq!(ingested.anchors.iter().flatten().count(), 1);
+        assert_eq!(ingested.meter[0].total, 100);
+        assert_eq!(ingested.meter[0].topple, 100);
+        let again = view.ingest(&echo, &monsters, |_, _| 150.0);
+        assert_eq!(again.anchors.iter().flatten().count(), 0);
+        assert_eq!(view.recount_total(), 100);
+        assert_eq!(view.alive_count(), 1);
+        assert_eq!(view.player_total(), 0);
+    }
+
+    #[test]
+    fn a_later_hit_of_100_with_its_own_hp_drop_still_spawns() {
+        let mut credit = TapCredit::default();
+        let mut first = vec![keyed(100, DamageKind::Topple, EventSource::Tap, 1041, 1041)];
+        credit.settle(10, &mut first);
+        let mut echo = vec![keyed(100, DamageKind::Hit, EventSource::Passive, 1041, 941)];
+        credit.settle(11, &mut echo);
+        assert!(echo.is_empty());
+
+        let mut later = vec![keyed(100, DamageKind::Hit, EventSource::Passive, 941, 841)];
+        credit.settle(20, &mut later);
+        assert_eq!(later.len(), 1);
+        assert_eq!(later[0].kind, DamageKind::Hit);
+        assert_eq!(later[0].amount, 100);
+        assert_eq!(later[0].hp_before, Some(941));
+        assert_eq!(later[0].hp_after, Some(841));
+
+        let mut view = CombatView::new();
+        view.observe(Scene::InQuest, 1);
+        view.set_anchor(NumberAnchor::Monster);
+        let monsters = [monster(0x1000, true)];
+        view.ingest(&first, &monsters, |_, _| 150.0);
+        let spawned = view.ingest(&later, &monsters, |_, _| 150.0);
+        assert_eq!(spawned.anchors.iter().flatten().count(), 1);
+        assert_eq!(view.recount_total(), 200);
+        assert_eq!(view.alive_count(), 2);
+        assert_eq!(view.player_total(), 0);
     }
 }

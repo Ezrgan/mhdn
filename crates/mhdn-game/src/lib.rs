@@ -24,7 +24,7 @@ pub use attacker::{Attacker, AttackerFilter, DEFAULT_ATTACKER_FILTER_ATTACKERS};
 pub use chain::{ChainError, ChainStep, PointerCache};
 pub use damage::{
     events_from_tap, overkill, tap_sum_for, DamageConfidence, DamageEvent, DamageKind, DmgDrop,
-    EventSource, UnmatchedTap,
+    EventSource, TapCredit, UnmatchedTap,
 };
 pub use model::{
     Anchor, CameraState, MonsterKey, MonsterState, Snapshot, Vec3, HP_FROM_OBJECT, LARGE_MIN_HP,

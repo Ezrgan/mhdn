@@ -3,7 +3,7 @@
 use mhdn_rpc::MemorySource;
 use xxhash_rust::xxh3::xxh3_64;
 
-use crate::damage::{compose_sources, DmgDrop, PluginHit, ResolvedTap, UnmatchedTap};
+use crate::damage::{compose_sources, DmgDrop, PluginHit, ResolvedTap, TapCredit, UnmatchedTap};
 use crate::model::{Anchor, MonsterState, Snapshot};
 use crate::profile::Profile;
 use crate::scene::{Scene, SceneMachine};
@@ -40,6 +40,8 @@ pub struct Pipeline {
     tap_blocked: bool,
     plugin_present: Option<bool>,
     wide: bool,
+    /// Tap amounts still waiting for the HP write that belongs to them.
+    tap_credit: TapCredit,
 }
 
 impl Default for Pipeline {
@@ -74,6 +76,7 @@ impl Pipeline {
             tap_blocked: false,
             plugin_present: None,
             wide,
+            tap_credit: TapCredit::default(),
         }
     }
 
@@ -172,6 +175,7 @@ impl Pipeline {
         if change.left_quest {
             self.track.clear();
             self.cache.clear();
+            self.tap_credit.clear();
         }
         let live = if change.scene == Scene::InQuest {
             self.track.update(&raw.monsters, raw.guest_frame)
@@ -321,7 +325,7 @@ impl Pipeline {
                 })
                 .collect()
         };
-        let composed = compose_sources(
+        let mut composed = compose_sources(
             Scene::InQuest,
             frame,
             live,
@@ -332,6 +336,7 @@ impl Pipeline {
         );
         self.drops = composed.drops;
         self.unmatched = composed.unmatched;
+        self.tap_credit.settle(frame, &mut composed.events);
         composed.events
     }
 
@@ -449,8 +454,9 @@ mod tests {
     use crate::sparse::SparseMemory;
     use crate::support::{hp_addr, live_profile, place_monster, stage_hunt};
     use crate::tap::{
-        hook_branch, ENTRY_SIZE, EXPECTED_HOOK, EXPECTED_HP_STORE, EXPECTED_NEXT, RING_ADDR,
-        WIDE_CAPACITY, WIDE_ENTRY_SIZE, WIDE_WRITE_SEQ_ADDR, WRITE_SEQ_ADDR,
+        hook_branch, CALLER_MOUNT_TOPPLE, ENTRY_SIZE, EXPECTED_HOOK, EXPECTED_HP_STORE,
+        EXPECTED_NEXT, RING_ADDR, WIDE_CAPACITY, WIDE_ENTRY_SIZE, WIDE_WRITE_SEQ_ADDR,
+        WRITE_SEQ_ADDR,
     };
     use crate::{DamageConfidence, DamageKind, EventSource};
     use mhdn_rpc::MemorySource;
@@ -844,6 +850,63 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_topple_tap_does_not_also_count_the_hp_drop_that_lands_next() {
+        let (mut pipeline, mut mem, profile) = prepared();
+        warm(&mut pipeline, &mut mem, &profile);
+        pipeline.maintain_tap(&mut mem, &profile).unwrap();
+        let object = hp_addr(0) - HP_FROM_OBJECT;
+        write_tap_from(&mut mem, 1, -100, object, CALLER_MOUNT_TOPPLE);
+        mem.write_u32(profile.frame_counter.addr.unwrap(), 4);
+        place_monster(&mut mem, 0, 774, 774, 1, [10.0, 20.0, 30.0], 0);
+        let first = pipeline.poll(&mut mem, &profile, 70_000).unwrap();
+        assert_eq!(first.events.len(), 1);
+        assert_eq!(first.events[0].source, EventSource::Tap);
+        assert_eq!(first.events[0].kind, DamageKind::Topple);
+        assert_eq!(first.events[0].amount, 100);
+        assert_eq!(first.events[0].hp_before, Some(774));
+        assert_eq!(first.events[0].hp_after, Some(774));
+
+        mem.write_u32(profile.frame_counter.addr.unwrap(), 5);
+        place_monster(&mut mem, 0, 674, 774, 1, [10.0, 20.0, 30.0], 0);
+        let second = pipeline.poll(&mut mem, &profile, 86_000).unwrap();
+        assert!(
+            second.events.is_empty(),
+            "hp 774→674 is the topple already counted"
+        );
+    }
+
+    #[test]
+    fn a_later_hit_of_100_with_its_own_hp_drop_still_counts() {
+        let (mut pipeline, mut mem, profile) = prepared();
+        warm(&mut pipeline, &mut mem, &profile);
+        pipeline.maintain_tap(&mut mem, &profile).unwrap();
+        let object = hp_addr(0) - HP_FROM_OBJECT;
+        write_tap_from(&mut mem, 1, -100, object, CALLER_MOUNT_TOPPLE);
+        mem.write_u32(profile.frame_counter.addr.unwrap(), 4);
+        place_monster(&mut mem, 0, 674, 774, 1, [10.0, 20.0, 30.0], 0);
+        let topple = pipeline.poll(&mut mem, &profile, 70_000).unwrap();
+        assert_eq!(topple.events.len(), 1);
+        assert_eq!(topple.events[0].kind, DamageKind::Topple);
+        assert_eq!(topple.events[0].hp_before, Some(774));
+        assert_eq!(topple.events[0].hp_after, Some(674));
+        assert!(topple
+            .events
+            .iter()
+            .all(|event| event.source == EventSource::Tap));
+
+        mem.write_u32(profile.frame_counter.addr.unwrap(), 5);
+        place_monster(&mut mem, 0, 574, 774, 1, [10.0, 20.0, 30.0], 0);
+        let later = pipeline.poll(&mut mem, &profile, 86_000).unwrap();
+        assert_eq!(later.events.len(), 1);
+        assert_eq!(later.events[0].amount, 100);
+        assert_eq!(later.events[0].kind, DamageKind::Hit);
+        assert_eq!(later.events[0].source, EventSource::Passive);
+        assert_eq!(later.events[0].confidence, DamageConfidence::HpDelta);
+        assert_eq!(later.events[0].hp_before, Some(674));
+        assert_eq!(later.events[0].hp_after, Some(574));
+    }
+
     fn write_tap(mem: &mut SparseMemory, seq: u32, r1: i32, monster: u32, bone: u32, part_hp: u32) {
         let mut raw = [0u8; ENTRY_SIZE as usize];
         raw[0..4].copy_from_slice(&seq.to_le_bytes());
@@ -854,6 +917,12 @@ mod tests {
         let addr = RING_ADDR + (seq % 64) * ENTRY_SIZE;
         mem.write_bytes(addr, &raw);
         mem.write_u32(WRITE_SEQ_ADDR, seq);
+    }
+
+    fn write_tap_from(mem: &mut SparseMemory, seq: u32, r1: i32, monster: u32, lr: u32) {
+        write_tap(mem, seq, r1, monster, 0, 0);
+        let addr = RING_ADDR + (seq % 64) * ENTRY_SIZE;
+        mem.write_u32(addr + 16, lr);
     }
 
     fn mem_word(mem: &mut SparseMemory, addr: u32) -> u32 {
