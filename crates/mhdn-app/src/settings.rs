@@ -173,7 +173,9 @@ impl Default for CornerSettings {
 }
 
 impl CornerSettings {
-    /// The corner text, or `None` when both parts are off. The default is `DMG 40  DPS 12`.
+    /// The old one-line corner, kept so a saved config still has the two switches.
+    /// The overlay now draws one block per monster instead of this string.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn line(&self, total: u32, dps: f32) -> Option<String> {
         match (self.show_total, self.show_dps) {
             (true, true) => Some(format!("DMG {total}  DPS {dps:.0}")),

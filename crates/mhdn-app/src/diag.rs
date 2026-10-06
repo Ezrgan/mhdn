@@ -215,6 +215,20 @@ pub fn format_dmg(event: &DamageEvent) -> String {
     line
 }
 
+pub fn format_meter(addr: u32, total: u32, poison: u32, topple: u32) -> String {
+    crate::meter::format_meter_line(addr, total, poison, topple)
+}
+
+/// [`format_meter`] plus `name=` with the table spelling when that species is listed.
+pub fn format_meter_named(addr: u32, total: u32, poison: u32, topple: u32, species: u16) -> String {
+    let mut line = format_meter(addr, total, poison, topple);
+    if let Some(name) = crate::meter::species_name(species) {
+        line.push_str(" name=");
+        line.push_str(name);
+    }
+    line
+}
+
 pub fn format_scene(scene: Scene, monsters: &[MonsterState]) -> String {
     let mut line = format!("scene {scene:?}");
     for monster in monsters {
@@ -533,6 +547,22 @@ mod tests {
         assert_eq!(
             format_dmg(&tap),
             "dmg source=tap kind=hit confidence=exact amount=42 mon=0x300E0E38 species=30 gen=1 max_hp=720 hp_before=700 hp_after=658 frames=1 lr=0x008BA260 r3=0x08123456 sp=0x00000001,0x0000005A,0x082CE744,0x0000002A,0x0000000E"
+        );
+        assert_eq!(
+            format_meter(0x3007_2518, 676, 30, 100),
+            "meter mon=0x30072518 total=676 poison=30 topple=100"
+        );
+        assert_eq!(
+            format_meter_named(0x3007_2518, 676, 30, 100, 30),
+            "meter mon=0x30072518 total=676 poison=30 topple=100 name=Bulldrome"
+        );
+        assert_eq!(
+            format_meter_named(0x3007_2518, 676, 30, 100, 85),
+            "meter mon=0x30072518 total=676 poison=30 topple=100 name=Great Maccao"
+        );
+        assert_eq!(
+            format_meter_named(0x3007_2518, 676, 30, 100, 116),
+            "meter mon=0x30072518 total=676 poison=30 topple=100"
         );
 
         let mut passive = tap.clone();

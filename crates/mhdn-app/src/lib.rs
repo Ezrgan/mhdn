@@ -7,11 +7,13 @@ mod config;
 mod diag;
 mod git_sha;
 mod hud;
+mod meter;
 mod numbers;
 mod run;
 mod session;
 mod settings;
 mod settings_window;
+mod species_names;
 mod status;
 mod trace;
 

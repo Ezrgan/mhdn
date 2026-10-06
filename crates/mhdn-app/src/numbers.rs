@@ -5,11 +5,14 @@
 use std::time::Duration;
 
 use mhdn_fx::{HitKind, MagnitudeWindow, Pool, Spawn};
-use mhdn_game::{Anchor, DamageEvent, DamageKind, MonsterState, Scene, HP_FROM_OBJECT};
+use mhdn_game::{
+    Anchor, Attacker, DamageEvent, DamageKind, MonsterKey, MonsterState, Scene, HP_FROM_OBJECT,
+};
 use mhdn_proj::{project, Camera, EdgeMode, Projected, ScreenRect};
 use mhdn_render::{glyph_quads, premul, Quad};
 
 use crate::config::NumberAnchor;
+use crate::meter::{Meter, MeterHit};
 use crate::settings::{CornerSettings, NumberSettings};
 
 /// A forward jump larger than this is a save state, not a dropped sample.
@@ -22,7 +25,8 @@ const HIT_HEIGHT: f32 = 130.0;
 pub struct CombatView {
     pool: Pool,
     magnitude: MagnitudeWindow,
-    recount: Recount,
+    meter: Meter,
+    elapsed_ms: f32,
     seen: bool,
     last_scene: Scene,
     last_frame: u32,
@@ -41,7 +45,8 @@ impl CombatView {
         Self {
             pool: Pool::new(),
             magnitude: MagnitudeWindow::new(),
-            recount: Recount::default(),
+            meter: Meter::new(),
+            elapsed_ms: 0.0,
             seen: false,
             last_scene: Scene::Disconnected,
             last_frame: 0,
@@ -66,7 +71,8 @@ impl CombatView {
     pub fn clear(&mut self) {
         self.pool.clear();
         self.magnitude.clear();
-        self.recount.clear();
+        self.meter.reset();
+        self.elapsed_ms = 0.0;
     }
 
     /// Drop numbers when the hunt ends, the frame rewinds, or a save state jumps ahead.
@@ -100,6 +106,7 @@ impl CombatView {
             return Ingested {
                 gated: true,
                 anchors: vec![None; events.len()],
+                meter: Vec::new(),
             };
         }
         let hunter = match self.anchor {
@@ -107,6 +114,7 @@ impl CombatView {
             NumberAnchor::Monster => None,
         };
         let mut anchors = Vec::with_capacity(events.len());
+        let mut touched: Vec<MonsterKey> = Vec::new();
         for event in events {
             let Some(counted) = recount_amount(event, monsters) else {
                 anchors.push(None);
@@ -114,11 +122,23 @@ impl CombatView {
             };
             let world = anchor_world(event, monsters, &height, hunter);
             anchors.push(world);
+            if counted > 0 {
+                let key = meter_key(event, monsters);
+                self.meter.add(MeterHit {
+                    key,
+                    amount: counted,
+                    attacker: Attacker::Unknown,
+                    kind: event.kind,
+                    at_ms: self.elapsed_ms as u64,
+                });
+                if !touched.contains(&key) {
+                    touched.push(key);
+                }
+            }
             let Some(world) = world else {
                 continue;
             };
             let style = self.magnitude.style(event.amount, hit_kind(event.kind));
-            self.recount.add(counted);
             self.pool.spawn(Spawn {
                 world,
                 rgb: style.rgb,
@@ -127,9 +147,24 @@ impl CombatView {
                 seed: event_seed(event),
             });
         }
+        let now = self.elapsed_ms as u64;
+        let meter = touched
+            .into_iter()
+            .filter_map(|key| {
+                let row = self.meter.row(key, now)?;
+                Some(MeterUpdate {
+                    addr: row.key.struct_addr,
+                    total: row.total,
+                    poison: row.poison,
+                    topple: row.topple,
+                    species: row.key.species,
+                })
+            })
+            .collect();
         Ingested {
             gated: false,
             anchors,
+            meter,
         }
     }
 
@@ -138,7 +173,12 @@ impl CombatView {
     }
 
     pub fn recount_total(&self) -> u32 {
-        self.recount.total
+        self.meter.received_total()
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn player_total(&self) -> u32 {
+        self.meter.player_total()
     }
 
     /// Where the live numbers project right now. Same test as `number_quads`.
@@ -161,8 +201,8 @@ impl CombatView {
     pub fn tick(&mut self, dt: Duration) {
         let ms = dt.as_secs_f32() * 1000.0;
         self.pool.tick(ms);
-        if self.last_scene == Scene::InQuest {
-            self.recount.tick(ms);
+        if self.last_scene == Scene::InQuest && self.meter.received_total() > 0 && ms > 0.0 {
+            self.elapsed_ms += ms;
         }
     }
 
@@ -210,22 +250,41 @@ impl CombatView {
     }
 
     /// `px` is the glyph height in physical pixels.
+    /// One short block per large monster, highest total on the bottom corner.
     pub fn recount_quads(&self, top: ScreenRect, px: f32, corner: &CornerSettings) -> Vec<Quad> {
-        if self.recount.total == 0 {
+        let lines = self.corner_lines(corner);
+        if lines.is_empty() {
             return Vec::new();
         }
-        let Some(line) = corner.line(self.recount.total, self.recount.dps()) else {
-            return Vec::new();
-        };
         let margin = px * 0.5;
-        glyph_quads(
-            &line,
-            top.x + margin,
-            top.y + top.height - px - margin,
-            px,
-            premul([1.0, 1.0, 1.0], 0.9),
-        )
+        let step = px * 1.05;
+        let mut quads = Vec::new();
+        for (index, line) in lines.iter().enumerate() {
+            let y = top.y + top.height - px - margin - index as f32 * step;
+            quads.extend(glyph_quads(
+                line,
+                top.x + margin,
+                y,
+                px,
+                premul([1.0, 1.0, 1.0], 0.9),
+            ));
+        }
+        quads
     }
+
+    pub fn corner_lines(&self, corner: &CornerSettings) -> Vec<String> {
+        self.meter
+            .screen_lines(corner.show_total, corner.show_dps, self.elapsed_ms as u64)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MeterUpdate {
+    pub addr: u32,
+    pub total: u32,
+    pub poison: u32,
+    pub topple: u32,
+    pub species: u16,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -233,6 +292,8 @@ pub struct Ingested {
     /// The view was not in a hunt, so nothing spawned.
     pub gated: bool,
     pub anchors: Vec<Option<[f32; 3]>>,
+    /// One entry per monster whose received total changed in this ingest.
+    pub meter: Vec<MeterUpdate>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -360,33 +421,18 @@ fn event_seed(event: &DamageEvent) -> u32 {
         .wrapping_add(event.monster)
 }
 
-#[derive(Debug, Clone, Copy, Default)]
-struct Recount {
-    total: u32,
-    elapsed_ms: f32,
-}
-
-impl Recount {
-    fn add(&mut self, amount: u32) {
-        self.total = self.total.saturating_add(amount);
+fn meter_key(event: &DamageEvent, monsters: &[MonsterState]) -> MonsterKey {
+    if let Some(key) = event.key {
+        return key;
     }
-
-    fn tick(&mut self, dt_ms: f32) {
-        if self.total > 0 && dt_ms > 0.0 {
-            self.elapsed_ms += dt_ms;
-        }
+    if let Some(monster) = find_monster(event, monsters) {
+        return monster.key;
     }
-
-    fn dps(&self) -> f32 {
-        if self.elapsed_ms < 250.0 {
-            0.0
-        } else {
-            self.total as f32 / (self.elapsed_ms / 1000.0)
-        }
-    }
-
-    fn clear(&mut self) {
-        *self = Self::default();
+    MonsterKey {
+        struct_addr: event.monster,
+        species: 0,
+        max_hp: 0,
+        generation: 0,
     }
 }
 
@@ -395,7 +441,8 @@ mod tests {
     use super::*;
     use mhdn_fx::{LIFE_MS, ORANGE, POISON, SCATTER_PX, TOPPLE};
     use mhdn_game::{
-        CameraState, DamageConfidence, EventSource, FovUnit, MonsterKey, Vec3 as GameVec3,
+        CameraState, DamageConfidence, EventSource, FovUnit, MonsterKey, TapCredit,
+        Vec3 as GameVec3,
     };
     use mhdn_proj::ScreenRect;
 
@@ -528,7 +575,7 @@ mod tests {
             &monsters,
             |_, _| 10.0,
         );
-        assert_eq!(view.recount.total, 40);
+        assert_eq!(view.recount_total(), 40);
         let top = ScreenRect::new(0.0, 0.0, 800.0, 480.0);
         let quads = view.number_quads(&hunt_camera(), top, 36.0, &NumberSettings::default());
         assert!(!quads.is_empty());
@@ -536,6 +583,84 @@ mod tests {
         let recount = view.recount_quads(top, 44.0, &CornerSettings::default());
         assert!(recount.len() > 4);
         assert!(recount.iter().all(|quad| top.contains(quad.x, quad.y)));
+    }
+
+    #[test]
+    fn two_monsters_keep_poison_and_topple_apart_and_unknown_is_not_the_player() {
+        let mut view = CombatView::new();
+        view.observe(Scene::InQuest, 10);
+        let mut poison = event(
+            5,
+            Anchor::World(GameVec3::new(0.0, 1.0, 0.0)),
+            DamageKind::Poison,
+        );
+        poison.key = Some(MonsterKey {
+            struct_addr: 0x1000,
+            species: 30,
+            max_hp: 774,
+            generation: 1,
+        });
+        let mut blow = event(
+            40,
+            Anchor::World(GameVec3::new(0.0, 1.0, 0.0)),
+            DamageKind::Hit,
+        );
+        blow.key = Some(MonsterKey {
+            struct_addr: 0x1000,
+            species: 30,
+            max_hp: 774,
+            generation: 1,
+        });
+        let mut topple = event(
+            100,
+            Anchor::World(GameVec3::new(2.0, 1.0, 0.0)),
+            DamageKind::Topple,
+        );
+        topple.monster = 0x2000;
+        topple.key = Some(MonsterKey {
+            struct_addr: 0x2000,
+            species: 42,
+            max_hp: 8_000,
+            generation: 1,
+        });
+        let ingested = view.ingest(
+            &[poison, blow, topple],
+            &[monster(0x1000, true), monster(0x2000, true)],
+            |_, _| 10.0,
+        );
+        assert_eq!(view.player_total(), 0);
+        assert_eq!(view.recount_total(), 145);
+        assert_eq!(
+            ingested.meter,
+            vec![
+                MeterUpdate {
+                    addr: 0x1000,
+                    total: 45,
+                    poison: 5,
+                    topple: 0,
+                    species: 30,
+                },
+                MeterUpdate {
+                    addr: 0x2000,
+                    total: 100,
+                    poison: 0,
+                    topple: 100,
+                    species: 42,
+                },
+            ]
+        );
+        let lines = view.corner_lines(&CornerSettings::default());
+        assert_eq!(
+            lines,
+            vec![
+                "DERRIBO 100  100%".to_string(),
+                "BARIOTH  100  69%".to_string(),
+                "VENENO 5  11%".to_string(),
+                "BULLDROME  45  31%".to_string(),
+            ]
+        );
+        assert!(lines.iter().all(|line| !line.contains("YOU")));
+        assert!(lines.iter().all(|line| !line.contains("JUMP")));
     }
 
     fn spawn_one(view: &mut CombatView, amount: u32, kind: DamageKind) {
@@ -566,7 +691,7 @@ mod tests {
         assert!(view
             .number_quads(&hunt_camera(), top, 36.0, &hidden)
             .is_empty());
-        assert_eq!(view.recount.total, 3);
+        assert_eq!(view.recount_total(), 3);
 
         // The same poison number comes back as soon as the setting does.
         assert!(!view
@@ -615,8 +740,12 @@ mod tests {
         let both = view.recount_quads(top, 44.0, &corner).len();
         corner.show_dps = false;
         let total_only = view.recount_quads(top, 44.0, &corner).len();
-        assert!(total_only > 0 && total_only < both);
+        assert!(total_only > 0);
+        assert_eq!(total_only, both);
+        corner.show_dps = true;
         corner.show_total = false;
+        assert!(view.recount_quads(top, 44.0, &corner).is_empty());
+        corner.show_dps = false;
         assert!(view.recount_quads(top, 44.0, &corner).is_empty());
     }
 
@@ -653,7 +782,7 @@ mod tests {
         assert!(view.alive());
         view.observe(Scene::QuestEnd, 110);
         assert!(!view.alive());
-        assert_eq!(view.recount.total, 0);
+        assert_eq!(view.recount_total(), 0);
 
         view.observe(Scene::InQuest, 200);
         view.ingest(
@@ -781,7 +910,7 @@ mod tests {
             DamageKind::Hit,
         );
         view.ingest(std::slice::from_ref(&at_cap), &monsters, |_, _| 10.0);
-        assert_eq!(view.recount.total, 3000);
+        assert_eq!(view.recount_total(), 3000);
         assert_eq!(view.magnitude.len(), 1);
 
         let huge = event(
@@ -791,7 +920,7 @@ mod tests {
         );
         let ingested = view.ingest(std::slice::from_ref(&huge), &monsters, |_, _| 10.0);
         assert_eq!(ingested.anchors, vec![None]);
-        assert_eq!(view.recount.total, 3000);
+        assert_eq!(view.recount_total(), 3000);
         assert_eq!(view.magnitude.len(), 1);
         assert_eq!(view.alive_count(), 1);
     }
@@ -818,7 +947,7 @@ mod tests {
         hit.hp_after = Some(0);
         let ingested = view.ingest(std::slice::from_ref(&hit), &[small], |_, _| 10.0);
         assert_eq!(ingested.anchors, vec![Some([0.0, 1.0, 0.0])]);
-        assert_eq!(view.recount.total, 9);
+        assert_eq!(view.recount_total(), 9);
         assert_eq!(view.magnitude.len(), 1);
         let shown = view.pool.live().next().expect("number");
         assert_eq!(shown.text, "39");
@@ -844,7 +973,7 @@ mod tests {
         hit.hp_before = Some(9);
         let ingested = view.ingest(std::slice::from_ref(&hit), &[small], |_, _| 10.0);
         assert_eq!(ingested.anchors, vec![None]);
-        assert_eq!(view.recount.total, 0);
+        assert_eq!(view.recount_total(), 0);
         assert_eq!(view.magnitude.len(), 0);
         assert_eq!(view.alive_count(), 0);
     }
@@ -860,5 +989,85 @@ mod tests {
         );
         view.tick(Duration::from_millis(LIFE_MS as u64));
         assert!(!view.alive());
+    }
+
+    fn keyed(
+        amount: u32,
+        kind: DamageKind,
+        source: EventSource,
+        before: u32,
+        after: u32,
+    ) -> DamageEvent {
+        let mut hit = event(amount, Anchor::World(GameVec3::new(0.0, 1.0, 0.0)), kind);
+        hit.source = source;
+        hit.confidence = DamageConfidence::HpDelta;
+        hit.hp_before = Some(before);
+        hit.hp_after = Some(after);
+        hit.frames_since = Some(1);
+        hit.key = Some(MonsterKey {
+            struct_addr: 0x1000,
+            species: 7,
+            max_hp: 3000,
+            generation: 1,
+        });
+        hit
+    }
+
+    #[test]
+    fn a_topple_whose_hp_drop_lands_next_counts_once_and_spawns_one_number() {
+        let mut credit = TapCredit::default();
+        let mut first = vec![keyed(100, DamageKind::Topple, EventSource::Tap, 1041, 1041)];
+        credit.settle(10, &mut first);
+        let mut echo = vec![keyed(100, DamageKind::Hit, EventSource::Passive, 1041, 941)];
+        credit.settle(11, &mut echo);
+
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].kind, DamageKind::Topple);
+        assert_eq!(first[0].source, EventSource::Tap);
+        assert_eq!(first[0].amount, 100);
+        assert!(echo.is_empty());
+
+        let mut view = CombatView::new();
+        view.observe(Scene::InQuest, 1);
+        view.set_anchor(NumberAnchor::Monster);
+        let monsters = [monster(0x1000, true)];
+        let ingested = view.ingest(&first, &monsters, |_, _| 150.0);
+        assert_eq!(ingested.anchors.iter().flatten().count(), 1);
+        assert_eq!(ingested.meter[0].total, 100);
+        assert_eq!(ingested.meter[0].topple, 100);
+        let again = view.ingest(&echo, &monsters, |_, _| 150.0);
+        assert_eq!(again.anchors.iter().flatten().count(), 0);
+        assert_eq!(view.recount_total(), 100);
+        assert_eq!(view.alive_count(), 1);
+        assert_eq!(view.player_total(), 0);
+    }
+
+    #[test]
+    fn a_later_hit_of_100_with_its_own_hp_drop_still_spawns() {
+        let mut credit = TapCredit::default();
+        let mut first = vec![keyed(100, DamageKind::Topple, EventSource::Tap, 1041, 1041)];
+        credit.settle(10, &mut first);
+        let mut echo = vec![keyed(100, DamageKind::Hit, EventSource::Passive, 1041, 941)];
+        credit.settle(11, &mut echo);
+        assert!(echo.is_empty());
+
+        let mut later = vec![keyed(100, DamageKind::Hit, EventSource::Passive, 941, 841)];
+        credit.settle(20, &mut later);
+        assert_eq!(later.len(), 1);
+        assert_eq!(later[0].kind, DamageKind::Hit);
+        assert_eq!(later[0].amount, 100);
+        assert_eq!(later[0].hp_before, Some(941));
+        assert_eq!(later[0].hp_after, Some(841));
+
+        let mut view = CombatView::new();
+        view.observe(Scene::InQuest, 1);
+        view.set_anchor(NumberAnchor::Monster);
+        let monsters = [monster(0x1000, true)];
+        view.ingest(&first, &monsters, |_, _| 150.0);
+        let spawned = view.ingest(&later, &monsters, |_, _| 150.0);
+        assert_eq!(spawned.anchors.iter().flatten().count(), 1);
+        assert_eq!(view.recount_total(), 200);
+        assert_eq!(view.alive_count(), 2);
+        assert_eq!(view.player_total(), 0);
     }
 }

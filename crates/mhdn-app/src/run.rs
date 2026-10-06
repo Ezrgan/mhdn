@@ -389,6 +389,15 @@ impl OverlayApp {
                     .map(|profile| profile.species.anchor_for(species, large))
                     .unwrap_or(if large { 150.0 } else { 52.0 })
             });
+            for update in &ingested.meter {
+                diag::line(&diag::format_meter_named(
+                    update.addr,
+                    update.total,
+                    update.poison,
+                    update.topple,
+                    update.species,
+                ));
+            }
             if !ingested.gated {
                 self.diag.spawned(ingested.anchors.iter().flatten().count());
             }
