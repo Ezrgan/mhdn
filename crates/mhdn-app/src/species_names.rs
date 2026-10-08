@@ -1,10 +1,18 @@
 //! In-game species id to the English name in the MHGU monster table.
 //!
-//! Spellings are the table's Name column, not a translation:
+//! Large monsters: spellings match the wiki Name column:
 //! <https://github.com/RTHKKona/MHGU-Modding/wiki/Monster-IDs>
+//!
+//! Small monsters use the same high nibble as in memory: `(id & 0xF000) == 0x1000`
+//! and `id & 0x0FFF` is the small-monster ordinal (`4096 + ordinal`, e.g. 4099 = Kelbi).
+//! IDs and names follow the MHGU/MHXX HP overlay table:
+//! <https://github.com/Alexander-Lancellott/MHGU-MHXX-HP-Overlay-For-Switch-Emulator/blob/main/modules/models.py>
+//!
 //! The corner atlas has no lowercase, so the overlay draws these in capitals.
 
-/// `(in-game id, name)`. 94 rows, the whole table.
+const SMALL_SPECIES_FLAG: u16 = 0x1000;
+
+/// `(in-game id, name)`. 94 rows, the whole large-monster table.
 pub const SPECIES_NAMES: &[(u16, &str)] = &[
     (1, "Rathian"),
     (2, "Rathalos"),
@@ -102,12 +110,63 @@ pub const SPECIES_NAMES: &[(u16, &str)] = &[
     (1351, "Chaotic Gore Magala"),
 ];
 
+/// Small-monster ids from the overlay table (`4096 + ordinal`, high nibble `0x1000`).
+pub const SMALL_SPECIES_NAMES: &[(u16, &str)] = &[
+    (4097, "Aptonoth"),
+    (4098, "Apceros"),
+    (4099, "Kelbi"),
+    (4100, "Mosswine"),
+    (4101, "Hornetaur"),
+    (4102, "Vespoid"),
+    (4103, "Felyne"),
+    (4104, "Melynx"),
+    (4105, "Velociprey"),
+    (4106, "Genprey"),
+    (4107, "Ioprey"),
+    (4108, "Cephalos"),
+    (4109, "Bullfango"),
+    (4110, "Popo"),
+    (4111, "Giaprey"),
+    (4112, "Anteka"),
+    (4113, "Great Thunderbug"),
+    (4115, "Remobra"),
+    (4116, "Hermitaur"),
+    (4117, "Ceanataur"),
+    (4118, "Conga"),
+    (4119, "Blango"),
+    (4121, "Rhenoplos"),
+    (4122, "Bnahabra"),
+    (4123, "Altaroth"),
+    (4130, "Jaggi"),
+    (4131, "Jaggia"),
+    (4135, "Ludroth"),
+    (4136, "Uroktor"),
+    (4137, "Slagtoth"),
+    (4138, "Gargwa"),
+    (4140, "Zamite"),
+    (4141, "Konchu"),
+    (4142, "Maccao"),
+    (4143, "Larinoth"),
+    (4144, "Moofah"),
+    (4197, "Rock"),
+];
+
 /// Table spelling for `species`, or `None` when that id is not in the table.
 pub fn name(species: u16) -> Option<&'static str> {
     SPECIES_NAMES
         .iter()
         .find(|&&(id, _)| id == species)
         .map(|&(_, monster)| monster)
+        .or_else(|| {
+            if species & 0xF000 == SMALL_SPECIES_FLAG {
+                SMALL_SPECIES_NAMES
+                    .iter()
+                    .find(|&&(id, _)| id == species)
+                    .map(|&(_, monster)| monster)
+            } else {
+                None
+            }
+        })
 }
 
 #[cfg(test)]
@@ -125,15 +184,31 @@ mod tests {
     }
 
     #[test]
+    fn measured_small_ids_use_small_names_not_large_dromes() {
+        assert_eq!(name(4110), Some("Popo"));
+        assert_eq!(name(4109), Some("Bullfango"));
+        assert_ne!(name(4110), name(14));
+        assert_eq!(name(4099), Some("Kelbi"));
+    }
+
+    #[test]
+    fn a_small_id_with_no_table_row_stays_unknown() {
+        assert!(name(4114).is_none());
+        assert!(name(5095).is_none());
+    }
+
+    #[test]
     fn every_id_is_unique_and_the_corner_can_draw_the_name() {
         let mut seen = std::collections::BTreeSet::new();
-        for &(id, monster) in SPECIES_NAMES {
-            assert!(seen.insert(id), "duplicate {id}");
-            let corner = monster.to_ascii_uppercase();
-            assert!(
-                corner.chars().all(|ch| matches!(ch, ' ' | 'A'..='Z' | '-')),
-                "{monster} needs a glyph the corner atlas does not have"
-            );
+        for table in [SPECIES_NAMES, SMALL_SPECIES_NAMES] {
+            for &(id, monster) in table {
+                assert!(seen.insert(id), "duplicate {id}");
+                let corner = monster.to_ascii_uppercase();
+                assert!(
+                    corner.chars().all(|ch| matches!(ch, ' ' | 'A'..='Z' | '-')),
+                    "{monster} needs a glyph the corner atlas does not have"
+                );
+            }
         }
     }
 }
