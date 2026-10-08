@@ -58,6 +58,18 @@ pub struct DamageEvent {
     pub tap_sp_hi: Option<[u32; 11]>,
 }
 
+impl DamageEvent {
+    /// Residual HP path: a passive sample whose confidence is an HP delta.
+    /// A tap hit stays hit-by-hit even when `frames_since` is set.
+    pub fn is_grouped_hp(&self) -> bool {
+        self.source == EventSource::Passive
+            && matches!(
+                self.confidence,
+                DamageConfidence::HpDelta | DamageConfidence::AggregatedHpDelta
+            )
+    }
+}
+
 /// One plugin hit. `hp_addr` is the monster HP word, the same address as [`MonsterKey::struct_addr`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PluginHit {

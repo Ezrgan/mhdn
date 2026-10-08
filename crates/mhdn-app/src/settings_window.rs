@@ -17,7 +17,8 @@ use winit::window::{Window, WindowAttributes, WindowId};
 
 use crate::config::{NumberAnchor, StyleConfig};
 use crate::settings::{
-    Category, CornerSettings, NumberSettings, CORNER_PT_RANGE, DEFAULT_NUMBER_PX, NUMBER_PX_RANGE,
+    Category, CornerMeterMode, CornerSettings, DamageCount, GroupedHpSettings, NumberSettings,
+    CORNER_PT_RANGE, DEFAULT_NUMBER_PX, NUMBER_PX_RANGE,
 };
 
 /// Game and Azahar facts, copied from `docs/SETUP_AZAHAR.md` and `docs/GUIA.md`.
@@ -103,7 +104,7 @@ impl SettingsWindow {
             .with_decorations(true)
             .with_transparent(false)
             .with_resizable(true)
-            .with_inner_size(LogicalSize::new(520.0, 700.0))
+            .with_inner_size(LogicalSize::new(520.0, 820.0))
             .with_min_inner_size(LogicalSize::new(420.0, 420.0))
             .with_visible(true);
         let window = Arc::new(
@@ -209,6 +210,8 @@ impl SettingsWindow {
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     outcome.action = dashboard_section(ui, dashboard);
                     ui.add_space(8.0);
+                    outcome.changed |= damage_section(ui, style);
+                    ui.add_space(8.0);
                     outcome.changed |= numbers_section(ui, style);
                     ui.add_space(8.0);
                     outcome.changed |= corner_section(ui, style);
@@ -278,6 +281,39 @@ fn dashboard_section(ui: &mut egui::Ui, dashboard: Dashboard<'_>) -> Option<Acti
     action
 }
 
+fn damage_section(ui: &mut egui::Ui, style: &mut StyleConfig) -> bool {
+    let mut changed = false;
+    ui.separator();
+    ui.heading("Count damage from");
+    changed |= ui.checkbox(&mut style.count.you, "You").changed();
+    changed |= ui
+        .checkbox(&mut style.count.your_felyne, "Your Felyne")
+        .changed();
+    changed |= ui
+        .checkbox(&mut style.count.other_hunters, "Other hunters")
+        .changed();
+    changed |= ui
+        .checkbox(&mut style.count.their_felynes, "Their Felynes")
+        .changed();
+    changed |= ui
+        .checkbox(&mut style.count.other, "Other sources")
+        .changed();
+    changed |= ui.checkbox(&mut style.count.unknown, "Unknown").changed();
+    ui.add_space(4.0);
+    changed |= ui
+        .checkbox(
+            &mut style.count.gray_uncounted,
+            "Show uncounted numbers in gray",
+        )
+        .changed();
+    ui.label(RichText::new("Gray numbers stay on screen and are not added to the meter.").weak());
+    if ui.button("Reset damage count").clicked() {
+        style.count = DamageCount::default();
+        changed = true;
+    }
+    changed
+}
+
 fn numbers_section(ui: &mut egui::Ui, style: &mut StyleConfig) -> bool {
     let mut changed = false;
     ui.separator();
@@ -315,6 +351,21 @@ fn numbers_section(ui: &mut egui::Ui, style: &mut StyleConfig) -> bool {
             ui.end_row();
         }
     });
+    ui.add_space(6.0);
+    ui.label("Grouped HP drops");
+    changed |= ui
+        .checkbox(&mut style.grouped_hp.show, "Show grouped HP drops")
+        .changed();
+    ui.horizontal(|ui| {
+        ui.label("Color");
+        changed |= ui
+            .color_edit_button_rgb(&mut style.grouped_hp.rgb)
+            .changed();
+    });
+    ui.label(
+        RichText::new("HP changes that arrive as one number (a residual drop), not each tap hit.")
+            .weak(),
+    );
     ui.add_space(2.0);
     ui.label(
         RichText::new(
@@ -328,6 +379,7 @@ fn numbers_section(ui: &mut egui::Ui, style: &mut StyleConfig) -> bool {
         style.number_px = DEFAULT_NUMBER_PX;
         style.anchor = NumberAnchor::default();
         style.show_numbers = true;
+        style.grouped_hp = GroupedHpSettings::default();
         changed = true;
     }
     changed
@@ -337,6 +389,32 @@ fn corner_section(ui: &mut egui::Ui, style: &mut StyleConfig) -> bool {
     let mut changed = false;
     ui.separator();
     ui.heading("Corner");
+    ui.label("Corner meter");
+    changed |= ui
+        .radio_value(
+            &mut style.corner.mode,
+            CornerMeterMode::CurrentMonster,
+            "Current monster",
+        )
+        .changed();
+    changed |= ui
+        .radio_value(
+            &mut style.corner.mode,
+            CornerMeterMode::WholeQuest,
+            "Whole quest",
+        )
+        .changed();
+    changed |= ui
+        .radio_value(&mut style.corner.mode, CornerMeterMode::Session, "Session")
+        .changed();
+    ui.label(
+        RichText::new(
+            "Current monster: name, damage, DPS and percent of max HP. \
+             Whole quest: one line per monster, plus the total. \
+             Session: large monsters, quest share, poison and topple.",
+        )
+        .weak(),
+    );
     changed |= ui
         .checkbox(&mut style.show_recount, "Show the recount")
         .changed();

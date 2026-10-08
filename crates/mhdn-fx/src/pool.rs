@@ -14,6 +14,10 @@ pub struct Spawn {
     pub mag_scale: f32,
     pub amount: u32,
     pub seed: u32,
+    /// Attacker index from the game crate. The pool does not interpret it.
+    pub tag: u8,
+    /// Residual HP drop, as opposed to a hit-by-hit tap.
+    pub grouped: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -28,6 +32,8 @@ struct Slot {
     text: [u8; 8],
     text_len: u8,
     born: u32,
+    tag: u8,
+    grouped: bool,
 }
 
 impl Default for Slot {
@@ -43,6 +49,8 @@ impl Default for Slot {
             text: [0; 8],
             text_len: 0,
             born: 0,
+            tag: 0,
+            grouped: false,
         }
     }
 }
@@ -55,6 +63,8 @@ pub struct Live<'a> {
     pub text: &'a str,
     pub pose: Pose,
     pub mag_scale: f32,
+    pub tag: u8,
+    pub grouped: bool,
 }
 
 pub struct Pool {
@@ -101,6 +111,8 @@ impl Pool {
             text,
             text_len,
             born,
+            tag: spawn.tag,
+            grouped: spawn.grouped,
         };
     }
 
@@ -129,6 +141,8 @@ impl Pool {
                 text,
                 pose: pose(slot.age_ms, slot.speed),
                 mag_scale: slot.mag_scale,
+                tag: slot.tag,
+                grouped: slot.grouped,
             }
         })
     }
@@ -185,6 +199,8 @@ mod tests {
             mag_scale: 1.0,
             amount,
             seed,
+            tag: 0,
+            grouped: false,
         }
     }
 
