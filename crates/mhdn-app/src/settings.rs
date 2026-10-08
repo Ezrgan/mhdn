@@ -10,6 +10,7 @@
 #![forbid(unsafe_code)]
 
 use mhdn_fx::{ORANGE, POISON, TOPPLE, WHITE, YELLOW};
+use mhdn_game::{Attacker, AttackerFilter};
 use serde::{Deserialize, Serialize};
 
 /// Glyph height of a floating number, in points. The value the overlay always used.
@@ -151,6 +152,110 @@ impl NumberSettings {
     }
 }
 
+/// Who adds to the floating numbers and the corner meter.
+///
+/// Missing keys in an old `config.toml` load these defaults: only you and your Felyne.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DamageCount {
+    #[serde(default = "on")]
+    pub you: bool,
+    #[serde(default = "on")]
+    pub your_felyne: bool,
+    #[serde(default = "off")]
+    pub other_hunters: bool,
+    #[serde(default = "off")]
+    pub their_felynes: bool,
+    #[serde(default = "off")]
+    pub other: bool,
+    #[serde(default = "off")]
+    pub unknown: bool,
+    /// Draw numbers for attackers that are off, in gray. They still do not add to the meter.
+    #[serde(default = "off")]
+    pub gray_uncounted: bool,
+}
+
+impl Default for DamageCount {
+    fn default() -> Self {
+        Self {
+            you: true,
+            your_felyne: true,
+            other_hunters: false,
+            their_felynes: false,
+            other: false,
+            unknown: false,
+            gray_uncounted: false,
+        }
+    }
+}
+
+impl DamageCount {
+    pub fn filter(self) -> AttackerFilter {
+        let mut filter = AttackerFilter::from_slice(&[]);
+        let pairs = [
+            (Attacker::You, self.you),
+            (Attacker::YourFelyne, self.your_felyne),
+            (Attacker::OtherHunter, self.other_hunters),
+            (Attacker::OtherFelyne, self.their_felynes),
+            (Attacker::Other, self.other),
+            (Attacker::Unknown, self.unknown),
+        ];
+        for (attacker, allowed) in pairs {
+            filter = filter.with(attacker, allowed);
+        }
+        filter
+    }
+
+    /// Every attacker counts. Tests of the pre-filter corner use this.
+    #[cfg(test)]
+    pub fn allowing_all() -> Self {
+        Self {
+            you: true,
+            your_felyne: true,
+            other_hunters: true,
+            their_felynes: true,
+            other: true,
+            unknown: true,
+            gray_uncounted: false,
+        }
+    }
+}
+
+/// Which block the corner draws. One choice, saved in `config.toml`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CornerMeterMode {
+    /// Large monsters, quest share, poison and topple: the corner the overlay already draws.
+    #[default]
+    Session,
+    /// The monster you last hit with the filter on.
+    CurrentMonster,
+    /// One line per monster hit, plus the quest total.
+    WholeQuest,
+}
+
+/// Residual HP drops (passive HP delta), not each tap hit.
+///
+/// Shown by default so an old config keeps drawing them. The color replaces the
+/// magnitude color for those numbers only.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct GroupedHpSettings {
+    #[serde(default = "on")]
+    pub show: bool,
+    #[serde(default = "default_grouped_rgb")]
+    pub rgb: [f32; 3],
+}
+
+pub const DEFAULT_GROUPED_RGB: [f32; 3] = [0.75, 0.82, 0.95];
+
+impl Default for GroupedHpSettings {
+    fn default() -> Self {
+        Self {
+            show: true,
+            rgb: DEFAULT_GROUPED_RGB,
+        }
+    }
+}
+
 /// The recount in the corner of the game screen.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct CornerSettings {
@@ -160,6 +265,8 @@ pub struct CornerSettings {
     pub show_dps: bool,
     #[serde(default = "default_corner_pt")]
     pub size_pt: f32,
+    #[serde(default)]
+    pub mode: CornerMeterMode,
 }
 
 impl Default for CornerSettings {
@@ -168,6 +275,7 @@ impl Default for CornerSettings {
             show_total: true,
             show_dps: true,
             size_pt: DEFAULT_CORNER_PT,
+            mode: CornerMeterMode::Session,
         }
     }
 }
@@ -197,6 +305,14 @@ pub fn clamp_px(value: f32, range: (f32, f32), fallback: f32) -> f32 {
 
 fn on() -> bool {
     true
+}
+
+fn off() -> bool {
+    false
+}
+
+fn default_grouped_rgb() -> [f32; 3] {
+    DEFAULT_GROUPED_RGB
 }
 
 fn default_corner_pt() -> f32 {
@@ -338,6 +454,56 @@ rgb = [0.72, 0.42, 0.95]
         assert_eq!(loaded.topple, NumberSettings::default().topple);
         assert_eq!(loaded.topple.rgb, TOPPLE);
         assert!(loaded.topple.show);
+    }
+
+    #[test]
+    fn damage_count_defaults_to_you_and_your_felyne_and_an_empty_table_loads() {
+        let count = DamageCount::default();
+        let filter = count.filter();
+        assert!(filter.allows(Attacker::You));
+        assert!(filter.allows(Attacker::YourFelyne));
+        assert!(!filter.allows(Attacker::OtherHunter));
+        assert!(!filter.allows(Attacker::OtherFelyne));
+        assert!(!filter.allows(Attacker::Other));
+        assert!(!filter.allows(Attacker::Unknown));
+        assert!(!count.gray_uncounted);
+        assert_eq!(filter, AttackerFilter::default());
+        let old: DamageCount = toml::from_str("").expect("missing table");
+        assert_eq!(old, count);
+        let partial: DamageCount = toml::from_str("unknown = true\n").expect("partial");
+        assert!(partial.unknown);
+        assert!(partial.you);
+        assert!(!partial.other_hunters);
+        let round: DamageCount = toml::from_str(&toml::to_string(&count).unwrap()).unwrap();
+        assert_eq!(round, count);
+    }
+
+    #[test]
+    fn corner_mode_and_grouped_drops_default_when_the_keys_are_missing() {
+        assert_eq!(CornerSettings::default().mode, CornerMeterMode::Session);
+        assert!(GroupedHpSettings::default().show);
+        assert_eq!(GroupedHpSettings::default().rgb, DEFAULT_GROUPED_RGB);
+        let corner: CornerSettings = toml::from_str("show_dps = false\n").expect("old corner");
+        assert!(!corner.show_dps);
+        assert!(corner.show_total);
+        assert_eq!(corner.mode, CornerMeterMode::Session);
+        assert_eq!(corner.size_pt, DEFAULT_CORNER_PT);
+        let grouped: GroupedHpSettings = toml::from_str("").expect("missing grouped");
+        assert_eq!(grouped, GroupedHpSettings::default());
+        let hidden: GroupedHpSettings =
+            toml::from_str("show = false\nrgb = [0.2, 0.3, 0.4]\n").unwrap();
+        assert!(!hidden.show);
+        assert_eq!(hidden.rgb, [0.2, 0.3, 0.4]);
+        #[derive(Deserialize)]
+        struct ModeFile {
+            mode: CornerMeterMode,
+        }
+        let whole: ModeFile = toml::from_str("mode = \"whole_quest\"").unwrap();
+        assert_eq!(whole.mode, CornerMeterMode::WholeQuest);
+        let current: ModeFile = toml::from_str("mode = \"current_monster\"").unwrap();
+        assert_eq!(current.mode, CornerMeterMode::CurrentMonster);
+        let session: ModeFile = toml::from_str("mode = \"session\"").unwrap();
+        assert_eq!(session.mode, CornerMeterMode::Session);
     }
 
     #[test]

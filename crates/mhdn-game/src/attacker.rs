@@ -37,9 +37,9 @@ impl Attacker {
     }
 }
 
-/// Attackers counted until real attribution exists. Change this single list when defaults move.
-pub const DEFAULT_ATTACKER_FILTER_ATTACKERS: &[Attacker] =
-    &[Attacker::You, Attacker::YourFelyne, Attacker::Unknown];
+/// Attackers counted by default. Unknown stays out until a later phase attributes it.
+/// Change this single list when defaults move.
+pub const DEFAULT_ATTACKER_FILTER_ATTACKERS: &[Attacker] = &[Attacker::You, Attacker::YourFelyne];
 
 /// Which attackers contribute to meter totals and corner text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,8 +54,13 @@ impl Default for AttackerFilter {
 }
 
 impl AttackerFilter {
-    /// Default filter: you, your Palico, and unknown hits (until attribution exists).
+    /// Default filter: you and your Palico. Unknown hits are not the player's.
     pub const DEFAULT: Self = Self::from_slice(DEFAULT_ATTACKER_FILTER_ATTACKERS);
+
+    /// Every attacker. Used when a caller wants the unfiltered totals.
+    pub const fn all() -> Self {
+        Self::from_slice(&Attacker::ALL)
+    }
 
     pub const fn from_slice(allowed: &[Attacker]) -> Self {
         let mut mask = 0u8;
@@ -95,10 +100,13 @@ mod tests {
         let filter = AttackerFilter::default();
         assert!(filter.allows(Attacker::You));
         assert!(filter.allows(Attacker::YourFelyne));
-        assert!(filter.allows(Attacker::Unknown));
+        assert!(!filter.allows(Attacker::Unknown));
         assert!(!filter.allows(Attacker::OtherHunter));
         assert!(!filter.allows(Attacker::OtherFelyne));
         assert!(!filter.allows(Attacker::Other));
+        assert_eq!(filter, AttackerFilter::only_you_and_felyne());
+        assert!(AttackerFilter::all().allows(Attacker::Unknown));
+        assert!(AttackerFilter::all().allows(Attacker::Other));
     }
 
     #[test]

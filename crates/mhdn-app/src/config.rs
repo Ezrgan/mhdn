@@ -13,8 +13,8 @@ use mhdn_proj::{LayoutOption, LayoutSettings, ScreenRect};
 use serde::{Deserialize, Serialize};
 
 use crate::settings::{
-    clamp_px, CornerSettings, NumberSettings, CORNER_PT_RANGE, DEFAULT_CORNER_PT,
-    DEFAULT_NUMBER_PX, NUMBER_PX_RANGE,
+    clamp_px, CornerSettings, DamageCount, GroupedHpSettings, NumberSettings, CORNER_PT_RANGE,
+    DEFAULT_CORNER_PT, DEFAULT_NUMBER_PX, NUMBER_PX_RANGE,
 };
 
 const DEFAULT_LATENCY_MS: u64 = 33;
@@ -60,6 +60,12 @@ pub struct StyleConfig {
     /// The total and DPS recount in the corner. Missing in older files, which show both.
     #[serde(default)]
     pub corner: CornerSettings,
+    /// Who is counted. Missing in older files: you and your Felyne only.
+    #[serde(default)]
+    pub count: DamageCount,
+    /// Residual HP-drop numbers. Missing in older files: shown, in the default color.
+    #[serde(default)]
+    pub grouped_hp: GroupedHpSettings,
 }
 
 /// Where a hit's number spawns until the exact contact point is known.
@@ -106,6 +112,8 @@ impl Default for StyleConfig {
             anchor: NumberAnchor::default(),
             numbers: NumberSettings::default(),
             corner: CornerSettings::default(),
+            count: DamageCount::default(),
+            grouped_hp: GroupedHpSettings::default(),
         }
     }
 }
@@ -342,6 +350,13 @@ mod tests {
         assert_eq!(config.style.anchor, NumberAnchor::Monster);
         assert_eq!(config.style.numbers, NumberSettings::default());
         assert_eq!(config.style.corner, CornerSettings::default());
+        assert_eq!(config.style.count, DamageCount::default());
+        assert!(config.style.count.you);
+        assert!(config.style.count.your_felyne);
+        assert!(!config.style.count.unknown);
+        assert!(!config.style.count.gray_uncounted);
+        assert!(config.style.grouped_hp.show);
+        assert_eq!(config.style.grouped_hp, GroupedHpSettings::default());
         let bare: OverlayConfig = toml::from_str("").expect("empty file parses");
         assert_eq!(bare, OverlayConfig::default());
     }
@@ -369,6 +384,12 @@ mod tests {
         config.style.numbers.large.rgb = [0.25, 0.5, 0.75];
         config.style.corner.show_total = false;
         config.style.corner.size_pt = 30.0;
+        config.style.corner.mode = crate::settings::CornerMeterMode::WholeQuest;
+        config.style.count.unknown = true;
+        config.style.count.gray_uncounted = true;
+        config.style.count.you = false;
+        config.style.grouped_hp.show = false;
+        config.style.grouped_hp.rgb = [0.1, 0.2, 0.3];
         config.save(&path).unwrap();
         assert_eq!(OverlayConfig::load(&path), config);
         let _ = fs::remove_file(&path);

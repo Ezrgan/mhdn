@@ -4,16 +4,17 @@
 
 use std::time::Duration;
 
-use mhdn_fx::{HitKind, MagnitudeWindow, Pool, Spawn};
+use mhdn_fx::{HitKind, MagnitudeWindow, Pool, Spawn, GRAY};
 use mhdn_game::{
-    Anchor, Attacker, DamageEvent, DamageKind, MonsterKey, MonsterState, Scene, HP_FROM_OBJECT,
+    Anchor, Attacker, AttackerFilter, DamageEvent, DamageKind, MonsterKey, MonsterState, Scene,
+    HP_FROM_OBJECT,
 };
 use mhdn_proj::{project, Camera, EdgeMode, Projected, ScreenRect};
 use mhdn_render::{glyph_quads, premul, Quad};
 
-use crate::config::NumberAnchor;
-use crate::meter::{Meter, MeterHit};
-use crate::settings::{CornerSettings, NumberSettings};
+use crate::config::{NumberAnchor, StyleConfig};
+use crate::meter::{corner_text, CornerMode, Meter, MeterHit};
+use crate::settings::CornerMeterMode;
 
 /// A forward jump larger than this is a save state, not a dropped sample.
 const FRAME_JUMP: u32 = 90;
@@ -145,6 +146,8 @@ impl CombatView {
                 mag_scale: style.scale,
                 amount: event.amount,
                 seed: event_seed(event),
+                tag: u8::try_from(Attacker::Unknown.index()).unwrap_or(0),
+                grouped: event.is_grouped_hp(),
             });
         }
         let now = self.elapsed_ms as u64;
@@ -170,6 +173,11 @@ impl CombatView {
 
     pub fn alive_count(&self) -> usize {
         self.pool.alive_count()
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn counted_total(&self, filter: AttackerFilter) -> u32 {
+        self.meter.quest_total(filter)
     }
 
     pub fn recount_total(&self) -> u32 {
@@ -206,22 +214,43 @@ impl CombatView {
         }
     }
 
-    /// Hidden categories draw nothing. The category is read from the number's spawn color
-    /// each frame, so a settings change also reaches numbers that are already flying.
+    /// Hidden categories, hidden grouped drops, and excluded attackers draw nothing.
+    /// The category is read from the number's spawn color each frame, so a settings
+    /// change also reaches numbers that are already flying. Gray is the same: the
+    /// filter is read here, not at spawn.
     pub fn number_quads(
         &self,
         camera: &Camera,
         top: ScreenRect,
         number_px: f32,
-        settings: &NumberSettings,
+        style: &StyleConfig,
     ) -> Vec<Quad> {
+        let filter = style.count.filter();
         let mut quads = Vec::new();
         for live in self.pool.live() {
             if live.pose.alpha <= 0.0 {
                 continue;
             }
-            let Some(rgb) = settings.color_for(live.rgb) else {
+            let attacker = Attacker::ALL
+                .get(usize::from(live.tag))
+                .copied()
+                .unwrap_or(Attacker::Unknown);
+            let counted = filter.allows(attacker);
+            if !counted && !style.count.gray_uncounted {
                 continue;
+            }
+            if live.grouped && !style.grouped_hp.show {
+                continue;
+            }
+            let rgb = if !counted {
+                GRAY
+            } else if live.grouped {
+                style.grouped_hp.rgb
+            } else {
+                match style.numbers.color_for(live.rgb) {
+                    Some(rgb) => rgb,
+                    None => continue,
+                }
             };
             let world = glam::Vec3::new(live.world[0], live.world[1], live.world[2]);
             let Some(pos) = project(world, camera, top, EdgeMode::Hide).visible_pos() else {
@@ -250,17 +279,24 @@ impl CombatView {
     }
 
     /// `px` is the glyph height in physical pixels.
-    /// One short block per large monster, highest total on the bottom corner.
-    pub fn recount_quads(&self, top: ScreenRect, px: f32, corner: &CornerSettings) -> Vec<Quad> {
-        let lines = self.corner_lines(corner);
+    /// Session keeps one block per large monster, highest total on the bottom corner.
+    /// Current monster and whole quest read top to bottom, with the last line on the corner.
+    pub fn recount_quads(&self, top: ScreenRect, px: f32, style: &StyleConfig) -> Vec<Quad> {
+        let lines = self.corner_lines(style);
         if lines.is_empty() {
             return Vec::new();
         }
+        let session = style.corner.mode == CornerMeterMode::Session;
         let margin = px * 0.5;
         let step = px * 1.05;
         let mut quads = Vec::new();
         for (index, line) in lines.iter().enumerate() {
-            let y = top.y + top.height - px - margin - index as f32 * step;
+            let from_bottom = if session {
+                index
+            } else {
+                lines.len() - 1 - index
+            };
+            let y = top.y + top.height - px - margin - from_bottom as f32 * step;
             quads.extend(glyph_quads(
                 line,
                 top.x + margin,
@@ -272,9 +308,46 @@ impl CombatView {
         quads
     }
 
-    pub fn corner_lines(&self, corner: &CornerSettings) -> Vec<String> {
-        self.meter
-            .screen_lines(corner.show_total, corner.show_dps, self.elapsed_ms as u64)
+    pub fn corner_lines(&self, style: &StyleConfig) -> Vec<String> {
+        let now = self.elapsed_ms as u64;
+        let filter = style.count.filter();
+        let corner = &style.corner;
+        match corner.mode {
+            CornerMeterMode::Session => {
+                self.meter
+                    .screen_lines(corner.show_total, corner.show_dps, filter, now)
+            }
+            CornerMeterMode::CurrentMonster => {
+                if !corner.show_total {
+                    return Vec::new();
+                }
+                split_lines(&corner_text(
+                    CornerMode::CurrentMonster,
+                    &self.meter,
+                    filter,
+                    now,
+                ))
+            }
+            CornerMeterMode::WholeQuest => {
+                if !corner.show_total {
+                    return Vec::new();
+                }
+                split_lines(&corner_text(
+                    CornerMode::WholeQuest,
+                    &self.meter,
+                    filter,
+                    now,
+                ))
+            }
+        }
+    }
+}
+
+fn split_lines(text: &str) -> Vec<String> {
+    if text.is_empty() {
+        Vec::new()
+    } else {
+        text.split('\n').map(str::to_string).collect()
     }
 }
 
@@ -439,12 +512,14 @@ fn meter_key(event: &DamageEvent, monsters: &[MonsterState]) -> MonsterKey {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mhdn_fx::{LIFE_MS, ORANGE, POISON, SCATTER_PX, TOPPLE};
+    use mhdn_fx::{GRAY, LIFE_MS, ORANGE, POISON, SCATTER_PX, TOPPLE};
     use mhdn_game::{
         CameraState, DamageConfidence, EventSource, FovUnit, MonsterKey, TapCredit,
         Vec3 as GameVec3,
     };
     use mhdn_proj::ScreenRect;
+
+    use crate::settings::{CornerMeterMode, DamageCount};
 
     fn monster(addr: u32, large: bool) -> MonsterState {
         MonsterState {
@@ -471,8 +546,8 @@ mod tests {
             amount,
             lr: 0,
             kind,
-            source: EventSource::Passive,
-            confidence: DamageConfidence::HpDelta,
+            source: EventSource::Tap,
+            confidence: DamageConfidence::Exact,
             key: Some(MonsterKey {
                 struct_addr: 0x1000,
                 species: 7,
@@ -577,10 +652,11 @@ mod tests {
         );
         assert_eq!(view.recount_total(), 40);
         let top = ScreenRect::new(0.0, 0.0, 800.0, 480.0);
-        let quads = view.number_quads(&hunt_camera(), top, 36.0, &NumberSettings::default());
+        let style = counting_all();
+        let quads = view.number_quads(&hunt_camera(), top, 36.0, &style);
         assert!(!quads.is_empty());
         assert!(quads.iter().all(|quad| top.contains(quad.x, quad.y)));
-        let recount = view.recount_quads(top, 44.0, &CornerSettings::default());
+        let recount = view.recount_quads(top, 44.0, &style);
         assert!(recount.len() > 4);
         assert!(recount.iter().all(|quad| top.contains(quad.x, quad.y)));
     }
@@ -649,7 +725,7 @@ mod tests {
                 },
             ]
         );
-        let lines = view.corner_lines(&CornerSettings::default());
+        let lines = view.corner_lines(&counting_all());
         assert_eq!(
             lines,
             vec![
@@ -661,6 +737,13 @@ mod tests {
         );
         assert!(lines.iter().all(|line| !line.contains("YOU")));
         assert!(lines.iter().all(|line| !line.contains("JUMP")));
+    }
+
+    fn counting_all() -> StyleConfig {
+        StyleConfig {
+            count: DamageCount::allowing_all(),
+            ..StyleConfig::default()
+        }
     }
 
     fn spawn_one(view: &mut CombatView, amount: u32, kind: DamageKind) {
@@ -681,13 +764,13 @@ mod tests {
         let mut view = CombatView::new();
         view.observe(Scene::InQuest, 10);
         spawn_one(&mut view, 3, DamageKind::Poison);
-        let shown = NumberSettings::default();
+        let shown = counting_all();
         assert!(!view
             .number_quads(&hunt_camera(), top, 36.0, &shown)
             .is_empty());
 
-        let mut hidden = NumberSettings::default();
-        hidden.poison.show = false;
+        let mut hidden = counting_all();
+        hidden.numbers.poison.show = false;
         assert!(view
             .number_quads(&hunt_camera(), top, 36.0, &hidden)
             .is_empty());
@@ -707,10 +790,10 @@ mod tests {
         spawn_one(&mut view, 3, DamageKind::Poison);
         spawn_one(&mut view, 40, DamageKind::Hit);
         let all = view
-            .number_quads(&hunt_camera(), top, 36.0, &NumberSettings::default())
+            .number_quads(&hunt_camera(), top, 36.0, &counting_all())
             .len();
-        let mut hidden = NumberSettings::default();
-        hidden.poison.show = false;
+        let mut hidden = counting_all();
+        hidden.numbers.poison.show = false;
         let without_poison = view.number_quads(&hunt_camera(), top, 36.0, &hidden).len();
         assert!(without_poison > 0);
         assert!(without_poison < all);
@@ -722,8 +805,8 @@ mod tests {
         let mut view = CombatView::new();
         view.observe(Scene::InQuest, 10);
         spawn_one(&mut view, 3, DamageKind::Poison);
-        let mut green = NumberSettings::default();
-        green.poison.rgb = [0.0, 1.0, 0.0];
+        let mut green = counting_all();
+        green.numbers.poison.rgb = [0.0, 1.0, 0.0];
         let quads = view.number_quads(&hunt_camera(), top, 36.0, &green);
         assert!(quads
             .iter()
@@ -736,17 +819,179 @@ mod tests {
         let mut view = CombatView::new();
         view.observe(Scene::InQuest, 10);
         spawn_one(&mut view, 40, DamageKind::Hit);
-        let mut corner = CornerSettings::default();
-        let both = view.recount_quads(top, 44.0, &corner).len();
-        corner.show_dps = false;
-        let total_only = view.recount_quads(top, 44.0, &corner).len();
+        let mut style = counting_all();
+        let both = view.recount_quads(top, 44.0, &style).len();
+        style.corner.show_dps = false;
+        let total_only = view.recount_quads(top, 44.0, &style).len();
         assert!(total_only > 0);
         assert_eq!(total_only, both);
-        corner.show_dps = true;
-        corner.show_total = false;
-        assert!(view.recount_quads(top, 44.0, &corner).is_empty());
-        corner.show_dps = false;
-        assert!(view.recount_quads(top, 44.0, &corner).is_empty());
+        style.corner.show_dps = true;
+        style.corner.show_total = false;
+        assert!(view.recount_quads(top, 44.0, &style).is_empty());
+        style.corner.show_dps = false;
+        assert!(view.recount_quads(top, 44.0, &style).is_empty());
+    }
+
+    #[test]
+    fn each_corner_mode_has_its_own_text_and_whole_quest_is_several_lines() {
+        let mut view = CombatView::new();
+        view.observe(Scene::InQuest, 10);
+        let mut first = event(
+            100,
+            Anchor::World(GameVec3::new(0.0, 1.0, 0.0)),
+            DamageKind::Hit,
+        );
+        first.key = Some(MonsterKey {
+            struct_addr: 0x1000,
+            species: 7,
+            max_hp: 1_000,
+            generation: 1,
+        });
+        let mut second = event(
+            200,
+            Anchor::World(GameVec3::new(2.0, 1.0, 0.0)),
+            DamageKind::Hit,
+        );
+        second.monster = 0x2000;
+        second.seq = 201;
+        second.key = Some(MonsterKey {
+            struct_addr: 0x2000,
+            species: 42,
+            max_hp: 2_000,
+            generation: 1,
+        });
+        view.ingest(
+            &[first, second],
+            &[monster(0x1000, true), monster(0x2000, true)],
+            |_, _| 10.0,
+        );
+        let mut style = counting_all();
+
+        style.corner.mode = CornerMeterMode::CurrentMonster;
+        assert_eq!(
+            view.corner_lines(&style),
+            vec![
+                "BARIOTH".to_string(),
+                "DMG 200  DPS 200".to_string(),
+                "10.0% HP".to_string(),
+            ]
+        );
+
+        style.corner.mode = CornerMeterMode::WholeQuest;
+        let lines = view.corner_lines(&style);
+        assert_eq!(
+            lines,
+            vec![
+                "BARIOTH  DMG 200  DPS 200  10.0% HP".to_string(),
+                "DIABLOS  DMG 100  DPS 100  10.0% HP".to_string(),
+                "Total DMG 300".to_string(),
+            ]
+        );
+        let top = ScreenRect::new(0.0, 0.0, 800.0, 480.0);
+        let quads = view.recount_quads(top, 22.0, &style);
+        let mut rows = quads
+            .iter()
+            .map(|quad| quad.y.round() as i32)
+            .collect::<Vec<_>>();
+        rows.sort_unstable();
+        rows.dedup();
+        assert!(
+            rows.len() >= 3,
+            "whole quest draws one row per line, got {rows:?}"
+        );
+
+        style.corner.mode = CornerMeterMode::Session;
+        let session = view.corner_lines(&style);
+        assert!(session.iter().any(|line| line.contains("BARIOTH")));
+        assert!(session.iter().any(|line| line.contains("DIABLOS")));
+        assert!(session.len() >= 2);
+    }
+
+    #[test]
+    fn an_excluded_attacker_stays_out_of_the_total_and_gray_draws_it_anyway() {
+        let top = ScreenRect::new(0.0, 0.0, 800.0, 480.0);
+        let mut view = CombatView::new();
+        view.observe(Scene::InQuest, 10);
+        spawn_one(&mut view, 40, DamageKind::Hit);
+        let style = StyleConfig::default();
+        assert_eq!(view.counted_total(style.count.filter()), 0);
+        assert_eq!(view.recount_total(), 40);
+        assert!(view
+            .number_quads(&hunt_camera(), top, 36.0, &style)
+            .is_empty());
+        assert!(view.corner_lines(&style).is_empty());
+
+        let mut gray = style;
+        gray.count.gray_uncounted = true;
+        let quads = view.number_quads(&hunt_camera(), top, 36.0, &gray);
+        assert!(!quads.is_empty());
+        assert!(quads.iter().all(|quad| {
+            let alpha = quad.color[3];
+            alpha > 0.0
+                && (quad.color[0] - GRAY[0] * alpha).abs() < 0.001
+                && (quad.color[1] - GRAY[1] * alpha).abs() < 0.001
+                && (quad.color[2] - GRAY[2] * alpha).abs() < 0.001
+        }));
+        assert_eq!(view.counted_total(gray.count.filter()), 0);
+        assert!(view.corner_lines(&gray).is_empty());
+
+        let mut counted = style;
+        counted.count.unknown = true;
+        assert_eq!(view.counted_total(counted.count.filter()), 40);
+        assert!(!view
+            .number_quads(&hunt_camera(), top, 36.0, &counted)
+            .is_empty());
+        assert!(!view.corner_lines(&counted).is_empty());
+    }
+
+    #[test]
+    fn grouped_hp_drops_hide_and_recolor_without_leaving_the_meter() {
+        let top = ScreenRect::new(0.0, 0.0, 800.0, 480.0);
+        let mut view = CombatView::new();
+        view.observe(Scene::InQuest, 10);
+        let mut drop = event(
+            80,
+            Anchor::World(GameVec3::new(0.0, 1.0, 0.0)),
+            DamageKind::Hit,
+        );
+        drop.source = EventSource::Passive;
+        drop.confidence = DamageConfidence::AggregatedHpDelta;
+        drop.frames_since = Some(12);
+        assert!(drop.is_grouped_hp());
+        view.ingest(&[drop], &[monster(0x1000, true)], |_, _| 10.0);
+        let mut style = counting_all();
+        style.grouped_hp.rgb = [0.1, 0.2, 0.3];
+        let quads = view.number_quads(&hunt_camera(), top, 36.0, &style);
+        assert!(!quads.is_empty());
+        assert!(quads.iter().all(|quad| {
+            let alpha = quad.color[3];
+            (quad.color[0] - 0.1 * alpha).abs() < 0.001
+                && (quad.color[1] - 0.2 * alpha).abs() < 0.001
+                && (quad.color[2] - 0.3 * alpha).abs() < 0.001
+        }));
+        assert_eq!(view.counted_total(style.count.filter()), 80);
+
+        style.grouped_hp.show = false;
+        assert!(view
+            .number_quads(&hunt_camera(), top, 36.0, &style)
+            .is_empty());
+        assert_eq!(view.counted_total(style.count.filter()), 80);
+
+        let mut tap = event(
+            15,
+            Anchor::World(GameVec3::new(0.0, 1.0, 0.0)),
+            DamageKind::Hit,
+        );
+        tap.seq = 16;
+        assert!(!tap.is_grouped_hp());
+        view.ingest(
+            std::slice::from_ref(&tap),
+            &[monster(0x1000, true)],
+            |_, _| 10.0,
+        );
+        let still = view.number_quads(&hunt_camera(), top, 36.0, &style);
+        assert!(!still.is_empty());
+        assert_eq!(view.counted_total(style.count.filter()), 95);
     }
 
     #[test]

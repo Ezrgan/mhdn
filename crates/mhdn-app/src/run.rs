@@ -689,7 +689,7 @@ impl OverlayApp {
                     &camera,
                     top,
                     self.config.style.number_size() * ui,
-                    &self.config.style.numbers,
+                    &self.config.style,
                 ));
             }
         }
@@ -697,7 +697,7 @@ impl OverlayApp {
             quads.extend(self.combat.recount_quads(
                 top,
                 self.config.style.corner_size() * ui,
-                &self.config.style.corner,
+                &self.config.style,
             ));
         }
         if self.calibrator.active {

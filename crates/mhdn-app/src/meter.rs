@@ -3,8 +3,9 @@
 //! Attacker attribution stays [`Attacker::Unknown`] until a later phase. Player
 //! totals count only [`Attacker::You`] and are never filled with that unknown damage.
 //!
-//! Filter queries and the quest corner modes are covered by tests. The overlay
-//! draws [`Meter::screen_lines`] today; phase 5 switches modes from Settings.
+//! Filter queries and the quest corner modes are covered by tests. Settings
+//! picks the mode: session keeps the large-monster corner, current monster and
+//! whole quest use [`corner_text`].
 
 #![cfg_attr(not(test), allow(dead_code))]
 
@@ -37,7 +38,7 @@ pub struct MonsterMeterStats {
     pub damage: u32,
     pub hits: u32,
     pub dps: f32,
-    /// Player damage only (`Attacker::You` / max HP), capped at 100. Unknown damage stays at 0.
+    /// Counted damage for the active filter, over max HP, capped at 100.
     pub pct_of_max_hp: f32,
 }
 
@@ -130,10 +131,7 @@ impl Meter {
                     damage,
                     hits: filtered_hits(&entry.hits, filter),
                     dps: monster_dps(damage, first, last, now_ms),
-                    pct_of_max_hp: player_pct(
-                        entry.damage[Attacker::You.index()],
-                        entry.key.max_hp,
-                    ),
+                    pct_of_max_hp: hp_pct(damage, entry.key.max_hp),
                 })
             })
             .collect();
@@ -199,24 +197,41 @@ impl Meter {
     /// the quest. Poison and topple percentages are over that monster's own total.
     /// The atlas has no lowercase. `DERRIBO` is [`DamageKind::Topple`] (the fixed
     /// 100/150 mount hit). There is no YOU line: unknown damage is not the player's.
-    pub fn screen_lines(&self, show_total: bool, _show_dps: bool, now_ms: u64) -> Vec<String> {
+    pub fn screen_lines(
+        &self,
+        show_total: bool,
+        _show_dps: bool,
+        filter: AttackerFilter,
+        _now_ms: u64,
+    ) -> Vec<String> {
         if !show_total {
             return Vec::new();
         }
-        let rows = self.rows(now_ms);
-        let quest_total = self.received_total();
-        let large: Vec<&MonsterRow> = rows
+        let mut large: Vec<(&MonsterEntry, u32)> = self
+            .monsters
             .iter()
-            .filter(|row| row.key.max_hp >= LARGE_MIN_HP)
+            .filter_map(|entry| {
+                let damage = filtered_sum(&entry.damage, filter);
+                if damage == 0 || entry.key.max_hp < LARGE_MIN_HP {
+                    return None;
+                }
+                Some((entry, damage))
+            })
             .collect();
-        let totals: Vec<u32> = large.iter().map(|row| row.total).collect();
+        large.sort_by(|a, b| {
+            b.1.cmp(&a.1)
+                .then_with(|| a.0.key.species.cmp(&b.0.key.species))
+                .then_with(|| a.0.key.struct_addr.cmp(&b.0.key.struct_addr))
+        });
+        let quest_total = self.quest_total(filter);
+        let totals: Vec<u32> = large.iter().map(|(_, damage)| *damage).collect();
         let percents = quest_percents(&totals, quest_total);
         let mut lines = Vec::new();
-        for (row, pct) in large.into_iter().zip(percents) {
-            if let Some(detail) = detail_line(row.poison, row.topple, row.total) {
+        for ((entry, damage), pct) in large.into_iter().zip(percents) {
+            if let Some(detail) = detail_line(entry.poison, entry.topple, damage) {
                 lines.push(detail);
             }
-            lines.push(name_line(&species_label(row.key.species), row.total, pct));
+            lines.push(name_line(&species_label(entry.key.species), damage, pct));
         }
         lines
     }
@@ -283,7 +298,7 @@ impl Meter {
             damage,
             hits: filtered_hits(&entry.hits, filter),
             dps: monster_dps(damage, first, last, now_ms),
-            pct_of_max_hp: player_pct(entry.damage[Attacker::You.index()], entry.key.max_hp),
+            pct_of_max_hp: hp_pct(damage, entry.key.max_hp),
         })
     }
 
@@ -316,12 +331,7 @@ pub fn corner_text(mode: CornerMode, meter: &Meter, filter: AttackerFilter, now_
 }
 
 fn session_corner_text(meter: &Meter, filter: AttackerFilter, now_ms: u64) -> String {
-    let total = meter.quest_total(filter);
-    if total == 0 {
-        return String::new();
-    }
-    let dps = meter.session_dps(filter, now_ms);
-    format!("DMG {total}  DPS {dps:.0}")
+    meter.screen_lines(true, true, filter, now_ms).join("\n")
 }
 
 fn current_monster_corner_text(meter: &Meter, filter: AttackerFilter, now_ms: u64) -> String {
@@ -329,8 +339,11 @@ fn current_monster_corner_text(meter: &Meter, filter: AttackerFilter, now_ms: u6
         return String::new();
     };
     format!(
-        "Monster {}\nDMG {}  DPS {:.0}\n{:.1}% HP",
-        stats.key.species, stats.damage, stats.dps, stats.pct_of_max_hp
+        "{}\nDMG {}  DPS {:.0}\n{:.1}% HP",
+        corner_name(stats.key.species),
+        stats.damage,
+        stats.dps,
+        stats.pct_of_max_hp
     )
 }
 
@@ -343,14 +356,24 @@ fn whole_quest_corner_text(meter: &Meter, filter: AttackerFilter, now_ms: u64) -
         .iter()
         .map(|row| {
             format!(
-                "Monster {}: DMG {}  DPS {:.0}  {:.1}% HP",
-                row.key.species, row.damage, row.dps, row.pct_of_max_hp
+                "{}  DMG {}  DPS {:.0}  {:.1}% HP",
+                corner_name(row.key.species),
+                row.damage,
+                row.dps,
+                row.pct_of_max_hp
             )
         })
         .collect();
     let total = meter.quest_total(filter);
     lines.push(format!("Total DMG {total}"));
     lines.join("\n")
+}
+
+/// English name in capitals, or the species id when the table has no row.
+fn corner_name(species: u16) -> String {
+    species_name(species)
+        .map(str::to_ascii_uppercase)
+        .unwrap_or_else(|| species.to_string())
 }
 
 impl MonsterEntry {
@@ -493,12 +516,16 @@ fn filtered_hits(hits: &[u32; Attacker::ALL.len()], filter: AttackerFilter) -> u
         .sum()
 }
 
-/// Share of max HP dealt by the player. Unknown damage contributes nothing, and the result never passes 100.
-fn player_pct(player: u32, max_hp: u32) -> f32 {
-    if player == 0 || max_hp == 0 {
+/// Share of max HP. The result never passes 100, and a zero bar is 0 rather than NaN.
+fn hp_pct(damage: u32, max_hp: u32) -> f32 {
+    if damage == 0 || max_hp == 0 {
         return 0.0;
     }
-    ((player as f32 / max_hp as f32) * 100.0).min(100.0)
+    ((damage as f32 / max_hp as f32) * 100.0).min(100.0)
+}
+
+fn player_pct(player: u32, max_hp: u32) -> f32 {
+    hp_pct(player, max_hp)
 }
 
 fn dps_window_ms(first_ms: u64, last_ms: u64, now_ms: u64) -> u64 {
@@ -664,7 +691,7 @@ mod tests {
     }
 
     #[test]
-    fn corner_text_session_matches_recount_format() {
+    fn corner_text_session_keeps_the_large_monster_corner() {
         let mut meter = Meter::new();
         meter.add(hit(0x1000, 7, 5_000, 1, 40, Attacker::You, 0));
         meter.add(hit(0x1000, 7, 5_000, 1, 60, Attacker::You, 2_000));
@@ -674,7 +701,9 @@ mod tests {
             AttackerFilter::default(),
             2_000,
         );
-        assert_eq!(text, "DMG 100  DPS 50");
+        assert_eq!(text, "DIABLOS  100  100%");
+        let dps = meter.session_dps(AttackerFilter::default(), 2_000);
+        assert!((dps - 50.0).abs() < 0.01);
     }
 
     #[test]
@@ -687,7 +716,7 @@ mod tests {
             AttackerFilter::default(),
             1_000,
         );
-        assert_eq!(text, "Monster 7\nDMG 250  DPS 250\n25.0% HP");
+        assert_eq!(text, "DIABLOS\nDMG 250  DPS 250\n25.0% HP");
     }
 
     #[test]
@@ -703,8 +732,37 @@ mod tests {
         );
         assert_eq!(
             text,
-            "Monster 42: DMG 200  DPS 133  10.0% HP\nMonster 7: DMG 100  DPS 50  10.0% HP\nTotal DMG 300"
+            "BARIOTH  DMG 200  DPS 133  10.0% HP\nDIABLOS  DMG 100  DPS 50  10.0% HP\nTotal DMG 300"
         );
+    }
+
+    #[test]
+    fn counted_pct_includes_the_felyne_when_the_default_filter_allows_it() {
+        let mut meter = Meter::new();
+        meter.add(hit(0x1000, 7, 1_000, 1, 200, Attacker::You, 0));
+        meter.add(hit(0x1000, 7, 1_000, 1, 300, Attacker::YourFelyne, 500));
+        let stats = meter.current(AttackerFilter::default(), 1_000).unwrap();
+        assert_eq!(stats.damage, 500);
+        assert!((stats.pct_of_max_hp - 50.0).abs() < 0.01);
+        assert!(stats.pct_of_max_hp <= 100.0);
+    }
+
+    #[test]
+    fn default_filter_leaves_unknown_out_of_every_corner_mode() {
+        let mut meter = Meter::new();
+        meter.add(hit(0x1000, 7, 1_000, 1, 400, Attacker::Unknown, 0));
+        let filter = AttackerFilter::default();
+        assert_eq!(meter.quest_total(filter), 0);
+        assert_eq!(meter.received_total(), 400);
+        for mode in [
+            CornerMode::Session,
+            CornerMode::CurrentMonster,
+            CornerMode::WholeQuest,
+        ] {
+            assert_eq!(corner_text(mode, &meter, filter, 1_000), "");
+        }
+        let lines = meter.screen_lines(true, true, filter, 1_000);
+        assert!(lines.is_empty());
     }
 
     #[test]
@@ -780,7 +838,7 @@ mod tests {
         assert_eq!(toppled.topple, 150);
         assert_eq!(toppled.poison, 0);
         assert_eq!(toppled.total, 150);
-        let lines = meter.screen_lines(true, false, 2_000);
+        let lines = meter.screen_lines(true, false, AttackerFilter::all(), 2_000);
         assert!(lines.iter().any(|line| line.contains("VENENO 10")));
         assert!(lines.iter().any(|line| line.contains("DERRIBO 150")));
         assert!(!lines.iter().any(|line| line.contains("YOU")));
@@ -803,7 +861,7 @@ mod tests {
         assert!(rows
             .iter()
             .all(|row| row.player == 0 && row.player_pct == 0.0));
-        let lines = meter.screen_lines(true, true, 1_000);
+        let lines = meter.screen_lines(true, true, AttackerFilter::all(), 1_000);
         assert!(!lines.is_empty());
         assert!(lines.iter().all(|line| !line.contains("YOU")));
     }
@@ -819,7 +877,7 @@ mod tests {
         assert!(row.player_pct <= 100.0);
         assert!((row.player_pct - 100.0).abs() < 0.01);
         assert_eq!(meter.player_total(), 250);
-        let lines = meter.screen_lines(true, false, 1_000);
+        let lines = meter.screen_lines(true, false, AttackerFilter::all(), 1_000);
         assert!(
             lines.is_empty(),
             "a bar under {LARGE_MIN_HP} is not painted"
@@ -832,7 +890,7 @@ mod tests {
         let mut meter = Meter::new();
         meter.add(hit(0x1000, 30, 774, 1, 420, Attacker::Unknown, 0));
         meter.add(hit(0x2000, 1, 2_205, 1, 200, Attacker::Unknown, 100));
-        let lines = meter.screen_lines(true, false, 1_000);
+        let lines = meter.screen_lines(true, false, AttackerFilter::all(), 1_000);
         assert_eq!(
             lines,
             vec![
@@ -849,7 +907,7 @@ mod tests {
         let mut meter = Meter::new();
         meter.add(hit(0x1000, 30, 774, 1, 420, Attacker::Unknown, 0));
         meter.add(hit(0x3000, 4107, 80, 1, 100, Attacker::Unknown, 50));
-        let lines = meter.screen_lines(true, false, 1_000);
+        let lines = meter.screen_lines(true, false, AttackerFilter::all(), 1_000);
         assert_eq!(lines, vec!["BULLDROME  420  80%".to_string()]);
         assert!(lines.iter().all(|line| !has_id_token(line, 4107)));
         assert_eq!(meter.received_total(), 520);
@@ -859,7 +917,7 @@ mod tests {
     fn zero_poison_and_topple_do_not_draw_those_words() {
         let mut meter = Meter::new();
         meter.add(hit(0x1000, 30, 774, 1, 420, Attacker::Unknown, 0));
-        let lines = meter.screen_lines(true, false, 1_000);
+        let lines = meter.screen_lines(true, false, AttackerFilter::all(), 1_000);
         assert_eq!(lines, vec!["BULLDROME  420  100%".to_string()]);
         assert!(lines.iter().all(|line| !line.contains("VENENO")));
         assert!(lines.iter().all(|line| !line.contains("DERRIBO")));
@@ -870,7 +928,7 @@ mod tests {
         let mut meter = Meter::new();
         meter.add(hit(0x1000, 30, 774, 1, 420, Attacker::Unknown, 0));
         meter.add(hit(0x2000, 30, 774, 2, 200, Attacker::Unknown, 100));
-        let lines = meter.screen_lines(true, false, 1_000);
+        let lines = meter.screen_lines(true, false, AttackerFilter::all(), 1_000);
         assert_eq!(
             lines,
             vec![
@@ -894,7 +952,7 @@ mod tests {
         meter.add(hit(0x1000, 116, 1_200, 1, 420, Attacker::Unknown, 0));
         meter.add(hit(0x2000, 116, 1_200, 2, 258, Attacker::Unknown, 100));
         assert!(species_name(116).is_none());
-        let lines = meter.screen_lines(true, false, 1_000);
+        let lines = meter.screen_lines(true, false, AttackerFilter::all(), 1_000);
         assert_eq!(
             lines,
             vec!["-  420  62%".to_string(), "-  258  38%".to_string()]
@@ -912,7 +970,7 @@ mod tests {
         let mut meter = Meter::new();
         meter.add(hit(0x1000, 85, 1_200, 1, 420, Attacker::Unknown, 0));
         meter.add(hit(0x2000, 14, 830, 1, 258, Attacker::Unknown, 100));
-        let lines = meter.screen_lines(true, false, 1_000);
+        let lines = meter.screen_lines(true, false, AttackerFilter::all(), 1_000);
         assert_eq!(
             lines,
             vec![
@@ -936,7 +994,7 @@ mod tests {
             hit(0x1000, 30, 774, 1, 100, Attacker::Unknown, 200),
             DamageKind::Topple,
         ));
-        let lines = meter.screen_lines(true, false, 1_000);
+        let lines = meter.screen_lines(true, false, AttackerFilter::all(), 1_000);
         assert_eq!(
             lines,
             vec![
