@@ -17,5 +17,5 @@ pub use client::{
 pub use error::{Result, RpcError};
 pub use memory_source::{read_dump_range, FileMemorySource, MemorySource, ReplaySource};
 pub use packet::{
-    PacketHeader, PacketType, MAX_PACKET_DATA_SIZE, MAX_PACKET_SIZE, PROTOCOL_VERSION,
+    PacketHeader, PacketType, RpcProtocol, MAX_PACKET_DATA_SIZE, MAX_PACKET_SIZE, PROTOCOL_VERSION,
 };

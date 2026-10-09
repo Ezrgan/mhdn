@@ -2,7 +2,10 @@ use std::net::{SocketAddr, UdpSocket};
 use std::time::Duration;
 
 use crate::error::{Result, RpcError};
-use crate::packet::{self, PacketHeader, PacketType, MAX_PACKET_DATA_SIZE, MAX_PACKET_SIZE};
+use crate::packet::{
+    self, PacketHeader, PacketType, RpcProtocol, MAX_PACKET_SIZE, PROTOCOL_VERSION_V1,
+    PROTOCOL_VERSION_V2,
+};
 
 /// One process entry returned by [`RpcClient::list_processes`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,6 +44,7 @@ pub struct RpcClient {
     socket: UdpSocket,
     server: SocketAddr,
     timeout: Duration,
+    protocol: RpcProtocol,
     next_id: u32,
     pipeline_window: usize,
 }
@@ -50,13 +54,22 @@ impl RpcClient {
         let socket = UdpSocket::bind("0.0.0.0:0")?;
         socket.connect(addr)?;
         socket.set_read_timeout(Some(timeout))?;
+        let protocol = detect_protocol(&socket, timeout)?;
+        socket.set_read_timeout(Some(timeout))?;
         Ok(Self {
             socket,
             server: addr,
             timeout,
+            protocol,
             next_id: 1,
             pipeline_window: DEFAULT_PIPELINE_WINDOW,
         })
+    }
+
+    /// Negotiated dialect. Version 1 is Azahar through 2126.1. Version 2 is 2126.2.
+    /// A higher number is a later build that kept the same RPC body.
+    pub fn protocol(&self) -> RpcProtocol {
+        self.protocol
     }
 
     pub fn set_pipeline_window(&mut self, window: usize) {
@@ -90,7 +103,12 @@ impl RpcClient {
         packet_type: PacketType,
         payload: &[u8],
     ) -> Result<()> {
-        let header = PacketHeader::new(id, packet_type, payload.len() as u32);
+        let header = PacketHeader::new_with_version(
+            self.protocol.version,
+            id,
+            packet_type,
+            payload.len() as u32,
+        );
         let mut datagram = Vec::with_capacity(16 + payload.len());
         datagram.extend_from_slice(&header.encode());
         datagram.extend_from_slice(payload);
@@ -111,7 +129,8 @@ impl RpcClient {
             if len == 0 {
                 return Err(RpcError::InvalidResponse);
             }
-            match packet::validate_response(&buf[..len], expected_id, expected_type) {
+            match packet::validate_response(&buf[..len], self.protocol, expected_id, expected_type)
+            {
                 Ok(payload) => return Ok(payload.to_vec()),
                 Err(RpcError::IdMismatch { .. }) => continue,
                 Err(err) => return Err(err),
@@ -203,7 +222,7 @@ impl RpcClient {
         let mut offset = 0usize;
         let mut cur_addr = addr;
         while offset < buf.len() {
-            let chunk = (buf.len() - offset).min(MAX_PACKET_DATA_SIZE);
+            let chunk = (buf.len() - offset).min(self.protocol.max_packet_data_size);
             let req = [cur_addr.to_le_bytes(), (chunk as u32).to_le_bytes()].concat();
             let reply = self
                 .exchange(PacketType::ReadMemory, &req, 1)
@@ -235,7 +254,7 @@ impl RpcClient {
         if data.is_empty() {
             return Ok(());
         }
-        let chunk_max = MAX_PACKET_DATA_SIZE - 8;
+        let chunk_max = self.protocol.max_write_chunk();
         let mut offset = 0usize;
         let mut cur_addr = addr;
         while offset < data.len() {
@@ -292,4 +311,113 @@ fn should_retry(err: &RpcError) -> bool {
         err,
         RpcError::Timeout(_) | RpcError::InvalidResponse | RpcError::Io(_)
     )
+}
+
+/// Smallest ProcessList body Azahar writes on success: a `u32` count, even when the count is 0.
+const MIN_PROCESS_LIST_REPLY: usize = 4;
+
+/// Last header number tried when a rejection echoes our version instead of naming its own.
+const MAX_PROBED_VERSION: u32 = 16;
+
+const PROBE_ID: u32 = 0x7FFF_FFFE;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProbeReply {
+    /// ProcessList body of at least 4 bytes, header version equal to the one we sent.
+    Accepted,
+    /// Same id, `packet_size == 0`. `version` is whatever the server wrote in the header.
+    Rejected { version: u32 },
+}
+
+/// Pick the header version the server answers with a real process list.
+///
+/// Azahar 2126.2 (`src/core/rpc/udp_server.cpp` `SendReply`, tag 2126.2) copies the
+/// request `PacketHeader` and `SetPacketDataSize` only writes `packet_size`. A
+/// failed `ValidatePacket` (`rpc_server.cpp`) therefore echoes the version the
+/// client sent, with an empty body. It does not write `CURRENT_VERSION`.
+///
+/// Version 2 is tried first. A timeout means nothing is listening, so no other
+/// version is tried. A list body selects version 2 and stops. An empty body is a
+/// rejection, not "no games".
+///
+/// If that rejection's header version is neither the one we sent nor 0, the server
+/// is naming its own version: retry that value once and do not sweep. Otherwise
+/// try version 1, then 3, 4, … through 16, and stop at the first list body.
+fn detect_protocol(socket: &UdpSocket, timeout: Duration) -> Result<RpcProtocol> {
+    match probe_process_list(socket, PROTOCOL_VERSION_V2, timeout)? {
+        ProbeReply::Accepted => return Ok(RpcProtocol::for_version(PROTOCOL_VERSION_V2)),
+        ProbeReply::Rejected { version } if version != PROTOCOL_VERSION_V2 && version != 0 => {
+            return accept_announced_version(socket, version, timeout);
+        }
+        ProbeReply::Rejected { .. } => {}
+    }
+    for version in std::iter::once(PROTOCOL_VERSION_V1).chain(3..=MAX_PROBED_VERSION) {
+        if probe_process_list(socket, version, timeout)? == ProbeReply::Accepted {
+            return Ok(RpcProtocol::for_version(version));
+        }
+    }
+    Err(RpcError::InvalidResponse)
+}
+
+/// One retry with the version a rejection header named. A second miss does not sweep.
+fn accept_announced_version(
+    socket: &UdpSocket,
+    version: u32,
+    timeout: Duration,
+) -> Result<RpcProtocol> {
+    match probe_process_list(socket, version, timeout)? {
+        ProbeReply::Accepted => Ok(RpcProtocol::for_version(version)),
+        ProbeReply::Rejected { .. } => Err(RpcError::InvalidResponse),
+    }
+}
+
+fn probe_process_list(socket: &UdpSocket, version: u32, timeout: Duration) -> Result<ProbeReply> {
+    let payload: Vec<u8> = [0u32.to_le_bytes(), 0x7FFF_FFFFu32.to_le_bytes()].concat();
+    let header = PacketHeader::new_with_version(
+        version,
+        PROBE_ID,
+        PacketType::ProcessList,
+        payload.len() as u32,
+    );
+    let mut datagram = Vec::with_capacity(16 + payload.len());
+    datagram.extend_from_slice(&header.encode());
+    datagram.extend_from_slice(&payload);
+    socket.send(&datagram)?;
+
+    let mut buf = [0u8; MAX_PACKET_SIZE];
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(RpcError::Timeout(timeout));
+        }
+        socket.set_read_timeout(Some(remaining))?;
+        let len = match socket.recv(&mut buf) {
+            Ok(n) => n,
+            Err(e) if is_timeout(&e) => return Err(RpcError::Timeout(timeout)),
+            Err(e) => return Err(e.into()),
+        };
+        if len == 0 {
+            continue;
+        }
+        let (header, payload) = packet::split_datagram(&buf[..len])?;
+        if header.id != PROBE_ID {
+            continue;
+        }
+        if header.packet_type != PacketType::ProcessList {
+            return Err(RpcError::TypeMismatch {
+                expected: PacketType::ProcessList,
+                got: header.packet_type,
+            });
+        }
+        if payload.len() >= MIN_PROCESS_LIST_REPLY && header.version == version {
+            return Ok(ProbeReply::Accepted);
+        }
+        if payload.is_empty() {
+            return Ok(ProbeReply::Rejected {
+                version: header.version,
+            });
+        }
+        return Err(RpcError::InvalidResponse);
+    }
 }

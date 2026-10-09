@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use crate::packet::{PacketHeader, PacketType, MAX_PACKET_SIZE};
+use crate::packet::{PacketHeader, PacketType, RpcProtocol, MAX_PACKET_SIZE, PROTOCOL_VERSION_V1};
 
 #[derive(Debug, Clone)]
 pub struct FakeProcess {
@@ -31,18 +31,33 @@ pub struct ServerState {
     pub drop_replies: bool,
     pub empty_replies: bool,
     pub reorder_replies: bool,
+    /// Count of ReadMemory requests that passed the version and size checks.
+    pub read_requests: u32,
+    /// Well-formed requests seen, including ones whose reply was dropped or rejected.
+    pub requests: u32,
+    /// Answer every request the way `ValidatePacket` fails: zero-byte body.
+    pub reject_all: bool,
+    /// When set, every reply header uses this version instead of echoing the client.
+    /// Azahar 2126.2 echoes; this is only for a server that names its own version.
+    pub announce_version: Option<u32>,
     pending_replies: Vec<Vec<u8>>,
 }
 
 impl FakeRpcServer {
+    /// Azahar 2125.x / 2126.1.x: `version <= 1`, 1024-byte payloads.
     pub fn bind() -> (Self, Arc<Mutex<ServerState>>) {
+        Self::bind_protocol(RpcProtocol::V1)
+    }
+
+    /// `V1` matches Azahar through 2126.1.x. `V2` matches Azahar 2126.2 (`version == 2`).
+    pub fn bind_protocol(protocol: RpcProtocol) -> (Self, Arc<Mutex<ServerState>>) {
         let socket = UdpSocket::bind("127.0.0.1:0").expect("bind");
         let addr = socket.local_addr().expect("addr");
         let state = Arc::new(Mutex::new(ServerState::default()));
         let stop = Arc::new(Mutex::new(false));
         let state_thread = Arc::clone(&state);
         let stop_thread = Arc::clone(&stop);
-        let handle = thread::spawn(move || run_server(socket, state_thread, stop_thread));
+        let handle = thread::spawn(move || run_server(socket, state_thread, stop_thread, protocol));
         (
             Self {
                 addr,
@@ -71,7 +86,12 @@ impl Drop for FakeRpcServer {
     }
 }
 
-fn run_server(socket: UdpSocket, state: Arc<Mutex<ServerState>>, stop: Arc<Mutex<bool>>) {
+fn run_server(
+    socket: UdpSocket,
+    state: Arc<Mutex<ServerState>>,
+    stop: Arc<Mutex<bool>>,
+    protocol: RpcProtocol,
+) {
     socket
         .set_read_timeout(Some(Duration::from_millis(100)))
         .ok();
@@ -86,13 +106,20 @@ fn run_server(socket: UdpSocket, state: Arc<Mutex<ServerState>>, stop: Arc<Mutex
             Err(e) if e.kind() == std::io::ErrorKind::TimedOut => continue,
             Err(_) => break,
         };
+        if len > protocol.max_packet_size() {
+            continue;
+        }
         let raw = &buf[..len];
         let header = match PacketHeader::decode(raw) {
             Ok(h) => h,
             Err(_) => continue,
         };
+        if raw.len() != 16 + header.data_size as usize {
+            continue;
+        }
         let payload = &raw[16..];
         let mut st = state.lock().unwrap();
+        st.requests = st.requests.wrapping_add(1);
         if st.latency > Duration::ZERO {
             thread::sleep(st.latency);
         }
@@ -103,7 +130,7 @@ fn run_server(socket: UdpSocket, state: Arc<Mutex<ServerState>>, stop: Arc<Mutex
             let _ = socket.send_to(&[], peer);
             continue;
         }
-        let reply = build_reply(&mut st, header, payload);
+        let reply = build_reply(&mut st, protocol, header, payload);
         if st.reorder_replies {
             st.pending_replies.push(reply);
             if st.pending_replies.len() >= 2 {
@@ -151,7 +178,45 @@ fn apply_write(memory: &mut HashMap<u32, Vec<u8>>, addr: u32, data: &[u8]) {
     memory.insert(addr, data.to_vec());
 }
 
-fn build_reply(st: &mut ServerState, header: PacketHeader, payload: &[u8]) -> Vec<u8> {
+/// Azahar ≤2126.1 accepts `version <= 1`. Azahar 2126.2 accepts only `version == 2`.
+/// Any other bound version accepts only that exact header number (a future bump
+/// that does not change the body). Failure is an empty body.
+fn request_accepted(protocol: RpcProtocol, header: &PacketHeader, payload: &[u8]) -> bool {
+    let version_ok = if protocol.version == PROTOCOL_VERSION_V1 {
+        header.version <= PROTOCOL_VERSION_V1
+    } else {
+        header.version == protocol.version
+    };
+    if !version_ok || payload.len() != header.data_size as usize || header.data_size < 8 {
+        return false;
+    }
+    matches!(
+        header.packet_type,
+        PacketType::ReadMemory
+            | PacketType::WriteMemory
+            | PacketType::ProcessList
+            | PacketType::SetGetProcess
+    )
+}
+
+fn encode_reply(version: u32, id: u32, packet_type: PacketType, payload: &[u8]) -> Vec<u8> {
+    let hdr = PacketHeader::new_with_version(version, id, packet_type, payload.len() as u32);
+    let mut datagram = Vec::with_capacity(16 + payload.len());
+    datagram.extend_from_slice(&hdr.encode());
+    datagram.extend_from_slice(payload);
+    datagram
+}
+
+fn build_reply(
+    st: &mut ServerState,
+    protocol: RpcProtocol,
+    header: PacketHeader,
+    payload: &[u8],
+) -> Vec<u8> {
+    let reply_version = st.announce_version.unwrap_or(header.version);
+    if st.reject_all || !request_accepted(protocol, &header, payload) {
+        return encode_reply(reply_version, header.id, header.packet_type, &[]);
+    }
     let mut out_payload = Vec::new();
     match header.packet_type {
         PacketType::ProcessList => {
@@ -161,7 +226,7 @@ fn build_reply(st: &mut ServerState, header: PacketHeader, payload: &[u8]) -> Ve
                 0
             };
             let slice = st.processes.get(start..).unwrap_or(&[]);
-            let count = slice.len().min(51);
+            let count = slice.len().min(protocol.max_processes_in_list());
             out_payload.extend_from_slice(&(count as u32).to_le_bytes());
             for p in &slice[..count] {
                 out_payload.extend_from_slice(&p.pid.to_le_bytes());
@@ -178,10 +243,11 @@ fn build_reply(st: &mut ServerState, header: PacketHeader, payload: &[u8]) -> Ve
             }
             out_payload.extend_from_slice(&st.selected_pid.to_le_bytes());
         }
-        PacketType::ReadMemory => {
-            if payload.len() >= 8 {
-                let addr = u32::from_le_bytes(payload[0..4].try_into().expect("slice"));
-                let size = u32::from_le_bytes(payload[4..8].try_into().expect("slice")) as usize;
+        PacketType::ReadMemory if payload.len() >= 8 => {
+            let addr = u32::from_le_bytes(payload[0..4].try_into().expect("slice"));
+            let size = u32::from_le_bytes(payload[4..8].try_into().expect("slice")) as usize;
+            if size > 0 && size <= protocol.max_packet_data_size {
+                st.read_requests = st.read_requests.wrapping_add(1);
                 out_payload.resize(size, 0);
                 if let Some(bytes) = st.memory.get(&addr) {
                     let copy_len = size.min(bytes.len());
@@ -202,21 +268,20 @@ fn build_reply(st: &mut ServerState, header: PacketHeader, payload: &[u8]) -> Ve
                 }
             }
         }
-        PacketType::WriteMemory => {
-            if payload.len() >= 8 {
-                let addr = u32::from_le_bytes(payload[0..4].try_into().expect("slice"));
-                let size = u32::from_le_bytes(payload[4..8].try_into().expect("slice")) as usize;
-                let data = &payload[8..];
-                if data.len() >= size && write_allowed(addr) {
-                    apply_write(&mut st.memory, addr, &data[..size]);
-                }
+        // Azahar sends an empty payload for both a landed write and a rejected one.
+        PacketType::WriteMemory if payload.len() >= 8 => {
+            let addr = u32::from_le_bytes(payload[0..4].try_into().expect("slice"));
+            let size = u32::from_le_bytes(payload[4..8].try_into().expect("slice")) as usize;
+            let data = &payload[8..];
+            if size > 0
+                && size <= protocol.max_write_chunk()
+                && data.len() >= size
+                && write_allowed(addr)
+            {
+                apply_write(&mut st.memory, addr, &data[..size]);
             }
-            // Azahar sends an empty payload for both a landed write and a rejected one.
         }
+        _ => {}
     }
-    let hdr = PacketHeader::new(header.id, header.packet_type, out_payload.len() as u32);
-    let mut datagram = Vec::with_capacity(16 + out_payload.len());
-    datagram.extend_from_slice(&hdr.encode());
-    datagram.extend_from_slice(&out_payload);
-    datagram
+    encode_reply(reply_version, header.id, header.packet_type, &out_payload)
 }
