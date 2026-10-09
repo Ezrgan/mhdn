@@ -1,8 +1,9 @@
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use mhdn_rpc::fake_server::{FakeProcess, FakeRpcServer};
+use mhdn_rpc::fake_server::{FakeProcess, FakeRpcServer, ServerState};
 use mhdn_rpc::RpcError;
-use mhdn_rpc::{ReadReq, RpcClient};
+use mhdn_rpc::{ReadReq, RpcClient, RpcProtocol};
 
 #[test]
 fn read_memory_via_fake_server() {
@@ -61,8 +62,8 @@ fn read_chunks_over_1kb() {
 #[test]
 fn timeout_on_dropped_replies() {
     let (server, state) = FakeRpcServer::bind();
-    state.lock().unwrap().drop_replies = true;
     let mut client = RpcClient::connect(server.addr(), Duration::from_millis(50)).unwrap();
+    state.lock().unwrap().drop_replies = true;
     let err = client.read_u32(0).unwrap_err();
     assert!(matches!(err, RpcError::Timeout(_)));
     server.shutdown();
@@ -131,9 +132,9 @@ fn late_replies_after_a_timeout_do_not_desync_later_reads() {
     {
         let mut st = state.lock().unwrap();
         st.memory.insert(0x3000, vec![1, 2, 3, 4]);
-        st.latency = LATE_REPLY;
     }
     let mut client = RpcClient::connect(server.addr(), Duration::from_millis(30)).unwrap();
+    state.lock().unwrap().latency = LATE_REPLY;
     let mut buf = [0u8; 4];
     assert!(client.read(0x3000, &mut buf).is_err());
     state.lock().unwrap().latency = Duration::ZERO;
@@ -166,11 +167,11 @@ fn pipelined_read_many_with_reorder() {
     let (server, state) = FakeRpcServer::bind();
     {
         let mut st = state.lock().unwrap();
-        st.reorder_replies = true;
         st.memory.insert(0x3000, vec![1, 2, 3, 4]);
         st.memory.insert(0x4000, vec![5, 6, 7, 8]);
     }
     let mut client = RpcClient::connect(server.addr(), Duration::from_millis(500)).unwrap();
+    state.lock().unwrap().reorder_replies = true;
     client.set_pipeline_window(2);
     let mut a = [0u8; 4];
     let mut b = [0u8; 4];
@@ -187,5 +188,79 @@ fn pipelined_read_many_with_reorder() {
     client.read_many(&mut reqs).unwrap();
     assert_eq!(a, [1, 2, 3, 4]);
     assert_eq!(b, [5, 6, 7, 8]);
+    server.shutdown();
+}
+
+fn connect_dialect(protocol: RpcProtocol) -> (FakeRpcServer, Arc<Mutex<ServerState>>, RpcClient) {
+    let (server, state) = FakeRpcServer::bind_protocol(protocol);
+    {
+        let mut st = state.lock().unwrap();
+        st.processes.push(FakeProcess {
+            pid: 42,
+            title_id: 0x0004_0000_0019_7100,
+            name: *b"MHXXJP  ",
+        });
+        st.memory.insert(0x1000, vec![0x07, 0x00, 0x00, 0xEB]);
+        let mut block = vec![0u8; 1500];
+        for (i, byte) in block.iter_mut().enumerate() {
+            *byte = (i % 256) as u8;
+        }
+        st.memory.insert(0x2000, block);
+    }
+    let client = RpcClient::connect(server.addr(), Duration::from_millis(500)).unwrap();
+    (server, state, client)
+}
+
+fn assert_list_select_and_read(client: &mut RpcClient) {
+    let list = client.list_processes().unwrap();
+    assert_eq!(list.len(), 1);
+    assert_eq!(list[0].pid, 42);
+    assert_eq!(list[0].title_id, 0x0004_0000_0019_7100);
+    client.select_process(42).unwrap();
+    assert_eq!(client.selected_process().unwrap(), 42);
+    let mut buf = [0u8; 4];
+    client.read(0x1000, &mut buf).unwrap();
+    assert_eq!(buf, [0x07, 0x00, 0x00, 0xEB]);
+}
+
+#[test]
+fn v1_server_is_not_mistaken_for_2126_2() {
+    let (server, state, mut client) = connect_dialect(RpcProtocol::V1);
+    assert_eq!(client.protocol(), RpcProtocol::V1);
+    assert_list_select_and_read(&mut client);
+    state.lock().unwrap().read_requests = 0;
+    let mut big = vec![0u8; 1500];
+    client.read(0x2000, &mut big).unwrap();
+    assert_eq!(state.lock().unwrap().read_requests, 2);
+    for (i, byte) in big.iter().enumerate() {
+        assert_eq!(*byte, (i % 256) as u8);
+    }
+    server.shutdown();
+}
+
+#[test]
+fn v2_server_answers_2126_2_process_list_and_reads() {
+    let (server, state, mut client) = connect_dialect(RpcProtocol::V2);
+    assert_eq!(client.protocol(), RpcProtocol::V2);
+    assert_eq!(client.protocol().max_packet_data_size, 32 * 1024);
+    assert_list_select_and_read(&mut client);
+    state.lock().unwrap().read_requests = 0;
+    let mut big = vec![0u8; 1500];
+    client.read(0x2000, &mut big).unwrap();
+    assert_eq!(state.lock().unwrap().read_requests, 1);
+    for (i, byte) in big.iter().enumerate() {
+        assert_eq!(*byte, (i % 256) as u8);
+    }
+    server.shutdown();
+}
+
+#[test]
+fn a_server_that_rejects_v1_and_v2_does_not_connect() {
+    let (server, state) = FakeRpcServer::bind_protocol(RpcProtocol::V2);
+    state.lock().unwrap().reject_all = true;
+    let Err(err) = RpcClient::connect(server.addr(), Duration::from_millis(300)) else {
+        panic!("connect succeeded against a server that rejects both versions");
+    };
+    assert!(matches!(err, RpcError::InvalidResponse));
     server.shutdown();
 }

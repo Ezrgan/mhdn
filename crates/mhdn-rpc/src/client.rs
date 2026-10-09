@@ -2,7 +2,7 @@ use std::net::{SocketAddr, UdpSocket};
 use std::time::Duration;
 
 use crate::error::{Result, RpcError};
-use crate::packet::{self, PacketHeader, PacketType, MAX_PACKET_DATA_SIZE, MAX_PACKET_SIZE};
+use crate::packet::{self, PacketHeader, PacketType, RpcProtocol, MAX_PACKET_SIZE};
 
 /// One process entry returned by [`RpcClient::list_processes`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,6 +41,7 @@ pub struct RpcClient {
     socket: UdpSocket,
     server: SocketAddr,
     timeout: Duration,
+    protocol: RpcProtocol,
     next_id: u32,
     pipeline_window: usize,
 }
@@ -50,13 +51,21 @@ impl RpcClient {
         let socket = UdpSocket::bind("0.0.0.0:0")?;
         socket.connect(addr)?;
         socket.set_read_timeout(Some(timeout))?;
+        let protocol = detect_protocol(&socket, timeout)?;
+        socket.set_read_timeout(Some(timeout))?;
         Ok(Self {
             socket,
             server: addr,
             timeout,
+            protocol,
             next_id: 1,
             pipeline_window: DEFAULT_PIPELINE_WINDOW,
         })
+    }
+
+    /// Negotiated dialect. Version 1 is Azahar 2125.x and 2126.1.x. Version 2 is Azahar 2126.2.
+    pub fn protocol(&self) -> RpcProtocol {
+        self.protocol
     }
 
     pub fn set_pipeline_window(&mut self, window: usize) {
@@ -90,7 +99,12 @@ impl RpcClient {
         packet_type: PacketType,
         payload: &[u8],
     ) -> Result<()> {
-        let header = PacketHeader::new(id, packet_type, payload.len() as u32);
+        let header = PacketHeader::new_with_version(
+            self.protocol.version,
+            id,
+            packet_type,
+            payload.len() as u32,
+        );
         let mut datagram = Vec::with_capacity(16 + payload.len());
         datagram.extend_from_slice(&header.encode());
         datagram.extend_from_slice(payload);
@@ -111,7 +125,8 @@ impl RpcClient {
             if len == 0 {
                 return Err(RpcError::InvalidResponse);
             }
-            match packet::validate_response(&buf[..len], expected_id, expected_type) {
+            match packet::validate_response(&buf[..len], self.protocol, expected_id, expected_type)
+            {
                 Ok(payload) => return Ok(payload.to_vec()),
                 Err(RpcError::IdMismatch { .. }) => continue,
                 Err(err) => return Err(err),
@@ -203,7 +218,7 @@ impl RpcClient {
         let mut offset = 0usize;
         let mut cur_addr = addr;
         while offset < buf.len() {
-            let chunk = (buf.len() - offset).min(MAX_PACKET_DATA_SIZE);
+            let chunk = (buf.len() - offset).min(self.protocol.max_packet_data_size);
             let req = [cur_addr.to_le_bytes(), (chunk as u32).to_le_bytes()].concat();
             let reply = self
                 .exchange(PacketType::ReadMemory, &req, 1)
@@ -235,7 +250,7 @@ impl RpcClient {
         if data.is_empty() {
             return Ok(());
         }
-        let chunk_max = MAX_PACKET_DATA_SIZE - 8;
+        let chunk_max = self.protocol.max_write_chunk();
         let mut offset = 0usize;
         let mut cur_addr = addr;
         while offset < data.len() {
@@ -292,4 +307,67 @@ fn should_retry(err: &RpcError) -> bool {
         err,
         RpcError::Timeout(_) | RpcError::InvalidResponse | RpcError::Io(_)
     )
+}
+
+/// Smallest ProcessList body Azahar writes on success: a `u32` count, even when the count is 0.
+const MIN_PROCESS_LIST_REPLY: usize = 4;
+
+/// Pick the dialect the server actually answers.
+///
+/// Azahar 2125.x and 2126.1.x (`ValidatePacket`) accept `version <= 1`. Azahar 2126.2
+/// accepts only `version == 2`. Both use the same ProcessList body: a `u32` count
+/// plus 0x14-byte entries. A rejected version is still answered: the request header
+/// echoed with `packet_size == 0`. That empty body is not a process list, so it
+/// does not select a dialect. A later Azahar that answers neither version fails
+/// both probes.
+///
+/// Version 2 is tried first. A timeout means nothing answered, so version 1 is not
+/// tried; that would double the wait while Azahar is closed.
+fn detect_protocol(socket: &UdpSocket, timeout: Duration) -> Result<RpcProtocol> {
+    match probe_process_list(socket, RpcProtocol::V2, timeout) {
+        Ok(()) => return Ok(RpcProtocol::V2),
+        Err(RpcError::Timeout(elapsed)) => return Err(RpcError::Timeout(elapsed)),
+        Err(_) => {}
+    }
+    probe_process_list(socket, RpcProtocol::V1, timeout)?;
+    Ok(RpcProtocol::V1)
+}
+
+fn probe_process_list(socket: &UdpSocket, protocol: RpcProtocol, timeout: Duration) -> Result<()> {
+    const PROBE_ID: u32 = 0x7FFF_FFFE;
+    let payload: Vec<u8> = [0u32.to_le_bytes(), 0x7FFF_FFFFu32.to_le_bytes()].concat();
+    let header = PacketHeader::new_with_version(
+        protocol.version,
+        PROBE_ID,
+        PacketType::ProcessList,
+        payload.len() as u32,
+    );
+    let mut datagram = Vec::with_capacity(16 + payload.len());
+    datagram.extend_from_slice(&header.encode());
+    datagram.extend_from_slice(&payload);
+    socket.send(&datagram)?;
+
+    let mut buf = [0u8; MAX_PACKET_SIZE];
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(RpcError::Timeout(timeout));
+        }
+        socket.set_read_timeout(Some(remaining))?;
+        let len = match socket.recv(&mut buf) {
+            Ok(n) => n,
+            Err(e) if is_timeout(&e) => return Err(RpcError::Timeout(timeout)),
+            Err(e) => return Err(e.into()),
+        };
+        if len == 0 {
+            continue;
+        }
+        match packet::validate_response(&buf[..len], protocol, PROBE_ID, PacketType::ProcessList) {
+            Ok(payload) if payload.len() >= MIN_PROCESS_LIST_REPLY => return Ok(()),
+            Ok(_) => return Err(RpcError::InvalidResponse),
+            Err(RpcError::IdMismatch { .. }) => continue,
+            Err(err) => return Err(err),
+        }
+    }
 }

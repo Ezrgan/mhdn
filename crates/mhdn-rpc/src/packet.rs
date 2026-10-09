@@ -1,17 +1,59 @@
-//! Azahar/Citra RPC packet header and payload layout (see `dist/scripting/citra.py`).
+//! Azahar/Citra RPC packet header and payload layout (see Azahar `src/core/rpc/packet.h`).
 
 use crate::error::{Result, RpcError};
 
-/// Protocol version shared by request and response headers.
-pub const PROTOCOL_VERSION: u32 = 1;
+/// RPC protocol v1 (`CURRENT_VERSION` in Azahar 2125.x and 2126.1.x).
+pub const PROTOCOL_VERSION_V1: u32 = 1;
+/// RPC protocol v2 (Azahar 2126.2, `CURRENT_VERSION = 2`). Later Azahar builds are not supported.
+pub const PROTOCOL_VERSION_V2: u32 = 2;
 
-/// Maximum bytes of payload after the 16-byte header.
-pub const MAX_PACKET_DATA_SIZE: usize = 1024;
+/// Legacy alias: default on-the-wire version before auto-detection (v1).
+pub const PROTOCOL_VERSION: u32 = PROTOCOL_VERSION_V1;
 
-/// Maximum UDP datagram size accepted from the server.
-pub const MAX_PACKET_SIZE: usize = MAX_PACKET_DATA_SIZE + 16;
+/// Max payload bytes after the 16-byte header (Azahar v1).
+pub const MAX_PACKET_DATA_SIZE_V1: usize = 1024;
+/// Max payload bytes after the 16-byte header (Azahar 2126.2).
+pub const MAX_PACKET_DATA_SIZE_V2: usize = 32 * 1024;
+
+/// Largest payload this client accepts (v2 ceiling).
+pub const MAX_PACKET_DATA_SIZE: usize = MAX_PACKET_DATA_SIZE_V2;
 
 const HEADER_SIZE: usize = 16;
+
+/// Negotiated RPC dialect (version + per-datagram payload limit).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RpcProtocol {
+    pub version: u32,
+    pub max_packet_data_size: usize,
+}
+
+impl RpcProtocol {
+    pub const V1: Self = Self {
+        version: PROTOCOL_VERSION_V1,
+        max_packet_data_size: MAX_PACKET_DATA_SIZE_V1,
+    };
+
+    pub const V2: Self = Self {
+        version: PROTOCOL_VERSION_V2,
+        max_packet_data_size: MAX_PACKET_DATA_SIZE_V2,
+    };
+
+    pub fn max_packet_size(self) -> usize {
+        HEADER_SIZE + self.max_packet_data_size
+    }
+
+    pub fn max_write_chunk(self) -> usize {
+        self.max_packet_data_size.saturating_sub(8)
+    }
+
+    /// Max process entries in one ProcessList reply (Azahar `MAX_PROCESSES_IN_LIST`).
+    pub fn max_processes_in_list(self) -> usize {
+        (self.max_packet_data_size - 4) / 0x14
+    }
+}
+
+/// Maximum UDP datagram size accepted from the server (v2 ceiling).
+pub const MAX_PACKET_SIZE: usize = HEADER_SIZE + MAX_PACKET_DATA_SIZE;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
@@ -20,6 +62,10 @@ pub enum PacketType {
     WriteMemory = 2,
     ProcessList = 3,
     SetGetProcess = 4,
+    /// Azahar 2126.2+ only (not used by mhdn).
+    TakeScreenshot = 5,
+    ReadScreenshot = 6,
+    GetPerfStats = 7,
 }
 
 impl PacketType {
@@ -29,6 +75,9 @@ impl PacketType {
             2 => Some(Self::WriteMemory),
             3 => Some(Self::ProcessList),
             4 => Some(Self::SetGetProcess),
+            5 => Some(Self::TakeScreenshot),
+            6 => Some(Self::ReadScreenshot),
+            7 => Some(Self::GetPerfStats),
             _ => None,
         }
     }
@@ -45,8 +94,17 @@ pub struct PacketHeader {
 
 impl PacketHeader {
     pub fn new(id: u32, packet_type: PacketType, data_size: u32) -> Self {
+        Self::new_with_version(PROTOCOL_VERSION_V1, id, packet_type, data_size)
+    }
+
+    pub fn new_with_version(
+        version: u32,
+        id: u32,
+        packet_type: PacketType,
+        data_size: u32,
+    ) -> Self {
         Self {
-            version: PROTOCOL_VERSION,
+            version,
             id,
             packet_type,
             data_size,
@@ -97,11 +155,16 @@ pub fn split_datagram(raw: &[u8]) -> Result<(PacketHeader, &[u8])> {
 }
 
 /// Validate response header against the outstanding request.
-pub fn validate_response(raw: &[u8], expected_id: u32, expected_type: PacketType) -> Result<&[u8]> {
+pub fn validate_response(
+    raw: &[u8],
+    protocol: RpcProtocol,
+    expected_id: u32,
+    expected_type: PacketType,
+) -> Result<&[u8]> {
     let (header, payload) = split_datagram(raw)?;
-    if header.version != PROTOCOL_VERSION {
+    if header.version != protocol.version {
         return Err(RpcError::VersionMismatch {
-            expected: PROTOCOL_VERSION,
+            expected: protocol.version,
             got: header.version,
         });
     }
@@ -168,7 +231,8 @@ mod tests {
         let mut raw = Vec::new();
         raw.extend_from_slice(&PacketHeader::new(5, PacketType::SetGetProcess, 4).encode());
         raw.extend_from_slice(&123u32.to_le_bytes());
-        let payload = validate_response(&raw, 5, PacketType::SetGetProcess).unwrap();
+        let payload =
+            validate_response(&raw, RpcProtocol::V1, 5, PacketType::SetGetProcess).unwrap();
         assert_eq!(payload, 123u32.to_le_bytes());
     }
 
@@ -177,8 +241,30 @@ mod tests {
         let mut raw = Vec::new();
         raw.extend_from_slice(&PacketHeader::new(5, PacketType::ReadMemory, 0).encode());
         assert!(matches!(
-            validate_response(&raw, 6, PacketType::ReadMemory),
+            validate_response(&raw, RpcProtocol::V1, 6, PacketType::ReadMemory),
             Err(RpcError::IdMismatch { .. })
         ));
+    }
+
+    #[test]
+    fn versions_match_azahar_packet_h() {
+        // 2126.1: CURRENT_VERSION = 1, MAX_PACKET_DATA_SIZE = 1024.
+        // 2126.2: CURRENT_VERSION = 2, MAX_PACKET_DATA_SIZE = 32 * 1024.
+        // MAX_PROCESSES_IN_LIST = (MAX_PACKET_DATA_SIZE - sizeof(u32)) / sizeof(ProcessInfo).
+        assert_eq!(PROTOCOL_VERSION_V1, 1);
+        assert_eq!(MAX_PACKET_DATA_SIZE_V1, 1024);
+        assert_eq!(RpcProtocol::V1.max_processes_in_list(), 51);
+        assert_eq!(RpcProtocol::V1.max_write_chunk(), 1024 - 8);
+        assert_eq!(PROTOCOL_VERSION_V2, 2);
+        assert_eq!(MAX_PACKET_DATA_SIZE_V2, 32 * 1024);
+        assert_eq!(
+            RpcProtocol::V2.max_processes_in_list(),
+            (32 * 1024 - 4) / 0x14
+        );
+        assert_eq!(RpcProtocol::V2.max_write_chunk(), 32 * 1024 - 8);
+        assert_eq!(PacketType::ReadMemory as u32, 1);
+        assert_eq!(PacketType::WriteMemory as u32, 2);
+        assert_eq!(PacketType::ProcessList as u32, 3);
+        assert_eq!(PacketType::SetGetProcess as u32, 4);
     }
 }

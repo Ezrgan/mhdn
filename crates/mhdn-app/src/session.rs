@@ -235,6 +235,11 @@ fn connect() -> Result<RpcClient, ConnectFail> {
         .expect("127.0.0.1:45987 is a valid socket address");
     let mut client =
         RpcClient::connect(addr, Duration::from_millis(50)).map_err(|_| ConnectFail::Rpc)?;
+    let protocol = client.protocol();
+    crate::diag::line(&format!(
+        "rpc version={} max_read={}",
+        protocol.version, protocol.max_packet_data_size
+    ));
     let processes = client.list_processes().map_err(|_| ConnectFail::Rpc)?;
     let pid = processes
         .iter()

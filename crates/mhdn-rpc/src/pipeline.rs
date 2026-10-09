@@ -1,6 +1,6 @@
 use crate::client::RpcClient;
 use crate::error::{Result, RpcError};
-use crate::packet::{self, PacketType, MAX_PACKET_DATA_SIZE, MAX_PACKET_SIZE};
+use crate::packet::{self, PacketType, MAX_PACKET_SIZE};
 use crate::ReadReq;
 
 impl RpcClient {
@@ -29,10 +29,11 @@ impl RpcClient {
                     completed += 1;
                     continue;
                 }
-                if len > MAX_PACKET_DATA_SIZE {
+                let max = self.protocol().max_packet_data_size;
+                if len > max {
                     return Err(RpcError::ReadTooLarge {
                         requested: len,
-                        max: MAX_PACKET_DATA_SIZE,
+                        max,
                     });
                 }
                 let id = self.next_request_id();
@@ -64,9 +65,10 @@ impl RpcClient {
                 return Err(RpcError::InvalidResponse);
             }
             let (header, payload) = packet::split_datagram(&buf[..len])?;
-            if header.version != packet::PROTOCOL_VERSION {
+            let version = self.protocol().version;
+            if header.version != version {
                 return Err(RpcError::VersionMismatch {
-                    expected: packet::PROTOCOL_VERSION,
+                    expected: version,
                     got: header.version,
                 });
             }
