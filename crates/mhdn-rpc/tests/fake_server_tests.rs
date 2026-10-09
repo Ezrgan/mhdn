@@ -255,12 +255,90 @@ fn v2_server_answers_2126_2_process_list_and_reads() {
 }
 
 #[test]
-fn a_server_that_rejects_v1_and_v2_does_not_connect() {
+fn a_server_that_rejects_every_probed_version_does_not_connect() {
     let (server, state) = FakeRpcServer::bind_protocol(RpcProtocol::V2);
     state.lock().unwrap().reject_all = true;
     let Err(err) = RpcClient::connect(server.addr(), Duration::from_millis(300)) else {
-        panic!("connect succeeded against a server that rejects both versions");
+        panic!("connect succeeded against a server that rejects every version");
     };
     assert!(matches!(err, RpcError::InvalidResponse));
+    // Version 2, then 1, then 3..=16. An echoed empty body is not a process list.
+    assert_eq!(state.lock().unwrap().requests, 16);
+    server.shutdown();
+}
+
+fn one_game(protocol: RpcProtocol) -> (FakeRpcServer, Arc<Mutex<ServerState>>) {
+    let (server, state) = FakeRpcServer::bind_protocol(protocol);
+    state.lock().unwrap().processes.push(FakeProcess {
+        pid: 42,
+        title_id: 0x0004_0000_0019_7100,
+        name: *b"MHXXJP  ",
+    });
+    (server, state)
+}
+
+#[test]
+fn version_2_is_accepted_without_probing_further() {
+    let (server, state) = one_game(RpcProtocol::V2);
+    let mut client = RpcClient::connect(server.addr(), Duration::from_millis(200)).unwrap();
+    assert_eq!(client.protocol(), RpcProtocol::V2);
+    assert_eq!(state.lock().unwrap().requests, 1);
+    assert_eq!(client.list_processes().unwrap().len(), 1);
+    server.shutdown();
+}
+
+#[test]
+fn version_1_is_chosen_after_an_empty_v2_rejection() {
+    let (server, state) = one_game(RpcProtocol::V1);
+    let mut client = RpcClient::connect(server.addr(), Duration::from_millis(200)).unwrap();
+    assert_eq!(client.protocol(), RpcProtocol::V1);
+    // Version 2 echoed back empty, then version 1 returned a list. 3..=16 stay untried.
+    assert_eq!(state.lock().unwrap().requests, 2);
+    assert_eq!(client.list_processes().unwrap().len(), 1);
+    server.shutdown();
+}
+
+#[test]
+fn an_announced_header_version_is_retried_once() {
+    let protocol = RpcProtocol {
+        version: 7,
+        max_packet_data_size: mhdn_rpc::MAX_PACKET_DATA_SIZE,
+    };
+    let (server, state) = one_game(protocol);
+    state.lock().unwrap().announce_version = Some(7);
+    let mut client = RpcClient::connect(server.addr(), Duration::from_millis(200)).unwrap();
+    assert_eq!(client.protocol().version, 7);
+    assert_eq!(client.protocol().max_packet_data_size, 32 * 1024);
+    // Version 2 rejected with header version 7, then one retry. No sweep.
+    assert_eq!(state.lock().unwrap().requests, 2);
+    assert_eq!(client.list_processes().unwrap().len(), 1);
+    server.shutdown();
+}
+
+#[test]
+fn version_5_is_found_by_sweep_and_stops_there() {
+    let protocol = RpcProtocol {
+        version: 5,
+        max_packet_data_size: mhdn_rpc::MAX_PACKET_DATA_SIZE,
+    };
+    let (server, state) = one_game(protocol);
+    let mut client = RpcClient::connect(server.addr(), Duration::from_millis(200)).unwrap();
+    assert_eq!(client.protocol().version, 5);
+    assert_eq!(client.protocol().max_packet_data_size, 32 * 1024);
+    // 2 (echoed empty), 1, 3, 4, then 5 returns a list. 6..=16 stay untried.
+    assert_eq!(state.lock().unwrap().requests, 5);
+    assert_eq!(client.list_processes().unwrap().len(), 1);
+    server.shutdown();
+}
+
+#[test]
+fn a_silent_server_is_not_swept() {
+    let (server, state) = FakeRpcServer::bind_protocol(RpcProtocol::V2);
+    state.lock().unwrap().drop_replies = true;
+    let Err(err) = RpcClient::connect(server.addr(), Duration::from_millis(50)) else {
+        panic!("connect succeeded against a server that does not answer");
+    };
+    assert!(matches!(err, RpcError::Timeout(_)));
+    assert_eq!(state.lock().unwrap().requests, 1);
     server.shutdown();
 }

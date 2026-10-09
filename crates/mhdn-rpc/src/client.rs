@@ -2,7 +2,10 @@ use std::net::{SocketAddr, UdpSocket};
 use std::time::Duration;
 
 use crate::error::{Result, RpcError};
-use crate::packet::{self, PacketHeader, PacketType, RpcProtocol, MAX_PACKET_SIZE};
+use crate::packet::{
+    self, PacketHeader, PacketType, RpcProtocol, MAX_PACKET_SIZE, PROTOCOL_VERSION_V1,
+    PROTOCOL_VERSION_V2,
+};
 
 /// One process entry returned by [`RpcClient::list_processes`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -63,7 +66,8 @@ impl RpcClient {
         })
     }
 
-    /// Negotiated dialect. Version 1 is Azahar 2125.x and 2126.1.x. Version 2 is Azahar 2126.2.
+    /// Negotiated dialect. Version 1 is Azahar through 2126.1. Version 2 is 2126.2.
+    /// A higher number is a later build that kept the same RPC body.
     pub fn protocol(&self) -> RpcProtocol {
         self.protocol
     }
@@ -312,32 +316,65 @@ fn should_retry(err: &RpcError) -> bool {
 /// Smallest ProcessList body Azahar writes on success: a `u32` count, even when the count is 0.
 const MIN_PROCESS_LIST_REPLY: usize = 4;
 
-/// Pick the dialect the server actually answers.
-///
-/// Azahar 2125.x and 2126.1.x (`ValidatePacket`) accept `version <= 1`. Azahar 2126.2
-/// accepts only `version == 2`. Both use the same ProcessList body: a `u32` count
-/// plus 0x14-byte entries. A rejected version is still answered: the request header
-/// echoed with `packet_size == 0`. That empty body is not a process list, so it
-/// does not select a dialect. A later Azahar that answers neither version fails
-/// both probes.
-///
-/// Version 2 is tried first. A timeout means nothing answered, so version 1 is not
-/// tried; that would double the wait while Azahar is closed.
-fn detect_protocol(socket: &UdpSocket, timeout: Duration) -> Result<RpcProtocol> {
-    match probe_process_list(socket, RpcProtocol::V2, timeout) {
-        Ok(()) => return Ok(RpcProtocol::V2),
-        Err(RpcError::Timeout(elapsed)) => return Err(RpcError::Timeout(elapsed)),
-        Err(_) => {}
-    }
-    probe_process_list(socket, RpcProtocol::V1, timeout)?;
-    Ok(RpcProtocol::V1)
+/// Last header number tried when a rejection echoes our version instead of naming its own.
+const MAX_PROBED_VERSION: u32 = 16;
+
+const PROBE_ID: u32 = 0x7FFF_FFFE;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProbeReply {
+    /// ProcessList body of at least 4 bytes, header version equal to the one we sent.
+    Accepted,
+    /// Same id, `packet_size == 0`. `version` is whatever the server wrote in the header.
+    Rejected { version: u32 },
 }
 
-fn probe_process_list(socket: &UdpSocket, protocol: RpcProtocol, timeout: Duration) -> Result<()> {
-    const PROBE_ID: u32 = 0x7FFF_FFFE;
+/// Pick the header version the server answers with a real process list.
+///
+/// Azahar 2126.2 (`src/core/rpc/udp_server.cpp` `SendReply`, tag 2126.2) copies the
+/// request `PacketHeader` and `SetPacketDataSize` only writes `packet_size`. A
+/// failed `ValidatePacket` (`rpc_server.cpp`) therefore echoes the version the
+/// client sent, with an empty body. It does not write `CURRENT_VERSION`.
+///
+/// Version 2 is tried first. A timeout means nothing is listening, so no other
+/// version is tried. A list body selects version 2 and stops. An empty body is a
+/// rejection, not "no games".
+///
+/// If that rejection's header version is neither the one we sent nor 0, the server
+/// is naming its own version: retry that value once and do not sweep. Otherwise
+/// try version 1, then 3, 4, … through 16, and stop at the first list body.
+fn detect_protocol(socket: &UdpSocket, timeout: Duration) -> Result<RpcProtocol> {
+    match probe_process_list(socket, PROTOCOL_VERSION_V2, timeout)? {
+        ProbeReply::Accepted => return Ok(RpcProtocol::for_version(PROTOCOL_VERSION_V2)),
+        ProbeReply::Rejected { version } if version != PROTOCOL_VERSION_V2 && version != 0 => {
+            return accept_announced_version(socket, version, timeout);
+        }
+        ProbeReply::Rejected { .. } => {}
+    }
+    for version in std::iter::once(PROTOCOL_VERSION_V1).chain(3..=MAX_PROBED_VERSION) {
+        if probe_process_list(socket, version, timeout)? == ProbeReply::Accepted {
+            return Ok(RpcProtocol::for_version(version));
+        }
+    }
+    Err(RpcError::InvalidResponse)
+}
+
+/// One retry with the version a rejection header named. A second miss does not sweep.
+fn accept_announced_version(
+    socket: &UdpSocket,
+    version: u32,
+    timeout: Duration,
+) -> Result<RpcProtocol> {
+    match probe_process_list(socket, version, timeout)? {
+        ProbeReply::Accepted => Ok(RpcProtocol::for_version(version)),
+        ProbeReply::Rejected { .. } => Err(RpcError::InvalidResponse),
+    }
+}
+
+fn probe_process_list(socket: &UdpSocket, version: u32, timeout: Duration) -> Result<ProbeReply> {
     let payload: Vec<u8> = [0u32.to_le_bytes(), 0x7FFF_FFFFu32.to_le_bytes()].concat();
     let header = PacketHeader::new_with_version(
-        protocol.version,
+        version,
         PROBE_ID,
         PacketType::ProcessList,
         payload.len() as u32,
@@ -363,11 +400,24 @@ fn probe_process_list(socket: &UdpSocket, protocol: RpcProtocol, timeout: Durati
         if len == 0 {
             continue;
         }
-        match packet::validate_response(&buf[..len], protocol, PROBE_ID, PacketType::ProcessList) {
-            Ok(payload) if payload.len() >= MIN_PROCESS_LIST_REPLY => return Ok(()),
-            Ok(_) => return Err(RpcError::InvalidResponse),
-            Err(RpcError::IdMismatch { .. }) => continue,
-            Err(err) => return Err(err),
+        let (header, payload) = packet::split_datagram(&buf[..len])?;
+        if header.id != PROBE_ID {
+            continue;
         }
+        if header.packet_type != PacketType::ProcessList {
+            return Err(RpcError::TypeMismatch {
+                expected: PacketType::ProcessList,
+                got: header.packet_type,
+            });
+        }
+        if payload.len() >= MIN_PROCESS_LIST_REPLY && header.version == version {
+            return Ok(ProbeReply::Accepted);
+        }
+        if payload.is_empty() {
+            return Ok(ProbeReply::Rejected {
+                version: header.version,
+            });
+        }
+        return Err(RpcError::InvalidResponse);
     }
 }

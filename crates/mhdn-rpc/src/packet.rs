@@ -4,7 +4,8 @@ use crate::error::{Result, RpcError};
 
 /// RPC protocol v1 (`CURRENT_VERSION` in Azahar 2125.x and 2126.1.x).
 pub const PROTOCOL_VERSION_V1: u32 = 1;
-/// RPC protocol v2 (Azahar 2126.2, `CURRENT_VERSION = 2`). Later Azahar builds are not supported.
+/// RPC protocol v2 (Azahar 2126.2, `CURRENT_VERSION = 2`).
+/// A later header number that does not change the RPC body keeps this payload size.
 pub const PROTOCOL_VERSION_V2: u32 = 2;
 
 /// Legacy alias: default on-the-wire version before auto-detection (v1).
@@ -49,6 +50,21 @@ impl RpcProtocol {
     /// Max process entries in one ProcessList reply (Azahar `MAX_PROCESSES_IN_LIST`).
     pub fn max_processes_in_list(self) -> usize {
         (self.max_packet_data_size - 4) / 0x14
+    }
+
+    /// Version 1 keeps the 1024-byte datagram. Any higher header number uses the
+    /// 2126.2 body layout until a trace shows the RPC itself changed.
+    pub fn for_version(version: u32) -> Self {
+        if version <= PROTOCOL_VERSION_V1 {
+            Self::V1
+        } else if version == PROTOCOL_VERSION_V2 {
+            Self::V2
+        } else {
+            Self {
+                version,
+                max_packet_data_size: MAX_PACKET_DATA_SIZE_V2,
+            }
+        }
     }
 }
 
@@ -262,6 +278,13 @@ mod tests {
             (32 * 1024 - 4) / 0x14
         );
         assert_eq!(RpcProtocol::V2.max_write_chunk(), 32 * 1024 - 8);
+        assert_eq!(RpcProtocol::for_version(1), RpcProtocol::V1);
+        assert_eq!(RpcProtocol::for_version(2), RpcProtocol::V2);
+        assert_eq!(RpcProtocol::for_version(5).version, 5);
+        assert_eq!(
+            RpcProtocol::for_version(5).max_packet_data_size,
+            MAX_PACKET_DATA_SIZE_V2
+        );
         assert_eq!(PacketType::ReadMemory as u32, 1);
         assert_eq!(PacketType::WriteMemory as u32, 2);
         assert_eq!(PacketType::ProcessList as u32, 3);

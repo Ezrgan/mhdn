@@ -6,10 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use crate::packet::{
-    PacketHeader, PacketType, RpcProtocol, MAX_PACKET_SIZE, PROTOCOL_VERSION_V1,
-    PROTOCOL_VERSION_V2,
-};
+use crate::packet::{PacketHeader, PacketType, RpcProtocol, MAX_PACKET_SIZE, PROTOCOL_VERSION_V1};
 
 #[derive(Debug, Clone)]
 pub struct FakeProcess {
@@ -36,8 +33,13 @@ pub struct ServerState {
     pub reorder_replies: bool,
     /// Count of ReadMemory requests that passed the version and size checks.
     pub read_requests: u32,
-    /// Answer every request the way `ValidatePacket` fails: echoed header, zero-byte body.
+    /// Well-formed requests seen, including ones whose reply was dropped or rejected.
+    pub requests: u32,
+    /// Answer every request the way `ValidatePacket` fails: zero-byte body.
     pub reject_all: bool,
+    /// When set, every reply header uses this version instead of echoing the client.
+    /// Azahar 2126.2 echoes; this is only for a server that names its own version.
+    pub announce_version: Option<u32>,
     pending_replies: Vec<Vec<u8>>,
 }
 
@@ -117,6 +119,7 @@ fn run_server(
         }
         let payload = &raw[16..];
         let mut st = state.lock().unwrap();
+        st.requests = st.requests.wrapping_add(1);
         if st.latency > Duration::ZERO {
             thread::sleep(st.latency);
         }
@@ -176,12 +179,13 @@ fn apply_write(memory: &mut HashMap<u32, Vec<u8>>, addr: u32, data: &[u8]) {
 }
 
 /// Azahar ≤2126.1 accepts `version <= 1`. Azahar 2126.2 accepts only `version == 2`.
-/// Both require a known opcode and at least two `u32` arguments. Failure is an empty body.
+/// Any other bound version accepts only that exact header number (a future bump
+/// that does not change the body). Failure is an empty body.
 fn request_accepted(protocol: RpcProtocol, header: &PacketHeader, payload: &[u8]) -> bool {
-    let version_ok = match protocol.version {
-        PROTOCOL_VERSION_V1 => header.version <= PROTOCOL_VERSION_V1,
-        PROTOCOL_VERSION_V2 => header.version == PROTOCOL_VERSION_V2,
-        _ => false,
+    let version_ok = if protocol.version == PROTOCOL_VERSION_V1 {
+        header.version <= PROTOCOL_VERSION_V1
+    } else {
+        header.version == protocol.version
     };
     if !version_ok || payload.len() != header.data_size as usize || header.data_size < 8 {
         return false;
@@ -209,8 +213,9 @@ fn build_reply(
     header: PacketHeader,
     payload: &[u8],
 ) -> Vec<u8> {
+    let reply_version = st.announce_version.unwrap_or(header.version);
     if st.reject_all || !request_accepted(protocol, &header, payload) {
-        return encode_reply(header.version, header.id, header.packet_type, &[]);
+        return encode_reply(reply_version, header.id, header.packet_type, &[]);
     }
     let mut out_payload = Vec::new();
     match header.packet_type {
@@ -278,5 +283,5 @@ fn build_reply(
         }
         _ => {}
     }
-    encode_reply(header.version, header.id, header.packet_type, &out_payload)
+    encode_reply(reply_version, header.id, header.packet_type, &out_payload)
 }
