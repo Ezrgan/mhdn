@@ -10,12 +10,17 @@ use crate::scene::{Scene, SceneMachine};
 use crate::snapshot::{capture, CaptureCache, RejectedRead, SnapshotError};
 use crate::tap::{
     hook_branch, install, install_wide, uninstall, InstallOutcome, PatchMemory, RingLayout,
-    TapError, TapEvent, HOOK_ADDR, RING_ADDR, WIDE_ENTRY_SIZE,
+    TapError, TapEvent, CALLER_HIT, HOOK_ADDR, RING_ADDR, WIDE_ENTRY_SIZE,
 };
 use crate::track::MonsterTrack;
+use crate::EventSource;
 
 const PLUGIN_ADDR: u32 = 0x0700_0000;
 const DISCONNECT_AFTER: u32 = 8;
+/// Candidate block on the HP word. Byte 0 is the zone index. The three f32 at +4 are not confirmed.
+const HIT_CANDIDATE_OFF: u32 = 0x5958;
+/// Measured center, twelve bytes at `mon - 0x320`. `mon` is the HP word.
+const MON_CENTER_OFF: u32 = 0x320;
 
 #[derive(Debug, Clone)]
 pub struct Sample {
@@ -42,6 +47,8 @@ pub struct Pipeline {
     wide: bool,
     /// Tap amounts still waiting for the HP write that belongs to them.
     tap_credit: TapCredit,
+    /// `hit_xyz` lines from the latest sample. Empty when the read failed.
+    hit_xyz: Vec<String>,
 }
 
 impl Default for Pipeline {
@@ -77,6 +84,7 @@ impl Pipeline {
             plugin_present: None,
             wide,
             tap_credit: TapCredit::default(),
+            hit_xyz: Vec::new(),
         }
     }
 
@@ -141,6 +149,7 @@ impl Pipeline {
                 .iter()
                 .map(UnmatchedTap::diag_line),
         );
+        lines.extend(std::mem::take(&mut self.hit_xyz));
         lines
     }
 
@@ -153,6 +162,7 @@ impl Pipeline {
         self.rejected.clear();
         self.drops.clear();
         self.unmatched.clear();
+        self.hit_xyz.clear();
         let raw = match capture(mem, profile, &mut self.cache) {
             Ok(Some(raw)) => raw,
             Ok(None) => {
@@ -337,6 +347,7 @@ impl Pipeline {
         self.drops = composed.drops;
         self.unmatched = composed.unmatched;
         self.tap_credit.settle(frame, &mut composed.events);
+        self.hit_xyz = hit_xyz_lines(mem, &composed.events);
         composed.events
     }
 
@@ -416,6 +427,57 @@ fn read_plugin(mem: &mut dyn MemorySource) -> Option<Vec<PluginHit>> {
     Some(hits)
 }
 
+/// One `hit_xyz` line per weapon tap. Poison and mount topples are not a point.
+/// A failed read is skipped: the sample still returns, and no coordinate is invented.
+fn hit_xyz_lines(mem: &mut dyn MemorySource, events: &[crate::DamageEvent]) -> Vec<String> {
+    let mut lines = Vec::new();
+    for event in events {
+        if event.source != EventSource::Tap || event.lr != CALLER_HIT {
+            continue;
+        }
+        let Some(mon) = event.key.map(|key| key.struct_addr) else {
+            continue;
+        };
+        if let Some(line) = read_hit_xyz(mem, mon) {
+            lines.push(line);
+        }
+    }
+    lines
+}
+
+fn read_hit_xyz(mem: &mut dyn MemorySource, mon: u32) -> Option<String> {
+    let mut block = [0u8; 16];
+    if mem
+        .read(mon.wrapping_add(HIT_CANDIDATE_OFF), &mut block)
+        .is_err()
+    {
+        return None;
+    }
+    let mut center = [0u8; 12];
+    if mem
+        .read(mon.wrapping_sub(MON_CENTER_OFF), &mut center)
+        .is_err()
+    {
+        return None;
+    }
+    let zone = block[0];
+    let x = f32_le(&block[4..8]);
+    let y = f32_le(&block[8..12]);
+    let z = f32_le(&block[12..16]);
+    let mon_pos_x = f32_le(&center[0..4]);
+    let mon_pos_y = f32_le(&center[4..8]);
+    let mon_pos_z = f32_le(&center[8..12]);
+    Some(format!(
+        "hit_xyz zone={zone} x={x} y={y} z={z} mon_pos_x={mon_pos_x} mon_pos_y={mon_pos_y} mon_pos_z={mon_pos_z}"
+    ))
+}
+
+fn f32_le(bytes: &[u8]) -> f32 {
+    let mut buf = [0u8; 4];
+    buf.copy_from_slice(bytes);
+    f32::from_le_bytes(buf)
+}
+
 fn fingerprints_match(mem: &mut dyn PatchMemory, profile: &Profile) -> bool {
     let windows: Vec<_> = profile
         .meta
@@ -454,9 +516,9 @@ mod tests {
     use crate::sparse::SparseMemory;
     use crate::support::{hp_addr, live_profile, place_monster, stage_hunt};
     use crate::tap::{
-        hook_branch, CALLER_MOUNT_TOPPLE, ENTRY_SIZE, EXPECTED_HOOK, EXPECTED_HP_STORE,
-        EXPECTED_NEXT, RING_ADDR, WIDE_CAPACITY, WIDE_ENTRY_SIZE, WIDE_WRITE_SEQ_ADDR,
-        WRITE_SEQ_ADDR,
+        hook_branch, CALLER_HIT, CALLER_MOUNT_TOPPLE, CALLER_STATUS, ENTRY_SIZE, EXPECTED_HOOK,
+        EXPECTED_HP_STORE, EXPECTED_NEXT, RING_ADDR, WIDE_CAPACITY, WIDE_ENTRY_SIZE,
+        WIDE_WRITE_SEQ_ADDR, WRITE_SEQ_ADDR,
     };
     use crate::{DamageConfidence, DamageKind, EventSource};
     use mhdn_rpc::MemorySource;
@@ -907,6 +969,81 @@ mod tests {
         assert_eq!(later.events[0].hp_after, Some(574));
     }
 
+    #[test]
+    fn a_weapon_hit_logs_the_hitzone_candidate_and_poison_and_topple_do_not() {
+        let (mut pipeline, mut mem, profile) = prepared();
+        warm(&mut pipeline, &mut mem, &profile);
+        pipeline.maintain_tap(&mut mem, &profile).unwrap();
+        let mon = hp_addr(0);
+        let object = mon - HP_FROM_OBJECT;
+        let mut block = [0u8; 16];
+        block[0] = 4;
+        block[1] = 0xAB;
+        block[2] = 0xCD;
+        block[3] = 0xEF;
+        let x = 1.25f32;
+        let y = -8.5f32;
+        let z = 3.0f32;
+        block[4..8].copy_from_slice(&x.to_le_bytes());
+        block[8..12].copy_from_slice(&y.to_le_bytes());
+        block[12..16].copy_from_slice(&z.to_le_bytes());
+        let center = [10.0f32, 20.0, 30.0];
+        write_tap_from(&mut mem, 1, -14, object, CALLER_HIT);
+        write_tap_from(&mut mem, 2, -5, object, CALLER_STATUS);
+        write_tap_from(&mut mem, 3, -100, object, CALLER_MOUNT_TOPPLE);
+        mem.write_u32(profile.frame_counter.addr.unwrap(), 4);
+        place_monster(&mut mem, 0, 655, 774, 1, center, 1);
+        mem.write_bytes(mon.wrapping_add(0x5958), &block);
+        let sample = pipeline.poll(&mut mem, &profile, 70_000).unwrap();
+        assert!(sample.events.iter().any(|event| {
+            event.source == EventSource::Tap
+                && event.lr == CALLER_HIT
+                && event.kind == DamageKind::Hit
+        }));
+        assert!(sample.events.iter().any(|event| {
+            event.source == EventSource::Tap
+                && event.lr == CALLER_STATUS
+                && event.kind == DamageKind::Poison
+        }));
+        assert!(sample.events.iter().any(|event| {
+            event.source == EventSource::Tap
+                && event.lr == CALLER_MOUNT_TOPPLE
+                && event.kind == DamageKind::Topple
+        }));
+        let hits: Vec<String> = pipeline
+            .drain_diag_lines()
+            .into_iter()
+            .filter(|line| line.starts_with("hit_xyz"))
+            .collect();
+        assert_eq!(
+            hits,
+            vec![format!(
+                "hit_xyz zone=4 x={x} y={y} z={z} mon_pos_x={} mon_pos_y={} mon_pos_z={}",
+                center[0], center[1], center[2]
+            )]
+        );
+
+        write_tap_from(&mut mem, 4, -14, object, CALLER_HIT);
+        mem.write_u32(profile.frame_counter.addr.unwrap(), 5);
+        place_monster(&mut mem, 0, 641, 774, 1, center, 1);
+        mem.write_bytes(mon.wrapping_add(0x5958), &block);
+        let mut failing = FailAt {
+            inner: &mut mem,
+            addr: mon.wrapping_add(0x5958),
+        };
+        let missed = pipeline
+            .poll(&mut failing, &profile, 86_000)
+            .expect("a failed hitzone read does not fail the sample");
+        assert!(missed
+            .events
+            .iter()
+            .any(|event| { event.source == EventSource::Tap && event.lr == CALLER_HIT }));
+        assert!(pipeline
+            .drain_diag_lines()
+            .iter()
+            .all(|line| !line.starts_with("hit_xyz")));
+    }
+
     fn write_tap(mem: &mut SparseMemory, seq: u32, r1: i32, monster: u32, bone: u32, part_hp: u32) {
         let mut raw = [0u8; ENTRY_SIZE as usize];
         raw[0..4].copy_from_slice(&seq.to_le_bytes());
@@ -937,6 +1074,20 @@ mod tests {
     impl MemorySource for CountMem<'_> {
         fn read(&mut self, addr: u32, buf: &mut [u8]) -> mhdn_rpc::Result<()> {
             self.reads += 1;
+            MemorySource::read(self.inner, addr, buf)
+        }
+    }
+
+    struct FailAt<'a> {
+        inner: &'a mut SparseMemory,
+        addr: u32,
+    }
+
+    impl MemorySource for FailAt<'_> {
+        fn read(&mut self, addr: u32, buf: &mut [u8]) -> mhdn_rpc::Result<()> {
+            if addr == self.addr {
+                return Err(mhdn_rpc::RpcError::ReadFailed { addr });
+            }
             MemorySource::read(self.inner, addr, buf)
         }
     }
