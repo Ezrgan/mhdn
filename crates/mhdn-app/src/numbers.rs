@@ -16,8 +16,6 @@ use crate::config::{NumberAnchor, StyleConfig};
 use crate::meter::{corner_text, CornerMode, Meter, MeterHit};
 use crate::settings::CornerMeterMode;
 
-/// A forward jump larger than this is a save state, not a dropped sample.
-const FRAME_JUMP: u32 = 90;
 /// Game units are centimetres. A melee hit lands about this far in front of the hunter.
 const WEAPON_REACH: f32 = 120.0;
 /// Above the hunter's feet, so the number clears the hunter's own model.
@@ -29,8 +27,9 @@ pub struct CombatView {
     meter: Meter,
     elapsed_ms: f32,
     seen: bool,
+    /// The hunt total is still the one on screen. A stale snapshot does not close it.
+    quest_open: bool,
     last_scene: Scene,
-    last_frame: u32,
     anchor: NumberAnchor,
     hunter: Option<[f32; 3]>,
 }
@@ -49,8 +48,8 @@ impl CombatView {
             meter: Meter::new(),
             elapsed_ms: 0.0,
             seen: false,
+            quest_open: false,
             last_scene: Scene::Disconnected,
-            last_frame: 0,
             anchor: NumberAnchor::default(),
             hunter: None,
         }
@@ -76,20 +75,32 @@ impl CombatView {
         self.elapsed_ms = 0.0;
     }
 
-    /// Drop numbers when the hunt ends, the frame rewinds, or a save state jumps ahead.
-    pub fn observe(&mut self, scene: Scene, frame: u32) -> Option<ResetReason> {
+    /// Drop the meter when the hunt actually ends.
+    ///
+    /// A guest-frame jump, a rewind, or a short [`Scene::Disconnected`] (the
+    /// overlay's stale-snapshot gap) leaves the total, the magnitude window,
+    /// and this quest in place. The same quest also survives a zone change and
+    /// leaving the emulator room. [`Scene::QuestEnd`], the village, and a load
+    /// into another quest clear it.
+    pub fn observe(&mut self, scene: Scene, _frame: u32) -> Option<ResetReason> {
         if !self.seen {
             self.seen = true;
             self.last_scene = scene;
-            self.last_frame = frame;
+            self.quest_open = scene == Scene::InQuest;
             return None;
         }
-        let reason = reset_reason(self.last_scene, scene, self.last_frame, frame);
+        let reason = if self.quest_open && quest_ended(scene) {
+            Some(ResetReason::LeftQuest)
+        } else {
+            None
+        };
         if reason.is_some() {
             self.clear();
+            self.quest_open = false;
+        } else if scene == Scene::InQuest {
+            self.quest_open = true;
         }
         self.last_scene = scene;
-        self.last_frame = frame;
         reason
     }
 
@@ -103,7 +114,7 @@ impl CombatView {
     where
         F: Fn(u16, bool) -> f32,
     {
-        if self.last_scene != Scene::InQuest {
+        if !self.quest_open {
             return Ingested {
                 gated: true,
                 anchors: vec![None; events.len()],
@@ -209,7 +220,11 @@ impl CombatView {
     pub fn tick(&mut self, dt: Duration) {
         let ms = dt.as_secs_f32() * 1000.0;
         self.pool.tick(ms);
-        if self.last_scene == Scene::InQuest && self.meter.received_total() > 0 && ms > 0.0 {
+        if self.quest_open
+            && self.last_scene == Scene::InQuest
+            && self.meter.received_total() > 0
+            && ms > 0.0
+        {
             self.elapsed_ms += ms;
         }
     }
@@ -379,24 +394,12 @@ pub struct DrawStats {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResetReason {
     LeftQuest,
-    Rewind,
-    Jump(u32),
 }
 
-pub fn reset_reason(prev: Scene, next: Scene, prev_frame: u32, frame: u32) -> Option<ResetReason> {
-    if prev == Scene::InQuest && next != Scene::InQuest {
-        return Some(ResetReason::LeftQuest);
-    }
-    if prev == Scene::InQuest && next == Scene::InQuest {
-        if frame < prev_frame {
-            return Some(ResetReason::Rewind);
-        }
-        let jump = frame.wrapping_sub(prev_frame);
-        if jump > FRAME_JUMP {
-            return Some(ResetReason::Jump(jump));
-        }
-    }
-    None
+/// Reward screen, village, or the load into a different quest.
+/// `Disconnected` is a stale read, not one of these.
+fn quest_ended(scene: Scene) -> bool {
+    matches!(scene, Scene::QuestEnd | Scene::Village | Scene::Loading)
 }
 
 /// An exact contact point wins. Otherwise, with a hunter, the number goes between the
@@ -1012,7 +1015,7 @@ mod tests {
     }
 
     #[test]
-    fn leaving_the_quest_or_rewinding_drops_numbers() {
+    fn leaving_the_quest_drops_numbers_and_a_rewind_keeps_them() {
         let mut view = CombatView::new();
         view.observe(Scene::InQuest, 100);
         view.ingest(
@@ -1039,8 +1042,9 @@ mod tests {
             &[monster(0x1000, true)],
             |_, _| 1.0,
         );
-        view.observe(Scene::InQuest, 50);
-        assert!(!view.alive());
+        assert_eq!(view.observe(Scene::InQuest, 50), None);
+        assert!(view.alive());
+        assert_eq!(view.recount_total(), 9);
     }
 
     #[test]
@@ -1059,15 +1063,93 @@ mod tests {
         assert_eq!(view.observe(Scene::InQuest, 10), None);
         let spawned = view.ingest(&[hit], &[monster(0x1000, true)], |_, _| 1.0);
         assert_eq!(spawned.anchors, vec![Some([0.0, 2.0, 0.0])]);
-        assert_eq!(
-            view.observe(Scene::InQuest, 200),
-            Some(ResetReason::Jump(190))
-        );
-        assert_eq!(view.observe(Scene::InQuest, 100), Some(ResetReason::Rewind));
+        assert_eq!(view.recount_total(), 5);
+        assert_eq!(view.observe(Scene::InQuest, 200), None);
+        assert_eq!(view.observe(Scene::InQuest, 100), None);
+        assert_eq!(view.recount_total(), 5);
         assert_eq!(
             view.observe(Scene::Loading, 101),
             Some(ResetReason::LeftQuest)
         );
+        assert_eq!(view.recount_total(), 0);
+    }
+
+    #[test]
+    fn a_frame_jump_or_a_short_disconnect_keeps_the_open_quest_total() {
+        let mut view = CombatView::new();
+        let monsters = [monster(0x1000, true)];
+        view.observe(Scene::InQuest, 100);
+        view.ingest(
+            &[event(
+                881,
+                Anchor::World(GameVec3::new(0.0, 1.0, 0.0)),
+                DamageKind::Hit,
+            )],
+            &monsters,
+            |_, _| 1.0,
+        );
+        view.tick(Duration::from_millis(500));
+        let elapsed = view.elapsed_ms;
+        let window = view.magnitude.len();
+        assert!(elapsed > 0.0);
+        assert!(window > 0);
+
+        assert_eq!(view.observe(Scene::InQuest, 321), None);
+        assert_eq!(view.recount_total(), 881);
+        assert_eq!(view.magnitude.len(), window);
+        assert_eq!(view.elapsed_ms, elapsed);
+
+        assert_eq!(view.observe(Scene::Disconnected, 321), None);
+        assert_eq!(view.recount_total(), 881);
+        assert_eq!(view.magnitude.len(), window);
+        let during = view.ingest(
+            &[event(5, Anchor::Unknown, DamageKind::Hit)],
+            &monsters,
+            |_, _| 1.0,
+        );
+        assert!(!during.gated);
+        assert_eq!(view.recount_total(), 886);
+
+        assert_eq!(view.observe(Scene::InQuest, 400), None);
+        view.ingest(
+            &[event(1, Anchor::Unknown, DamageKind::Hit)],
+            &monsters,
+            |_, _| 1.0,
+        );
+        assert_eq!(view.recount_total(), 887);
+
+        assert_eq!(
+            view.observe(Scene::QuestEnd, 410),
+            Some(ResetReason::LeftQuest)
+        );
+        assert_eq!(view.recount_total(), 0);
+        assert_eq!(view.magnitude.len(), 0);
+        assert_eq!(view.elapsed_ms, 0.0);
+
+        view.observe(Scene::InQuest, 500);
+        view.ingest(
+            &[event(10, Anchor::Unknown, DamageKind::Hit)],
+            &monsters,
+            |_, _| 1.0,
+        );
+        assert_eq!(
+            view.observe(Scene::Village, 510),
+            Some(ResetReason::LeftQuest)
+        );
+        assert_eq!(view.recount_total(), 0);
+
+        view.observe(Scene::InQuest, 600);
+        view.ingest(
+            &[event(7, Anchor::Unknown, DamageKind::Hit)],
+            &monsters,
+            |_, _| 1.0,
+        );
+        assert_eq!(view.observe(Scene::Disconnected, 600), None);
+        assert_eq!(
+            view.observe(Scene::Loading, 610),
+            Some(ResetReason::LeftQuest)
+        );
+        assert_eq!(view.recount_total(), 0);
     }
 
     #[test]
