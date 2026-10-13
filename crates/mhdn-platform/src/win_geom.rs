@@ -21,6 +21,9 @@ pub const EX_NOREDIRECTIONBITMAP: u32 = 0x0020_0000;
 pub const EX_APPWINDOW: u32 = 0x0004_0000;
 pub const EX_LAYERED: u32 = 0x0008_0000;
 pub const EX_NOACTIVATE: u32 = 0x0800_0000;
+/// `HTTRANSPARENT`. `WM_NCHITTEST` returning this hands the mouse to the window
+/// underneath, including a window owned by another process.
+pub const HTTRANSPARENT: i32 = -1;
 
 /// A top-level window as read from Win32, in physical pixels.
 #[derive(Debug, Clone, PartialEq)]
@@ -155,6 +158,21 @@ pub fn overlay_ex_style(current: u32, click_through: bool) -> u32 {
         style &= !(EX_TRANSPARENT | EX_NOACTIVATE);
     }
     style
+}
+
+/// `WM_NCHITTEST` result for the overlay.
+///
+/// Click-through returns [`HTTRANSPARENT`] so the click reaches Azahar.
+/// `WS_EX_TRANSPARENT` without `WS_EX_LAYERED` does not do that, and setting
+/// `LAYERED` paints the clear colour as one opaque alpha. Calibration returns
+/// `None`: the previous window procedure decides, and this window still takes
+/// the mouse and the keyboard.
+pub fn overlay_nchittest(click_through: bool) -> Option<i32> {
+    if click_through {
+        Some(HTTRANSPARENT)
+    } else {
+        None
+    }
 }
 
 /// Extended style of a parked overlay. Dropping `TOPMOST` is what lets another app's
@@ -366,6 +384,17 @@ mod tests {
             style & (EX_TOPMOST | EX_TOOLWINDOW),
             EX_TOPMOST | EX_TOOLWINDOW
         );
+    }
+
+    #[test]
+    fn click_through_hit_test_is_httransparent() {
+        assert_eq!(overlay_nchittest(true), Some(HTTRANSPARENT));
+        assert_eq!(HTTRANSPARENT, -1);
+    }
+
+    #[test]
+    fn calibration_hit_test_lets_the_window_proc_decide() {
+        assert_eq!(overlay_nchittest(false), None);
     }
 
     #[test]

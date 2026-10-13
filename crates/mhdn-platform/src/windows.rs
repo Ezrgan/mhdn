@@ -6,18 +6,19 @@
 //! detected in [`WinTracker::poll`] and the overlay parks rather than sitting on the
 //! desktop behind the game.
 //!
-//! The geometry and style decisions live in `win_geom`, which is tested on every host.
+//! The geometry, extended-style, and hit-test decisions live in `win_geom`, which is
+//! tested on every host. The overlay subclass that returns that hit-test lives here.
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::mem::size_of;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use windows_sys::core::BOOL;
-use windows_sys::Win32::Foundation::{CloseHandle, HWND, LPARAM, POINT, RECT};
+use windows_sys::Win32::Foundation::{CloseHandle, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
 use windows_sys::Win32::Graphics::Gdi::{
     ClientToScreen, EnumDisplayMonitors, GetMonitorInfoW, MonitorFromWindow, HDC, HMONITOR,
@@ -34,10 +35,11 @@ use windows_sys::Win32::UI::Shell::{
     SHQueryUserNotificationState, QUERY_USER_NOTIFICATION_STATE, QUNS_RUNNING_D3D_FULL_SCREEN,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GetClientRect, GetForegroundWindow, GetWindowLongPtrW, GetWindowThreadProcessId,
-    IsIconic, IsWindowVisible, SetWindowLongPtrW, SetWindowPos, GWL_EXSTYLE, HWND_NOTOPMOST,
-    HWND_TOPMOST, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, WS_EX_APPWINDOW,
-    WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+    CallWindowProcW, DefWindowProcW, EnumWindows, GetClientRect, GetForegroundWindow,
+    GetWindowLongPtrW, GetWindowThreadProcessId, IsIconic, IsWindowVisible, SetWindowLongPtrW,
+    SetWindowPos, GWLP_WNDPROC, GWL_EXSTYLE, HWND_NOTOPMOST, HWND_TOPMOST, SWP_FRAMECHANGED,
+    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, WM_NCHITTEST, WNDPROC, WS_EX_APPWINDOW, WS_EX_LAYERED,
+    WS_EX_NOACTIVATE, WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
     WS_EX_TRANSPARENT,
 };
 use winit::error::EventLoopError;
@@ -50,8 +52,9 @@ use crate::select::HostWindow;
 use crate::track::{track_windows, Display, TrackedWindow, WindowTracker};
 use crate::win_geom::{
     display, host_display, host_window, is_azahar_exe, needs_raise, overlay_ex_style,
-    parked_ex_style, windows_insets, HostDisplay, RawMonitor, RawWindow, BASE_DPI, EX_APPWINDOW,
-    EX_LAYERED, EX_NOACTIVATE, EX_NOREDIRECTIONBITMAP, EX_TOOLWINDOW, EX_TOPMOST, EX_TRANSPARENT,
+    overlay_nchittest, parked_ex_style, windows_insets, HostDisplay, RawMonitor, RawWindow,
+    BASE_DPI, EX_APPWINDOW, EX_LAYERED, EX_NOACTIVATE, EX_NOREDIRECTIONBITMAP, EX_TOOLWINDOW,
+    EX_TOPMOST, EX_TRANSPARENT,
 };
 use crate::OverlayUserEvent;
 
@@ -63,11 +66,17 @@ const _: () = assert!(EX_NOACTIVATE == WS_EX_NOACTIVATE);
 const _: () = assert!(EX_TOOLWINDOW == WS_EX_TOOLWINDOW);
 const _: () = assert!(EX_APPWINDOW == WS_EX_APPWINDOW);
 const _: () = assert!(EX_NOREDIRECTIONBITMAP == WS_EX_NOREDIRECTIONBITMAP);
+const _: () = assert!(
+    crate::win_geom::HTTRANSPARENT == windows_sys::Win32::UI::WindowsAndMessaging::HTTRANSPARENT
+);
 
 /// Last mode requested, so `join_active_space` can repair the style the same way.
 static CLICK_THROUGH: AtomicBool = AtomicBool::new(true);
-/// The overlay's own window, so the tracker poll can look for it in the z-order.
+/// The overlay's own window, so the tracker poll can look for it in the z-order
+/// and so the subclass answers hit-tests for this HWND only.
 static OVERLAY_HWND: AtomicUsize = AtomicUsize::new(0);
+/// Window procedure replaced on the overlay. The settings window keeps winit's.
+static PREV_WNDPROC: AtomicIsize = AtomicIsize::new(0);
 /// Set by the tracker poll when the host has moved above the overlay, e.g. by going
 /// borderless fullscreen. Consumed by `join_active_space`.
 static RAISE: AtomicBool = AtomicBool::new(false);
@@ -89,6 +98,9 @@ pub fn apply_click_through(window: &Window, click_through: bool) -> Result<(), P
     if !reassert_style(hwnd, click_through) {
         raise(hwnd);
     }
+    // After winit's flag change. The settings window is a different winit window
+    // and never reaches `apply_click_through`, so only the overlay is subclassed.
+    subclass_overlay(hwnd);
     Ok(())
 }
 
@@ -107,6 +119,7 @@ pub fn join_active_space(window: &Window) -> Result<bool, PlatformError> {
     if raised && !restyled {
         raise(hwnd);
     }
+    subclass_overlay(hwnd);
     Ok(restyled || raised)
 }
 
@@ -144,6 +157,7 @@ pub fn set_overlay_parked(window: &Window, parked: bool) -> Result<(), PlatformE
             raise(hwnd);
         }
     }
+    subclass_overlay(hwnd);
     Ok(())
 }
 
@@ -230,6 +244,53 @@ fn raise(hwnd: HWND) {
             SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
         )
     };
+}
+
+/// Install the hit-test subclass on the overlay HWND, chaining whatever procedure
+/// is there now. A second call is a no-op until something (winit) replaces it.
+fn subclass_overlay(hwnd: HWND) {
+    if hwnd.is_null() || OVERLAY_HWND.load(Ordering::Relaxed) != hwnd as usize {
+        return;
+    }
+    let ours = overlay_wndproc as *const () as isize;
+    let current = unsafe { GetWindowLongPtrW(hwnd, GWLP_WNDPROC) };
+    if current == ours {
+        return;
+    }
+    if current != 0 {
+        PREV_WNDPROC.store(current, Ordering::Relaxed);
+    }
+    unsafe {
+        SetWindowLongPtrW(hwnd, GWLP_WNDPROC, ours);
+    }
+}
+
+/// `WM_NCHITTEST` returns `HTTRANSPARENT` while click-through is on. Every other
+/// message, and calibration, goes to the window procedure this subclass replaced.
+unsafe extern "system" fn overlay_wndproc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    if msg == WM_NCHITTEST && OVERLAY_HWND.load(Ordering::Relaxed) == hwnd as usize {
+        if let Some(hit) = overlay_nchittest(CLICK_THROUGH.load(Ordering::Relaxed)) {
+            return hit as LRESULT;
+        }
+    }
+    call_previous(hwnd, msg, wparam, lparam)
+}
+
+unsafe fn call_previous(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    let prev = PREV_WNDPROC.load(Ordering::Relaxed);
+    if prev == 0 {
+        return DefWindowProcW(hwnd, msg, wparam, lparam);
+    }
+    let proc: WNDPROC = Some(std::mem::transmute::<
+        isize,
+        unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT,
+    >(prev));
+    CallWindowProcW(proc, hwnd, msg, wparam, lparam)
 }
 
 /// Returns true when the style had to change.

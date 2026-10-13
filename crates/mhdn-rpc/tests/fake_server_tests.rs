@@ -339,6 +339,24 @@ fn a_silent_server_is_not_swept() {
         panic!("connect succeeded against a server that does not answer");
     };
     assert!(matches!(err, RpcError::Timeout(_)));
-    assert_eq!(state.lock().unwrap().requests, 1);
+    // Version 2 timed out and version 1 timed out. 3..=16 stay unprobed.
+    assert_eq!(state.lock().unwrap().requests, 2);
+    server.shutdown();
+}
+
+/// Citra `src/core/rpc/rpc_server.cpp` `ValidatePacket` accepts
+/// `packet_header.version <= CURRENT_VERSION` (`CURRENT_VERSION` is 1 in
+/// `packet.h`; 1024-byte payloads, 16-byte header). A version-2 datagram gets
+/// no UDP reply. Connect still negotiates version 1.
+#[test]
+fn citra_with_no_reply_to_version_2_negotiates_version_1() {
+    let (server, state) = one_game(RpcProtocol::V1);
+    state.lock().unwrap().drop_unknown_version = true;
+    let mut client = RpcClient::connect(server.addr(), Duration::from_millis(200)).unwrap();
+    assert_eq!(client.protocol(), RpcProtocol::V1);
+    assert_eq!(client.protocol().max_packet_data_size, 1024);
+    // Version 2 was dropped, version 1 returned a list. 3..=16 stay untried.
+    assert_eq!(state.lock().unwrap().requests, 2);
+    assert_eq!(client.list_processes().unwrap().len(), 1);
     server.shutdown();
 }
