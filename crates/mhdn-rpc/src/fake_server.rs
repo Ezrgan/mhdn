@@ -37,6 +37,10 @@ pub struct ServerState {
     pub requests: u32,
     /// Answer every request the way `ValidatePacket` fails: zero-byte body.
     pub reject_all: bool,
+    /// Citra and some older Azahar builds send no datagram when the header
+    /// version fails `ValidatePacket`. Azahar 2125.1.3 does the opposite: it
+    /// still `SendReply`s an empty body (`rpc_server.cpp`).
+    pub drop_unknown_version: bool,
     /// When set, every reply header uses this version instead of echoing the client.
     /// Azahar 2126.2 echoes; this is only for a server that names its own version.
     pub announce_version: Option<u32>,
@@ -130,6 +134,13 @@ fn run_server(
             let _ = socket.send_to(&[], peer);
             continue;
         }
+        // Citra `ValidatePacket` accepts `version <= CURRENT_VERSION`
+        // (`CURRENT_VERSION` is 1). Builds that drop an unknown version send
+        // no datagram. Azahar 2125.1.3 still `SendReply`s an empty body, so
+        // this flag stays off for that dialect.
+        if st.drop_unknown_version && !version_accepted(protocol, header.version) {
+            continue;
+        }
         let reply = build_reply(&mut st, protocol, header, payload);
         if st.reorder_replies {
             st.pending_replies.push(reply);
@@ -178,16 +189,25 @@ fn apply_write(memory: &mut HashMap<u32, Vec<u8>>, addr: u32, data: &[u8]) {
     memory.insert(addr, data.to_vec());
 }
 
-/// Azahar ≤2126.1 accepts `version <= 1`. Azahar 2126.2 accepts only `version == 2`.
-/// Any other bound version accepts only that exact header number (a future bump
-/// that does not change the body). Failure is an empty body.
-fn request_accepted(protocol: RpcProtocol, header: &PacketHeader, payload: &[u8]) -> bool {
-    let version_ok = if protocol.version == PROTOCOL_VERSION_V1 {
-        header.version <= PROTOCOL_VERSION_V1
+/// Citra and Azahar through 2126.1 (`rpc_server.cpp` `ValidatePacket`):
+/// `packet_header.version <= CURRENT_VERSION`, and `CURRENT_VERSION` is 1.
+/// Azahar 2126.2 accepts only `version == CURRENT_VERSION` (`CURRENT_VERSION` is 2).
+/// Any other bound version accepts only that exact header number.
+fn version_accepted(protocol: RpcProtocol, version: u32) -> bool {
+    if protocol.version == PROTOCOL_VERSION_V1 {
+        version <= PROTOCOL_VERSION_V1
     } else {
-        header.version == protocol.version
-    };
-    if !version_ok || payload.len() != header.data_size as usize || header.data_size < 8 {
+        version == protocol.version
+    }
+}
+
+/// Failure of this check is an empty body, except when [`ServerState::drop_unknown_version`]
+/// is set and the version itself was rejected.
+fn request_accepted(protocol: RpcProtocol, header: &PacketHeader, payload: &[u8]) -> bool {
+    if !version_accepted(protocol, header.version)
+        || payload.len() != header.data_size as usize
+        || header.data_size < 8
+    {
         return false;
     }
     matches!(

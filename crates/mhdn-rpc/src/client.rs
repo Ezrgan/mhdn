@@ -331,25 +331,34 @@ enum ProbeReply {
 
 /// Pick the header version the server answers with a real process list.
 ///
-/// Azahar 2126.2 (`src/core/rpc/udp_server.cpp` `SendReply`, tag 2126.2) copies the
-/// request `PacketHeader` and `SetPacketDataSize` only writes `packet_size`. A
-/// failed `ValidatePacket` (`rpc_server.cpp`) therefore echoes the version the
-/// client sent, with an empty body. It does not write `CURRENT_VERSION`.
+/// Azahar 2126.2 (`src/core/rpc/rpc_server.cpp` `ValidatePacket`, tag 2126.2)
+/// accepts only `packet_header.version == CURRENT_VERSION`, and `CURRENT_VERSION`
+/// is 2 (`packet.h`). `udp_server.cpp` `SendReply` copies the request
+/// `PacketHeader` and `SetPacketDataSize` only writes `packet_size`, so a failed
+/// check echoes the version the client sent, with an empty body. A list body
+/// selects version 2 and stops.
 ///
-/// Version 2 is tried first. A timeout means nothing is listening, so no other
-/// version is tried. A list body selects version 2 and stops. An empty body is a
-/// rejection, not "no games".
+/// Azahar 2125.1.3 (`rpc_server.cpp` `ValidatePacket`) accepts
+/// `packet_header.version <= CURRENT_VERSION` with `CURRENT_VERSION` 1, and on
+/// failure still `SendReply`s that empty echo. An empty echo of version 2 is a
+/// rejection, not "no games": try version 1, then 3, 4, … through 16, and stop
+/// at the first list body. If the rejection header names some other version,
+/// retry that value once and do not sweep.
 ///
-/// If that rejection's header version is neither the one we sent nor 0, the server
-/// is naming its own version: retry that value once and do not sweep. Otherwise
-/// try version 1, then 3, 4, … through 16, and stop at the first list body.
+/// Citra (`src/core/rpc/rpc_server.cpp` `ValidatePacket`, same `<= CURRENT_VERSION`
+/// check, `CURRENT_VERSION` 1) and some older Azahar builds do not answer a
+/// version they will not accept: the version-2 datagram gets no UDP reply.
+/// A timeout or any other non-reply on version 2 still tries version 1. Give up
+/// only when version 1 also produces no reply. Versions 3..=16 are not probed
+/// on that path.
 fn detect_protocol(socket: &UdpSocket, timeout: Duration) -> Result<RpcProtocol> {
-    match probe_process_list(socket, PROTOCOL_VERSION_V2, timeout)? {
-        ProbeReply::Accepted => return Ok(RpcProtocol::for_version(PROTOCOL_VERSION_V2)),
-        ProbeReply::Rejected { version } if version != PROTOCOL_VERSION_V2 && version != 0 => {
+    match probe_process_list(socket, PROTOCOL_VERSION_V2, timeout) {
+        Ok(ProbeReply::Accepted) => return Ok(RpcProtocol::for_version(PROTOCOL_VERSION_V2)),
+        Ok(ProbeReply::Rejected { version }) if version != PROTOCOL_VERSION_V2 && version != 0 => {
             return accept_announced_version(socket, version, timeout);
         }
-        ProbeReply::Rejected { .. } => {}
+        Ok(ProbeReply::Rejected { .. }) => {}
+        Err(_) => return negotiate_v1_after_silence(socket, timeout),
     }
     for version in std::iter::once(PROTOCOL_VERSION_V1).chain(3..=MAX_PROBED_VERSION) {
         if probe_process_list(socket, version, timeout)? == ProbeReply::Accepted {
@@ -357,6 +366,19 @@ fn detect_protocol(socket: &UdpSocket, timeout: Duration) -> Result<RpcProtocol>
         }
     }
     Err(RpcError::InvalidResponse)
+}
+
+/// Version 2 was not answered. One version-1 probe, then stop.
+///
+/// A list body is Citra / older Azahar (`version <= 1`, 1024-byte payloads).
+/// A second timeout, or any other miss, is "nothing speaking version 1 either":
+/// do not sweep 3..=16.
+fn negotiate_v1_after_silence(socket: &UdpSocket, timeout: Duration) -> Result<RpcProtocol> {
+    match probe_process_list(socket, PROTOCOL_VERSION_V1, timeout) {
+        Ok(ProbeReply::Accepted) => Ok(RpcProtocol::for_version(PROTOCOL_VERSION_V1)),
+        Ok(ProbeReply::Rejected { .. }) => Err(RpcError::InvalidResponse),
+        Err(err) => Err(err),
+    }
 }
 
 /// One retry with the version a rejection header named. A second miss does not sweep.
