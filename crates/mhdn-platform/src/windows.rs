@@ -91,7 +91,7 @@ static RAISE: AtomicBool = AtomicBool::new(false);
 pub fn apply_click_through(window: &Window, click_through: bool) -> Result<(), PlatformError> {
     let hwnd = hwnd(window)?;
     CLICK_THROUGH.store(click_through, Ordering::Relaxed);
-    OVERLAY_HWND.store(hwnd as usize, Ordering::Relaxed);
+    remember_overlay_hwnd(hwnd);
     // Winit owns the window flags and rewrites the whole extended style when one
     // changes, so go through it first and add the remaining bits afterwards.
     window.set_window_level(WindowLevel::AlwaysOnTop);
@@ -114,6 +114,9 @@ pub fn overlay_event_loop() -> Result<EventLoop<OverlayUserEvent>, EventLoopErro
 /// and raises the overlay again. It returns true only when it had to.
 pub fn join_active_space(window: &Window) -> Result<bool, PlatformError> {
     let hwnd = hwnd(window)?;
+    // Winit can replace the native HWND on resize; only apply_click_through used to
+    // refresh OVERLAY_HWND, so subclass_overlay would refuse the new window.
+    remember_overlay_hwnd(hwnd);
     let restyled = reassert_style(hwnd, CLICK_THROUGH.load(Ordering::Relaxed));
     let raised = RAISE.swap(false, Ordering::Relaxed);
     if raised && !restyled {
@@ -129,6 +132,7 @@ pub fn join_active_space(window: &Window) -> Result<bool, PlatformError> {
 /// overlay is hidden and dropped out of the topmost band.
 pub fn set_overlay_parked(window: &Window, parked: bool) -> Result<(), PlatformError> {
     let hwnd = hwnd(window)?;
+    remember_overlay_hwnd(hwnd);
     if parked {
         // Hidden first: winit rebuilds the whole extended style when a flag changes,
         // and a visible overlay without `TOOLWINDOW` grows a taskbar button.
@@ -246,10 +250,17 @@ fn raise(hwnd: HWND) {
     };
 }
 
+/// Keeps [`OVERLAY_HWND`] aligned with winit's current native window.
+fn remember_overlay_hwnd(hwnd: HWND) {
+    if !hwnd.is_null() {
+        OVERLAY_HWND.store(hwnd as usize, Ordering::Relaxed);
+    }
+}
+
 /// Install the hit-test subclass on the overlay HWND, chaining whatever procedure
 /// is there now. A second call is a no-op until something (winit) replaces it.
 fn subclass_overlay(hwnd: HWND) {
-    if hwnd.is_null() || OVERLAY_HWND.load(Ordering::Relaxed) != hwnd as usize {
+    if hwnd.is_null() {
         return;
     }
     let ours = overlay_wndproc as *const () as isize;
