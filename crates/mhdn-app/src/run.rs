@@ -953,6 +953,10 @@ impl ApplicationHandler<OverlayUserEvent> for OverlayApp {
                 if let Some(renderer) = self.renderer.as_mut() {
                     renderer.resize(size.width, size.height);
                 }
+                #[cfg(windows)]
+                if let Some(window) = &self.window {
+                    let _ = join_active_space(window);
+                }
                 self.clock.request();
             }
             WindowEvent::CursorMoved { position, .. } => {
