@@ -4,6 +4,7 @@
 
 use std::time::{Duration, Instant};
 
+#[cfg(not(windows))]
 use winit::dpi::{LogicalPosition, LogicalSize};
 use winit::window::Window;
 
@@ -128,6 +129,16 @@ impl FollowController {
         self.last_resize
             .is_none_or(|then| now.saturating_duration_since(then) >= self.interval)
     }
+
+    pub fn sync_actual(&mut self, actual: Option<PixelRect>) {
+        if self.pending.is_none() {
+            if let Some(actual) = actual {
+                if self.applied != Some(actual) {
+                    self.applied = Some(actual);
+                }
+            }
+        }
+    }
 }
 
 /// Applies a [`FollowController`] decision to a winit window. Position is the
@@ -150,19 +161,37 @@ impl OverlayHost {
     }
 
     pub fn sync(&mut self, window: &Window, content: Rect, now: Instant) -> SurfaceUpdate {
+        #[cfg(windows)]
+        self.follow
+            .sync_actual(crate::windows::overlay_pixel_rect(window));
         let update = self.follow.observe(now, round_rect(content));
         match update {
             SurfaceUpdate::Idle => {}
             SurfaceUpdate::Move { x, y } => {
+                #[cfg(windows)]
+                crate::windows::set_overlay_bounds(window, x, y, None);
+                #[cfg(not(windows))]
                 window.set_outer_position(LogicalPosition::new(f64::from(x), f64::from(y)));
             }
             SurfaceUpdate::MoveResize(rect) => {
-                window
-                    .set_outer_position(LogicalPosition::new(f64::from(rect.x), f64::from(rect.y)));
-                let _ = window.request_inner_size(LogicalSize::new(
-                    f64::from(rect.width),
-                    f64::from(rect.height),
-                ));
+                #[cfg(windows)]
+                crate::windows::set_overlay_bounds(
+                    window,
+                    rect.x,
+                    rect.y,
+                    Some((rect.width, rect.height)),
+                );
+                #[cfg(not(windows))]
+                {
+                    window.set_outer_position(LogicalPosition::new(
+                        f64::from(rect.x),
+                        f64::from(rect.y),
+                    ));
+                    let _ = window.request_inner_size(LogicalSize::new(
+                        f64::from(rect.width),
+                        f64::from(rect.height),
+                    ));
+                }
             }
         }
         update
@@ -219,5 +248,17 @@ mod tests {
     fn subpixel_jitter_rounds_away_before_it_can_resize() {
         let rounded = round_rect(Rect::new(1.2, 3.6, 100.4, 80.2));
         assert_eq!(rounded, px(1, 4, 100, 80));
+    }
+
+    #[test]
+    fn sync_actual_forces_move_resize_when_os_window_diverged() {
+        let start = Instant::now();
+        let mut follow = FollowController::new(Duration::from_millis(33));
+        follow.observe(start, px(0, 0, 100, 80));
+        follow.sync_actual(Some(px(50, 40, 100, 80)));
+        assert_eq!(
+            follow.observe(start, px(0, 0, 100, 80)),
+            SurfaceUpdate::Move { x: 0, y: 0 }
+        );
     }
 }

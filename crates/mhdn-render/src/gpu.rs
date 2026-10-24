@@ -276,8 +276,13 @@ impl Renderer {
         }
     }
 
+    pub fn surface_size(&self) -> (u32, u32) {
+        (self.config.width, self.config.height)
+    }
+
     pub fn resize(&mut self, width: u32, height: u32) {
-        if width == 0 || height == 0 {
+        if width == 0 || height == 0 || (self.config.width == width && self.config.height == height)
+        {
             return;
         }
         self.config.width = width;

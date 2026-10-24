@@ -56,9 +56,12 @@ pub use other::{
     apply_click_through, begin_latency_critical, frontmost_pid, join_active_space,
     overlay_event_loop, raise_thread_qos, set_overlay_parked, LatencyCritical, MenuStatus,
 };
+#[cfg(any(windows, test))]
+pub use win_geom::candidate_azahar_configs;
+
 #[cfg(windows)]
 pub use windows::{
-    apply_click_through, begin_latency_critical, frontmost_pid, join_active_space,
-    overlay_event_loop, raise_thread_qos, set_overlay_parked, tint_spike, LatencyCritical,
-    MenuStatus,
+    apply_click_through, begin_latency_critical, detected_azahar_exe, frontmost_pid,
+    join_active_space, overlay_event_loop, raise_thread_qos, set_overlay_parked, tint_spike,
+    LatencyCritical, MenuStatus,
 };
