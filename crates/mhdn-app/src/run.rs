@@ -13,13 +13,17 @@ use mhdn_platform::{
     overlay_event_loop, overlay_parked, report_startup_failure, set_overlay_parked, system_tracker,
     MenuStatus, OverlayHost, OverlayUserEvent, SurfaceUpdate, TrackedWindow, WindowTracker,
 };
+#[cfg(windows)]
+use mhdn_platform::{candidate_azahar_configs, detected_azahar_exe};
 use mhdn_proj::{
     parse_layout_settings, project, resolve, Camera, EdgeMode, LayoutOption, LayoutSettings,
     LayoutWatcher, Projected, ScreenRect,
 };
 use mhdn_render::{FrameClock, Paint, PaintWatch, Quad, RenderError, Renderer};
 use winit::application::ApplicationHandler;
-use winit::dpi::{LogicalPosition, LogicalSize, PhysicalSize};
+use winit::dpi::PhysicalSize;
+#[cfg(not(windows))]
+use winit::dpi::{LogicalPosition, LogicalSize};
 use winit::event::{ElementState, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoopProxy};
 use winit::window::{Window, WindowAttributes, WindowId};
@@ -217,10 +221,6 @@ impl OverlayApp {
             self.parked = false;
             self.host = OverlayHost::new();
         }
-        if let Ok(true) = join_active_space(&window) {
-            self.rejoins += 1;
-            self.clock.request();
-        }
         let update = self
             .host
             .sync(&window, tracked.content_rect, Instant::now());
@@ -230,6 +230,10 @@ impl OverlayApp {
             if let Err(err) = set_overlay_parked(&window, false) {
                 eprintln!("mhdn: {err}");
             }
+            self.clock.request();
+        }
+        if let Ok(true) = join_active_space(&window) {
+            self.rejoins += 1;
             self.clock.request();
         }
         if !matches!(update, SurfaceUpdate::Idle) {
@@ -265,8 +269,11 @@ impl OverlayApp {
         if let Err(err) = set_overlay_parked(window, true) {
             eprintln!("mhdn: {err}");
         }
-        let _ = window.request_inner_size(LogicalSize::new(1.0, 1.0));
-        window.set_outer_position(LogicalPosition::new(-8.0, -8.0));
+        #[cfg(not(windows))]
+        {
+            let _ = window.request_inner_size(LogicalSize::new(1.0, 1.0));
+            window.set_outer_position(LogicalPosition::new(-8.0, -8.0));
+        }
         self.parked = true;
         self.host = OverlayHost::new();
         self.clock.request();
@@ -289,6 +296,24 @@ impl OverlayApp {
     }
 
     fn reload_layout(&mut self) {
+        #[cfg(windows)]
+        if let Some(path) = azahar_config() {
+            let reopen = self
+                .layout_watcher
+                .as_ref()
+                .is_none_or(|watcher| watcher.path() != path.as_path());
+            if reopen {
+                match LayoutWatcher::open(path) {
+                    Ok(watcher) => {
+                        let detected = watcher.settings().clone();
+                        self.layout_watcher = Some(watcher);
+                        self.apply_layout(detected);
+                        return;
+                    }
+                    Err(err) => eprintln!("mhdn: layout: {err}"),
+                }
+            }
+        }
         let Some(watcher) = self.layout_watcher.as_mut() else {
             return;
         };
@@ -586,11 +611,16 @@ impl OverlayApp {
             }
             .to_string(),
         );
+        let layout_file = self
+            .layout_watcher
+            .as_ref()
+            .map(|watcher| watcher.path().display().to_string())
+            .unwrap_or_else(|| "none".to_string());
         self.diag.changed(
             "layout",
             format!(
-                "{} status_bar={}",
-                self.layout_key, self.layout.show_status_bar
+                "{} status_bar={} file={}",
+                self.layout_key, self.layout.show_status_bar, layout_file
             ),
         );
         self.diag.changed("status", self.status_text.clone());
@@ -711,10 +741,16 @@ impl OverlayApp {
             return;
         };
         let size = window.inner_size();
+        if size.width == 0 || size.height == 0 {
+            return;
+        }
         let quads = self.quads(size);
         let Some(renderer) = self.renderer.as_mut() else {
             return;
         };
+        if renderer.surface_size() != (size.width, size.height) {
+            renderer.resize(size.width, size.height);
+        }
         if let Err(RenderError::Outdated) = renderer.draw(&quads) {
             renderer.resize(size.width, size.height);
             let _ = renderer.draw(&quads);
@@ -1073,12 +1109,13 @@ fn azahar_config() -> Option<PathBuf> {
     }
     #[cfg(target_os = "windows")]
     {
-        let appdata = std::env::var_os("APPDATA")?;
-        let path = PathBuf::from(appdata)
-            .join("Azahar")
-            .join("config")
-            .join("qt-config.ini");
-        path.is_file().then_some(path)
+        candidate_azahar_configs(
+            detected_azahar_exe().as_deref(),
+            std::env::var("APPDATA").ok().as_deref(),
+            std::env::var("LOCALAPPDATA").ok().as_deref(),
+        )
+        .into_iter()
+        .find(|path| path.is_file())
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {

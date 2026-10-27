@@ -88,10 +88,10 @@ pub fn is_fullscreen(bounds: Rect, screens: &[Rect]) -> bool {
 }
 
 fn nearly_equal(left: Rect, right: Rect) -> bool {
-    (left.x - right.x).abs() <= 1.0
-        && (left.y - right.y).abs() <= 1.0
-        && (left.width - right.width).abs() <= 1.0
-        && (left.height - right.height).abs() <= 1.0
+    (left.x - right.x).abs() <= 2.0
+        && (left.y - right.y).abs() <= 2.0
+        && (left.width - right.width).abs() <= 2.0
+        && (left.height - right.height).abs() <= 2.0
 }
 
 #[cfg(test)]

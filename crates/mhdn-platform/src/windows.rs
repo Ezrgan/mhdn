@@ -35,26 +35,32 @@ use windows_sys::Win32::UI::Shell::{
     SHQueryUserNotificationState, QUERY_USER_NOTIFICATION_STATE, QUNS_RUNNING_D3D_FULL_SCREEN,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CallWindowProcW, DefWindowProcW, EnumWindows, GetClientRect, GetForegroundWindow,
-    GetWindowLongPtrW, GetWindowThreadProcessId, IsIconic, IsWindowVisible, SetWindowLongPtrW,
-    SetWindowPos, GWLP_WNDPROC, GWL_EXSTYLE, HWND_NOTOPMOST, HWND_TOPMOST, SWP_FRAMECHANGED,
-    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, WM_NCHITTEST, WNDPROC, WS_EX_APPWINDOW, WS_EX_LAYERED,
-    WS_EX_NOACTIVATE, WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
-    WS_EX_TRANSPARENT,
+    CallWindowProcW, DefWindowProcW, EnumWindows, GetClassNameW, GetClientRect,
+    GetForegroundWindow, GetWindowLongPtrW, GetWindowThreadProcessId, IsIconic, IsWindowVisible,
+    SetWindowLongPtrW, SetWindowPos, GWLP_WNDPROC, GWL_EXSTYLE, GWL_STYLE, HWND_NOTOPMOST,
+    HWND_TOPMOST, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE,
+    WM_DPICHANGED, WM_MOUSEACTIVATE, WM_NCHITTEST, WNDPROC, WS_BORDER, WS_CAPTION, WS_CLIPSIBLINGS,
+    WS_EX_APPWINDOW, WS_EX_CLIENTEDGE, WS_EX_DLGMODALFRAME, WS_EX_LAYERED, WS_EX_NOACTIVATE,
+    WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT,
+    WS_EX_WINDOWEDGE, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP, WS_SYSMENU, WS_THICKFRAME,
 };
 use winit::error::EventLoopError;
 use winit::event_loop::EventLoop;
 use winit::window::{Window, WindowLevel};
 
 use crate::error::PlatformError;
+use crate::follow::PixelRect;
 use crate::geom::Insets;
-use crate::select::HostWindow;
+use crate::select::{select_window, HostWindow, TrackQuery};
 use crate::track::{track_windows, Display, TrackedWindow, WindowTracker};
 use crate::win_geom::{
-    display, host_display, host_window, is_azahar_exe, needs_raise, overlay_ex_style,
-    overlay_nchittest, parked_ex_style, windows_insets, HostDisplay, RawMonitor, RawWindow,
-    BASE_DPI, EX_APPWINDOW, EX_LAYERED, EX_NOACTIVATE, EX_NOREDIRECTIONBITMAP, EX_TOOLWINDOW,
-    EX_TOPMOST, EX_TRANSPARENT,
+    display, dpi_scale, host_display, host_window, is_azahar_exe, needs_raise, overlay_ex_style,
+    overlay_mouseactivate, overlay_nchittest, overlay_style, parked_ex_style,
+    physical_windows_insets, HostDisplay, RawMonitor, RawWindow, BASE_DPI, EX_APPWINDOW,
+    EX_CLIENTEDGE, EX_DLGMODALFRAME, EX_LAYERED, EX_NOACTIVATE, EX_NOREDIRECTIONBITMAP,
+    EX_TOOLWINDOW, EX_TOPMOST, EX_TRANSPARENT, EX_WINDOWEDGE, MA_NOACTIVATE, STYLE_BORDER,
+    STYLE_CAPTION, STYLE_CLIPSIBLINGS, STYLE_MAXIMIZEBOX, STYLE_MINIMIZEBOX, STYLE_POPUP,
+    STYLE_SYSMENU, STYLE_THICKFRAME,
 };
 use crate::OverlayUserEvent;
 
@@ -66,9 +72,32 @@ const _: () = assert!(EX_NOACTIVATE == WS_EX_NOACTIVATE);
 const _: () = assert!(EX_TOOLWINDOW == WS_EX_TOOLWINDOW);
 const _: () = assert!(EX_APPWINDOW == WS_EX_APPWINDOW);
 const _: () = assert!(EX_NOREDIRECTIONBITMAP == WS_EX_NOREDIRECTIONBITMAP);
+const _: () = assert!(EX_WINDOWEDGE == WS_EX_WINDOWEDGE);
+const _: () = assert!(EX_CLIENTEDGE == WS_EX_CLIENTEDGE);
+const _: () = assert!(EX_DLGMODALFRAME == WS_EX_DLGMODALFRAME);
+const _: () = assert!(STYLE_POPUP == WS_POPUP);
+const _: () = assert!(STYLE_CLIPSIBLINGS == WS_CLIPSIBLINGS);
+const _: () = assert!(STYLE_CAPTION == WS_CAPTION);
+const _: () = assert!(STYLE_BORDER == WS_BORDER);
+const _: () = assert!(STYLE_THICKFRAME == WS_THICKFRAME);
+const _: () = assert!(STYLE_SYSMENU == WS_SYSMENU);
+const _: () = assert!(STYLE_MINIMIZEBOX == WS_MINIMIZEBOX);
+const _: () = assert!(STYLE_MAXIMIZEBOX == WS_MAXIMIZEBOX);
+const _: () =
+    assert!(MA_NOACTIVATE == windows_sys::Win32::UI::WindowsAndMessaging::MA_NOACTIVATE as i32);
 const _: () = assert!(
     crate::win_geom::HTTRANSPARENT == windows_sys::Win32::UI::WindowsAndMessaging::HTTRANSPARENT
 );
+
+static DETECTED_AZAHAR_EXE: Mutex<Option<String>> = Mutex::new(None);
+
+/// Executable path of the Azahar window currently being tracked, when known.
+pub fn detected_azahar_exe() -> Option<String> {
+    DETECTED_AZAHAR_EXE
+        .lock()
+        .ok()
+        .and_then(|guard| guard.clone())
+}
 
 /// Last mode requested, so `join_active_space` can repair the style the same way.
 static CLICK_THROUGH: AtomicBool = AtomicBool::new(true);
@@ -95,6 +124,7 @@ pub fn apply_click_through(window: &Window, click_through: bool) -> Result<(), P
     // Winit owns the window flags and rewrites the whole extended style when one
     // changes, so go through it first and add the remaining bits afterwards.
     window.set_window_level(WindowLevel::AlwaysOnTop);
+    let _ = window.set_cursor_hittest(!click_through);
     if !reassert_style(hwnd, click_through) {
         raise(hwnd);
     }
@@ -235,6 +265,52 @@ fn ex_style(hwnd: HWND) -> u32 {
     unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32 }
 }
 
+fn window_style(hwnd: HWND) -> u32 {
+    unsafe { GetWindowLongPtrW(hwnd, GWL_STYLE) as u32 }
+}
+
+/// Client area origin and size in physical screen pixels.
+pub fn overlay_pixel_rect(window: &Window) -> Option<PixelRect> {
+    let hwnd = hwnd(window).ok()?;
+    let mut client = RECT {
+        left: 0,
+        top: 0,
+        right: 0,
+        bottom: 0,
+    };
+    let mut origin = POINT { x: 0, y: 0 };
+    unsafe {
+        if GetClientRect(hwnd, &mut client) == 0 || ClientToScreen(hwnd, &mut origin) == 0 {
+            return None;
+        }
+    }
+    let width = (client.right - client.left).max(0) as u32;
+    let height = (client.bottom - client.top).max(0) as u32;
+    Some(PixelRect {
+        x: origin.x,
+        y: origin.y,
+        width,
+        height,
+    })
+}
+
+pub fn set_overlay_bounds(window: &Window, x: i32, y: i32, size: Option<(u32, u32)>) {
+    let Ok(hwnd) = hwnd(window) else {
+        return;
+    };
+    let flags = SWP_NOACTIVATE | SWP_NOOWNERZORDER;
+    unsafe {
+        match size {
+            None => {
+                SetWindowPos(hwnd, HWND_TOPMOST, x, y, 0, 0, flags | SWP_NOSIZE);
+            }
+            Some((width, height)) => {
+                SetWindowPos(hwnd, HWND_TOPMOST, x, y, width as i32, height as i32, flags);
+            }
+        }
+    }
+}
+
 /// Puts the overlay back at the top of the topmost band without activating it.
 fn raise(hwnd: HWND) {
     unsafe {
@@ -284,9 +360,20 @@ unsafe extern "system" fn overlay_wndproc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
-    if msg == WM_NCHITTEST && OVERLAY_HWND.load(Ordering::Relaxed) == hwnd as usize {
-        if let Some(hit) = overlay_nchittest(CLICK_THROUGH.load(Ordering::Relaxed)) {
-            return hit as LRESULT;
+    if OVERLAY_HWND.load(Ordering::Relaxed) == hwnd as usize {
+        let click_through = CLICK_THROUGH.load(Ordering::Relaxed);
+        if msg == WM_NCHITTEST {
+            if let Some(hit) = overlay_nchittest(click_through) {
+                return hit as LRESULT;
+            }
+        }
+        if msg == WM_MOUSEACTIVATE {
+            if let Some(ma) = overlay_mouseactivate(click_through) {
+                return ma as LRESULT;
+            }
+        }
+        if msg == WM_DPICHANGED {
+            return 0;
         }
     }
     call_previous(hwnd, msg, wparam, lparam)
@@ -306,13 +393,16 @@ unsafe fn call_previous(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) ->
 
 /// Returns true when the style had to change.
 fn reassert_style(hwnd: HWND, click_through: bool) -> bool {
-    let current = ex_style(hwnd);
-    let wanted = overlay_ex_style(current, click_through);
-    if wanted == current {
+    let current_style = window_style(hwnd);
+    let current_ex = ex_style(hwnd);
+    let wanted_style = overlay_style(current_style);
+    let wanted_ex = overlay_ex_style(current_ex, click_through);
+    if wanted_style == current_style && wanted_ex == current_ex {
         return false;
     }
     unsafe {
-        SetWindowLongPtrW(hwnd, GWL_EXSTYLE, wanted as isize);
+        SetWindowLongPtrW(hwnd, GWL_STYLE, wanted_style as isize);
+        SetWindowLongPtrW(hwnd, GWL_EXSTYLE, wanted_ex as isize);
         SetWindowPos(
             hwnd,
             HWND_TOPMOST,
@@ -320,7 +410,7 @@ fn reassert_style(hwnd: HWND, click_through: bool) -> bool {
             0,
             0,
             0,
-            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_FRAMECHANGED,
         );
     }
     true
@@ -383,7 +473,7 @@ impl WinTracker {
 
     /// Azahar's windows, plus every top-level window in z-order, top first, the way
     /// `EnumWindows` hands them over.
-    fn azahar_windows(&mut self) -> (Vec<HostWindow>, Vec<usize>) {
+    fn azahar_windows(&mut self) -> (Vec<HostWindow>, HashMap<u32, RawWindow>, Vec<usize>) {
         let mut handles: Vec<HWND> = Vec::new();
         unsafe {
             EnumWindows(
@@ -395,6 +485,7 @@ impl WinTracker {
         let own_pid = std::process::id();
         let mut seen = HashSet::new();
         let mut windows = Vec::new();
+        let mut raw_by_id = HashMap::new();
         for hwnd in handles {
             if unsafe { IsWindowVisible(hwnd) } == 0 || unsafe { IsIconic(hwnd) } != 0 {
                 continue;
@@ -413,23 +504,38 @@ impl WinTracker {
             if !is_azahar_exe(&exe) {
                 continue;
             }
-            if let Some(host) = read_window(hwnd, pid, exe).as_ref().and_then(host_window) {
-                windows.push(host);
+            if let Some(raw) = read_window(hwnd, pid, exe) {
+                if let Some(host) = host_window(&raw) {
+                    raw_by_id.insert(host.id, raw);
+                    windows.push(host);
+                }
             }
         }
         self.images.retain(|pid, _| seen.contains(pid));
-        (windows, z_order)
+        (windows, raw_by_id, z_order)
     }
 }
 
 impl WindowTracker for WinTracker {
     fn poll(&mut self) -> Option<TrackedWindow> {
-        let (windows, z_order) = self.azahar_windows();
+        let (windows, raw_by_id, z_order) = self.azahar_windows();
         let displays = list_displays();
+        let query = TrackQuery {
+            owner_name: "Azahar",
+            owner_pid: None,
+            preferred_id: self.preferred_id,
+        };
+        let picked = select_window(&windows, &query)?;
+        let raw = raw_by_id.get(&picked.id)?;
+        let scale = dpi_scale(raw.dpi);
+        let frameless = (raw.style & STYLE_CAPTION) == 0;
+        if let Ok(mut guard) = DETECTED_AZAHAR_EXE.lock() {
+            *guard = Some(raw.exe.clone());
+        }
         let tracked = track_windows(
             &windows,
             &displays,
-            windows_insets(self.insets),
+            physical_windows_insets(self.insets, scale, frameless),
             None,
             self.preferred_id,
         )?;
@@ -495,6 +601,15 @@ fn process_image(pid: u32) -> String {
 }
 
 fn read_window(hwnd: HWND, pid: u32, exe: String) -> Option<RawWindow> {
+    let mut class_buf = [0u16; 256];
+    let class_len = unsafe { GetClassNameW(hwnd, class_buf.as_mut_ptr(), class_buf.len() as i32) };
+    let class_name = if class_len > 0 {
+        String::from_utf16_lossy(&class_buf[..class_len as usize])
+    } else {
+        String::new()
+    };
+    let style = window_style(hwnd);
+    let extended = ex_style(hwnd);
     let mut client = RECT {
         left: 0,
         top: 0,
@@ -512,6 +627,9 @@ fn read_window(hwnd: HWND, pid: u32, exe: String) -> Option<RawWindow> {
         hwnd: hwnd as usize,
         pid,
         exe,
+        class_name,
+        style,
+        ex_style: extended,
         client_origin: (origin.x, origin.y),
         client_size: (client.right - client.left, client.bottom - client.top),
         visible: true,

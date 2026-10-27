@@ -30,15 +30,6 @@ pub fn select_window<'a>(
     windows: &'a [HostWindow],
     query: &TrackQuery<'_>,
 ) -> Option<&'a HostWindow> {
-    if let Some(id) = query.preferred_id {
-        if let Some(window) = windows
-            .iter()
-            .find(|window| window.id == id && is_candidate(window, query))
-        {
-            return Some(window);
-        }
-    }
-
     let mut best: Option<&HostWindow> = None;
     for window in windows {
         if !is_candidate(window, query) {
@@ -50,6 +41,21 @@ pub fn select_window<'a>(
             Some(current) => current,
         });
     }
+
+    if let Some(id) = query.preferred_id {
+        if let Some(preferred) = windows
+            .iter()
+            .find(|window| window.id == id && is_candidate(window, query))
+        {
+            if let Some(other) = best {
+                if other.id != preferred.id && other.bounds.area() > preferred.bounds.area() * 2.0 {
+                    return Some(other);
+                }
+            }
+            return Some(preferred);
+        }
+    }
+
     best
 }
 
@@ -136,6 +142,15 @@ mod tests {
         let tiny = window(3, "Azahar", 40.0, 40.0);
         let other = window(4, "Notes", 1000.0, 600.0);
         assert!(select_window(&[menu, hidden, tiny, other], &query(None)).is_none());
+    }
+
+    #[test]
+    fn a_preferred_small_dialog_yields_to_the_main_game_window() {
+        let windows = vec![
+            window(1, "Azahar", 320.0, 240.0),
+            window(2, "Azahar", 1000.0, 600.0),
+        ];
+        assert_eq!(select_window(&windows, &query(Some(1))).unwrap().id, 2);
     }
 
     #[test]
